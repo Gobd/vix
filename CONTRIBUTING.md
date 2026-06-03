@@ -100,4 +100,4 @@ When opening an issue, please include:
 
 ## License
 
-By contributing to Vix, you agree that your contributions will be licensed under the [Apache License 2.0](LICENSE).
+By contributing to Vix, you agree that your contributions will be licensed under the [GNU Affero General Public License v3.0](LICENSE).
