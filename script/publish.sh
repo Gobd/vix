@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   echo "Usage: $0 <version> --repo <owner/repo> [--force] [--changelog <path>]"
-  echo "  e.g. $0 v0.1.0 --repo kirby88/vix"
+  echo "  e.g. $0 v0.1.0 --repo get-vix/vix"
   echo ""
   echo "  --force              Delete existing release before creating a new one"
   echo "  --changelog <path>   Use contents of this file as the changelog"
