@@ -28,9 +28,9 @@ type Session struct {
 	id          string
 	parentID    string // non-empty if this session was forked; set once at creation
 	forkTurnIdx int    // which turn it was forked at (0-based); meaningful only when parentID != ""
-	server *Server
-	llm    LLM
-	model  string
+	server      *Server
+	llm         LLM
+	model       string
 	cwd                             string
 	paths                           config.VixPaths
 	forceInit                       bool

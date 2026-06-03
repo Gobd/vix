@@ -24,6 +24,7 @@ var globalRPM = func() int {
 	if n <= 0 {
 		return 0
 	}
+	log.Printf("[llm] rate limiter enabled: %d req/min (VIX_REQUESTS_PER_MINUTE)", n)
 	return n
 }()
 
