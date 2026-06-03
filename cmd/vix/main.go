@@ -36,6 +36,7 @@ func main() {
 	testMode := flag.Bool("test", false, "Fill chat with fake data for UI testing")
 	prompt := flag.String("p", "", "Run a single prompt non-interactively (headless mode). Use '-' to read from stdin.")
 	workflow := flag.String("w", "", "Workflow name to run (e.g. 'Plan Workflow'). Requires -p.")
+	modelFlag := flag.String("model", "", "Override the model for this session (e.g. bedrock/us.anthropic.claude-sonnet-4-6). Takes priority over the agent frontmatter.")
 	outputFormat := flag.String("output-format", "text", "Output format for headless mode: text, json, stream-json")
 	workdir := flag.String("workdir", "", "Set the working directory for this session")
 	configDir := flag.String("config-dir", "", "Use this directory as the sole .vix config root (ignores ~/.vix and ./.vix)")
@@ -284,7 +285,7 @@ func main() {
 		if client.Ping() {
 			session = daemon.NewSessionClient(cfg.SocketPath)
 			session.SetAuthToken(authToken)
-			if err := session.Connect(cfg.CWD, cfg.ConfigDir, cfg.Model, cfg.ForceInit, !*disableWritePermission, !*disableDirAccess, *prompt != ""); err != nil {
+			if err := session.Connect(cfg.CWD, cfg.ConfigDir, cfg.Model, *modelFlag, cfg.ForceInit, !*disableWritePermission, !*disableDirAccess, *prompt != ""); err != nil {
 				fmt.Fprintf(os.Stderr, "Error connecting to daemon: %v\n", err)
 				os.Exit(1)
 			}

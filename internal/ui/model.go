@@ -131,7 +131,7 @@ func attemptReconnect(socketPath, cwd, configDir, model, authToken string, force
 		}
 		session := daemon.NewSessionClient(socketPath)
 		session.SetAuthToken(authToken)
-		if err := session.Connect(cwd, configDir, model, forceInit, enableWrite, enableDir, false); err != nil {
+		if err := session.Connect(cwd, configDir, model, "", forceInit, enableWrite, enableDir, false); err != nil {
 			time.Sleep(2 * time.Second)
 			return reconnectFailedMsg{daemonSessionID: targetDaemonSessionID}
 		}

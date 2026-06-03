@@ -266,6 +266,7 @@ func (s *Server) handleSession(conn net.Conn, scanner *bufio.Scanner, startCmd p
 
 	sessionID := generateSessionID()
 	session := NewSession(sessionID, s, llmClient, model, cwd, startData.ConfigDir, startData.ForceInit, startData.EnableAutomaticWritePermission, startData.EnableAutomaticDirectoryAccess, startData.Headless, s.serverCtx)
+	session.modelOverride = startData.ModelOverride
 
 	// Seed conversation history from a forked session if requested.
 	// Must be done before session.Run() starts processing commands.

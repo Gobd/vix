@@ -35,6 +35,10 @@ type SessionStartData struct {
 	CWD                             string `json:"cwd"`
 	ConfigDir                       string `json:"config_dir,omitempty"`
 	Model                           string `json:"model"`
+	// ModelOverride, when non-empty, takes priority over the chat agent's
+	// frontmatter model. Use this to pass --model from the CLI without
+	// permanently changing the agent config file.
+	ModelOverride                   string `json:"model_override,omitempty"`
 	ForceInit                       bool   `json:"force_init"`
 	EnableAutomaticWritePermission bool `json:"enable_automatic_write_permission"`
 	EnableAutomaticDirectoryAccess bool `json:"enable_automatic_directory_access"`

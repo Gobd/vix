@@ -210,11 +210,13 @@ func (sc *SessionClient) SessionID() string {
 func (sc *SessionClient) StartedAt() time.Time { return sc.startedAt }
 
 // Connect establishes a persistent connection and starts an agent session.
-func (sc *SessionClient) Connect(cwd, configDir, model string, forceInit bool, enableAutomaticWritePermission bool, enableAutomaticDirectoryAccess bool, headless bool) error {
+// modelOverride, when non-empty, takes priority over the chat agent's frontmatter model.
+func (sc *SessionClient) Connect(cwd, configDir, model, modelOverride string, forceInit bool, enableAutomaticWritePermission bool, enableAutomaticDirectoryAccess bool, headless bool) error {
 	return sc.connectWith(protocol.SessionStartData{
 		CWD:                            cwd,
 		ConfigDir:                      configDir,
 		Model:                          model,
+		ModelOverride:                  modelOverride,
 		ForceInit:                      forceInit,
 		EnableAutomaticWritePermission: enableAutomaticWritePermission,
 		EnableAutomaticDirectoryAccess: enableAutomaticDirectoryAccess,
