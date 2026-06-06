@@ -752,7 +752,7 @@ func envVars(cwd, model string) map[string]string {
 // prompt includes from, in precedence order (highest first).
 // toolTimeouts carries the parent session's tool_timeouts bounds so the
 // runner's tool dispatches honour the same settings.json floor/cap.
-func NewAgentRunner(config SubagentConfig, cred config.Credential, parentModel, cwd string, toolTimeouts ToolTimeouts, searchDirs ...string) *AgentRunner {
+func NewAgentRunner(config SubagentConfig, cred config.Credential, parentModel, cwd string, toolTimeouts ToolTimeouts, searchDirs ...string) (*AgentRunner, error) {
 	model := config.Model
 	if model == "" {
 		model = parentModel
@@ -769,8 +769,7 @@ func NewAgentRunner(config SubagentConfig, cred config.Credential, parentModel, 
 	}
 	client, err := llm.NewFromModel(model, PluginConfig{}, effort, int64(config.MaxTokens))
 	if err != nil {
-		// Fall back to Anthropic adapter with the caller-provided credential.
-		client = NewLLM(cred, model, effort, int64(config.MaxTokens), PluginConfig{})
+		return nil, fmt.Errorf("cannot build agent runner: %w", err)
 	}
 	tools := FilterToolSchemasWithBounds(config.Tools, toolTimeouts.Default, toolTimeouts.Max)
 
@@ -789,11 +788,11 @@ func NewAgentRunner(config SubagentConfig, cred config.Credential, parentModel, 
 		Tools:        tools,
 		MaxTurns:     maxTurns,
 		ToolTimeouts: toolTimeouts,
-	}
+	}, nil
 }
 
 // Clone creates a deep copy of the agent runner (for fork_from).
-func (a *AgentRunner) Clone(cred config.Credential) *AgentRunner {
+func (a *AgentRunner) Clone(cred config.Credential) (*AgentRunner, error) {
 	msgs := make([]llm.MessageParam, len(a.Messages))
 	copy(msgs, a.Messages)
 
@@ -806,7 +805,7 @@ func (a *AgentRunner) Clone(cred config.Credential) *AgentRunner {
 	cloneSpec := llm.Spec(a.LLM) // e.g. "openai/gpt-5.1"
 	clonedClient, err := llm.NewFromModel(cloneSpec, PluginConfig{}, a.LLM.Effort(), a.LLM.MaxTokens())
 	if err != nil {
-		clonedClient = NewLLM(cred, a.LLM.Model(), a.LLM.Effort(), a.LLM.MaxTokens(), PluginConfig{})
+		return nil, fmt.Errorf("cannot clone agent runner: %w", err)
 	}
 
 	return &AgentRunner{
@@ -817,7 +816,7 @@ func (a *AgentRunner) Clone(cred config.Credential) *AgentRunner {
 		Tools:        tools,
 		MaxTurns:     a.MaxTurns,
 		ToolTimeouts: a.ToolTimeouts,
-	}
+	}, nil
 }
 
 // Send sends a message to the agent, runs the LLM loop with tool dispatch,
@@ -1434,7 +1433,12 @@ func (s *Session) executeParallelSteps(
 					if step.Effort != "" {
 						config.Effort = step.Effort
 					}
-					agent = NewAgentRunner(config, cred, parentModel, s.cwd, s.projectConfig.ToolTimeouts, s.searchDirsSlice()...)
+					ar, err := NewAgentRunner(config, cred, parentModel, s.cwd, s.projectConfig.ToolTimeouts, s.searchDirsSlice()...)
+					if err != nil {
+						errs[idx] = fmt.Errorf("step '%s': %w", stepID, err)
+						return
+					}
+					agent = ar
 					if s.headless {
 						agent.Tools = ExcludeTools(agent.Tools, "ask_question_to_user")
 					}
@@ -1446,7 +1450,12 @@ func (s *Session) executeParallelSteps(
 						errs[idx] = fmt.Errorf("step '%s': fork_from '%s' has no agent instance", stepID, step.ForkFrom)
 						return
 					}
-					agent = source.Clone(cred)
+					ar, err := source.Clone(cred)
+					if err != nil {
+						errs[idx] = fmt.Errorf("step '%s': %w", stepID, err)
+						return
+					}
+					agent = ar
 				}
 
 				vars := envVars(s.cwd, s.model)
@@ -1960,7 +1969,17 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 				if step.Effort != "" {
 					config.Effort = step.Effort
 				}
-				agent = NewAgentRunner(config, cred, parentModel, s.cwd, s.projectConfig.ToolTimeouts, s.searchDirsSlice()...)
+				ar, err := NewAgentRunner(config, cred, parentModel, s.cwd, s.projectConfig.ToolTimeouts, s.searchDirsSlice()...)
+				if err != nil {
+					s.activePlan = nil
+					s.emit("event.workflow_complete", protocol.EventWorkflowComplete{
+						WorkflowName: pf.Name,
+						Success:      false,
+						DurationMs:   time.Since(workflowStart).Milliseconds(),
+					})
+					return fmt.Errorf("step '%s': %w", stepID, err)
+				}
+				agent = ar
 				if s.headless {
 					agent.Tools = ExcludeTools(agent.Tools, "ask_question_to_user")
 				}
@@ -1976,7 +1995,17 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 					})
 					return fmt.Errorf("step '%s': fork_from '%s' has no agent instance", stepID, step.ForkFrom)
 				}
-				agent = source.Clone(cred)
+				ar, err := source.Clone(cred)
+				if err != nil {
+					s.activePlan = nil
+					s.emit("event.workflow_complete", protocol.EventWorkflowComplete{
+						WorkflowName: pf.Name,
+						Success:      false,
+						DurationMs:   time.Since(workflowStart).Milliseconds(),
+					})
+					return fmt.Errorf("step '%s': %w", stepID, err)
+				}
+				agent = ar
 				agentLabel = stepID + " (from " + step.ForkFrom + ")"
 			}
 			_ = agentLabel

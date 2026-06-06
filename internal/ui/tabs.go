@@ -304,7 +304,7 @@ const modelsViewportChrome = 1
 // renderer and the key handler both call it so the grid window and the scroll
 // clamp agree on how many rows fit.
 func modelsHeaderLines(st config.ProviderAuthStatus, loginStatus string) int {
-	n := 2 // "Authentication" title + separator
+	n := 2 // "Credentials" title + separator
 	n += 2 // API Key row + its buttons row
 	if st.OAuthSupported {
 		n += 2 // OAuth token row + its buttons row
@@ -417,7 +417,7 @@ func renderModelsView(width, height int, s Styles,
 	}
 
 	var rightLines []string
-	rightLines = append(rightLines, authTitle.Render("Authentication"), sep)
+	rightLines = append(rightLines, authTitle.Render("Credentials"), sep)
 
 	defaultTag := func(isDefault bool) string {
 		if isDefault {

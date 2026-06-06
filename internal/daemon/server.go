@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 	"github.com/get-vix/vix/internal/config"
-	"github.com/get-vix/vix/internal/daemon/llm"
 	"github.com/get-vix/vix/internal/protocol"
 )
 
@@ -256,13 +255,11 @@ func (s *Server) handleSession(conn net.Conn, scanner *bufio.Scanner, startCmd p
 		model = s.model
 	}
 
-	llmClient, err := llm.NewFromModel(model, s.pluginConfig, llm.DefaultEffortFromSpec(model), 0)
-	if err != nil {
-		// Fall back to a default Anthropic client if the model spec can't be
-		// resolved (e.g. no credential for the target provider). initBrain
-		// will attempt to resolve again from the agent frontmatter.
-		llmClient = NewLLM(s.cred, model, defaultSessionEffort(model), 0, s.pluginConfig)
-	}
+	// The session resolves its own LLM client from the authoritative model
+	// (chat-agent frontmatter, falling back to this initial spec) in initBrain.
+	// We pass nil here; if no credential is available the session enters its
+	// unconfigured state rather than fabricating a doomed client.
+	var llmClient LLM
 
 	sessionID := generateSessionID()
 	session := NewSession(sessionID, s, llmClient, model, cwd, startData.ConfigDir, startData.ForceInit, startData.EnableAutomaticWritePermission, startData.EnableAutomaticDirectoryAccess, startData.Headless, s.serverCtx)

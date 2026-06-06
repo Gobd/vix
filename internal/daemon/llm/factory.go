@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -9,6 +10,12 @@ import (
 	"github.com/get-vix/vix/internal/config"
 	"github.com/get-vix/vix/internal/providers"
 )
+
+// ErrNoCredential is wrapped by NewFromModel when the selected model's provider
+// has no resolvable credential. Callers use errors.Is to distinguish this
+// (recoverable: the user just needs to add a key) from other construction
+// failures such as an unknown provider prefix.
+var ErrNoCredential = errors.New("no credential")
 
 // Config is the shared input set every wire builder takes.
 type Config struct {
@@ -90,9 +97,9 @@ func NewFromModel(spec string, plugin PluginConfig, effort string, maxTokens int
 	cred := config.ResolveProviderCredentialFresh(refreshCtx, p.ID)
 	if cred.Value == "" {
 		if env := config.PrimaryEnvVar(p.ID); env != "" {
-			return nil, fmt.Errorf("no credential for %s (set %s)", p.ID, env)
+			return nil, fmt.Errorf("no credential for %s (set %s): %w", p.ID, env, ErrNoCredential)
 		}
-		return nil, fmt.Errorf("no credential for %s", p.ID)
+		return nil, fmt.Errorf("no credential for %s: %w", p.ID, ErrNoCredential)
 	}
 
 	inf := p.Inference.Resolve()

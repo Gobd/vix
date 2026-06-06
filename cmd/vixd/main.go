@@ -40,6 +40,7 @@ func main() {
 	socketPathFlag := flag.String("socket-path", "", "Unix socket path for the vix↔vixd connection. Env: VIX_SOCKET_PATH. Default: "+defaultSocketPath+".")
 	authTokenPath := flag.String("auth-token-path", "", "Path to a file holding the shared-secret token required on every incoming socket message. Empty means no auth check (in-process tests / trusted-host runs only — production deployments must set this and put the file outside the agent's reachable path tree, e.g. on a Landlock-blocked location). Env: VIX_AUTH_TOKEN_PATH.")
 	webPort := flag.Int("web-port", 1337, "Port for the local web UI. 0 disables it. Env: VIX_WEB_PORT.")
+	noMissionControl := flag.Bool("no-mission-control", false, "Disable the mission-control web UI server. Env: VIX_NO_MISSION_CONTROL.")
 	pprofPort := flag.Int("pprof-port", 0, "Port for the pprof HTTP server (GET /debug/pprof/*). 0 disables it. Env: VIX_PPROF_PORT.")
 	flag.Parse()
 
@@ -64,6 +65,11 @@ func main() {
 	if v := os.Getenv("VIX_WEB_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil {
 			*webPort = p
+		}
+	}
+	if !*noMissionControl {
+		if v := os.Getenv("VIX_NO_MISSION_CONTROL"); v == "1" || v == "true" {
+			*noMissionControl = true
 		}
 	}
 	if v := os.Getenv("VIX_PPROF_PORT"); v != "" {
@@ -160,7 +166,7 @@ func main() {
 		server.RegisterHandler(cmd, handler)
 	}, cred, ctx)
 	daemon.RegisterToolHandlers(server)
-	if *webPort > 0 {
+	if *webPort > 0 && !*noMissionControl {
 		go daemon.StartWebServer(ctx, server, *webPort)
 	}
 	if *pprofPort > 0 {

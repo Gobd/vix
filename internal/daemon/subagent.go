@@ -115,9 +115,7 @@ func RunSubagent(
 	}
 	client, err := llm.NewFromModel(model, PluginConfig{}, effort, int64(config.MaxTokens))
 	if err != nil {
-		// Fall back to Anthropic adapter with the caller-provided credential
-		// when the model spec can't be resolved (e.g. missing provider key).
-		client = NewLLM(cred, model, effort, int64(config.MaxTokens), PluginConfig{})
+		return nil, fmt.Errorf("cannot run subagent: %w", err)
 	}
 	tools := FilterToolSchemasWithBounds(config.Tools, toolTimeoutDefault, toolTimeoutMax)
 

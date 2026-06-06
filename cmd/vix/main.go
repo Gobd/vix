@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -16,7 +15,6 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 
 	"github.com/get-vix/vix/internal/config"
 	"github.com/get-vix/vix/internal/daemon"
@@ -26,7 +24,6 @@ import (
 	"github.com/get-vix/vix/internal/telemetry"
 
 	"github.com/get-vix/vix/internal/ui"
-	"github.com/mattn/go-isatty"
 )
 
 // Version is set at build time via -ldflags.
@@ -163,11 +160,12 @@ func main() {
 	// Pre-flight credential resolution. The session resolves the actual
 	// per-provider credential when the daemon constructs the LLM (based on
 	// the active chat agent's `model:` frontmatter); this check just makes
-	// sure the user has at least one usable key configured and offers a
-	// first-run interactive prompt for ANTHROPIC_API_KEY when none is set.
-	// Users on non-Anthropic providers must set their provider's env var
-	// (OPENAI_API_KEY / OPENROUTER_API_KEY / MINIMAX_API_KEY / MIMO_API_KEY)
-	// themselves.
+	// sure the user has at least one usable key configured, failing fast in
+	// headless mode when none is set. In interactive mode a missing credential
+	// for the selected model is surfaced as an error in the UI by the daemon.
+	// Users must set their provider's env var (ANTHROPIC_API_KEY /
+	// CLAUDE_CODE_OAUTH_TOKEN / OPENAI_API_KEY / OPENROUTER_API_KEY /
+	// MINIMAX_API_KEY / MIMO_API_KEY) themselves.
 	var apiKey string
 	apiKey, _ = config.ResolveProviderKey("anthropic") // includes CLAUDE_CODE_OAUTH_TOKEN fallback
 	hasNonAnthropicKey := func() bool {
@@ -178,21 +176,9 @@ func main() {
 		}
 		return false
 	}
-	if apiKey == "" && !hasNonAnthropicKey() {
-		isHeadless := *prompt != ""
-		if isHeadless {
-			fmt.Fprintf(os.Stderr, "Error: no API key found. Set ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, OPENAI_API_KEY, OPENROUTER_API_KEY, MINIMAX_API_KEY, or MIMO_API_KEY.\n")
-			os.Exit(1)
-		}
-		if isatty.IsTerminal(os.Stdin.Fd()) || isatty.IsCygwinTerminal(os.Stdin.Fd()) {
-			apiKey = promptAPIKey()
-			if apiKey != "" {
-				if err := config.StoreProviderKey("anthropic", apiKey); err != nil {
-					warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-					fmt.Fprintf(os.Stderr, "%s %v\n", warnStyle.Render("Warning: could not save key to keychain:"), err)
-				}
-			}
-		}
+	if apiKey == "" && !hasNonAnthropicKey() && *prompt != "" {
+		fmt.Fprintf(os.Stderr, "Error: no API key found. Set ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, OPENAI_API_KEY, OPENROUTER_API_KEY, MINIMAX_API_KEY, or MIMO_API_KEY.\n")
+		os.Exit(1)
 	}
 
 	cfg, err := config.Load(*forceInit, *workdir, *configDir, *socketPath)
@@ -269,35 +255,19 @@ func main() {
 		client := daemon.NewClient(cfg.SocketPath)
 		client.SetAuthToken(authToken)
 		if !client.Ping() {
-			if *prompt != "" {
-				// Headless mode: auto-start silently
-				var err error
-				daemonCmd, err = startDaemon(apiKey, resolvedLogDir, cfg.SocketPath, *authTokenPath)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error starting daemon: %v\n", err)
-					os.Exit(1)
-				}
-				if !waitForDaemon(client, 5*time.Second) {
-					fmt.Fprintf(os.Stderr, "Error: daemon did not start in time\n")
-					os.Exit(1)
-				}
-			} else {
-				// Interactive mode: ask the user
-				choice := promptDaemonChoice()
-				if choice == 1 {
-					var err error
-					daemonCmd, err = startDaemon(apiKey, resolvedLogDir, cfg.SocketPath, *authTokenPath)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "Error starting daemon: %v\n", err)
-						os.Exit(1)
-					}
-					if !waitForDaemon(client, 5*time.Second) {
-						fmt.Fprintf(os.Stderr, "Error: daemon did not start in time\n")
-						os.Exit(1)
-					}
-				} else {
-					fmt.Fprintf(os.Stderr, "Start the daemon manually with:\n  vix-daemon\n\n")
-				}
+			// No daemon answered the ping — spawn our own private daemon
+			// (silently, in both interactive and headless mode). An already
+			// running daemon is reused; only the instance that spawned the
+			// daemon tears it down on exit (see the daemonCmd cleanup below).
+			var err error
+			daemonCmd, err = startDaemon(apiKey, resolvedLogDir, cfg.SocketPath, *authTokenPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error starting daemon: %v\n", err)
+				os.Exit(1)
+			}
+			if !waitForDaemon(client, 5*time.Second) {
+				fmt.Fprintf(os.Stderr, "Error: daemon did not start in time\n")
+				os.Exit(1)
 			}
 		}
 
@@ -356,44 +326,22 @@ func main() {
 	}
 }
 
-// promptDaemonChoice asks the user how to handle a missing daemon.
-// Returns 1 (start subprocess) or 2 (start manually later).
-func promptDaemonChoice() int {
-	warn := lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
-	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	num := lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
-	prompt := lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
-
-	fmt.Println(warn.Render("The vix daemon is not running."))
-	fmt.Println()
-	fmt.Printf("  %s %s\n", num.Render("1)"), "Start daemon as a subprocess "+dim.Render("(will stop when this session exits, killing any other connected sessions)"))
-	fmt.Printf("  %s %s\n", num.Render("2)"), "Start the daemon manually later")
-	fmt.Println()
-	fmt.Print(prompt.Render("Choose [1/2] (default: 1): "))
-
-	reader := bufio.NewReader(os.Stdin)
-	line, _ := reader.ReadString('\n')
-	line = strings.TrimSpace(line)
-	if line == "2" {
-		return 2
-	}
-	return 1
-}
-
 // findDaemon returns the path to the vixd binary.
-// It checks $PATH first, then the directory containing the current executable.
+// It prefers the vixd sitting next to the current executable so the client
+// and daemon always come from the same build; an unrelated vixd earlier on
+// $PATH (e.g. a stale install) would otherwise be spawned with flags it may
+// not understand. Falls back to $PATH only when no sibling binary exists.
 func findDaemon() (string, error) {
-	if p, err := exec.LookPath("vixd"); err == nil {
-		return p, nil
-	}
-	self, err := os.Executable()
-	if err == nil {
+	if self, err := os.Executable(); err == nil {
 		candidate := filepath.Join(filepath.Dir(self), "vixd")
 		if _, err := os.Stat(candidate); err == nil {
 			return candidate, nil
 		}
 	}
-	return "", fmt.Errorf("vixd not found in $PATH or next to the vix binary")
+	if p, err := exec.LookPath("vixd"); err == nil {
+		return p, nil
+	}
+	return "", fmt.Errorf("vixd not found next to the vix binary or in $PATH")
 }
 
 // startDaemon spawns the daemon process as a subprocess.
@@ -423,6 +371,10 @@ func startDaemon(apiKey, logDir, socketPath, authTokenPath string) (*exec.Cmd, e
 	if authTokenPath != "" {
 		args = append(args, "--auth-token-path", authTokenPath)
 	}
+	// A daemon spawned by vix is private to this instance, so it must not
+	// serve the mission-control web UI (which would otherwise contend for
+	// the fixed web port). Standalone `vixd` keeps serving it.
+	args = append(args, "--no-mission-control")
 	cmd := exec.Command(daemonPath, args...)
 	if apiKey != "" {
 		cmd.Env = append(os.Environ(), "ANTHROPIC_API_KEY="+apiKey)
@@ -447,21 +399,6 @@ func startDaemon(apiKey, logDir, socketPath, authTokenPath string) (*exec.Cmd, e
 		}
 	}()
 	return cmd, nil
-}
-
-// promptAPIKey asks the user to enter their Anthropic API key interactively.
-func promptAPIKey() string {
-	warn := lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
-	prompt := lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
-
-	fmt.Println(warn.Render("No API key found."))
-	fmt.Println()
-	fmt.Print(prompt.Render("Enter your Anthropic API key: "))
-
-	reader := bufio.NewReader(os.Stdin)
-	line, _ := reader.ReadString('\n')
-	key := strings.TrimSpace(line)
-	return key
 }
 
 // waitForDaemon polls until the daemon responds to ping or timeout.

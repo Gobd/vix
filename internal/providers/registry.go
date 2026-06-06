@@ -111,6 +111,25 @@ func (r *Registry) ContextWindow(spec string) int64 {
 	return 0
 }
 
+// DisplayName returns the catalogued display name for the model identified by
+// spec (e.g. "anthropic/claude-opus-4-8"). Falls back to the raw spec when the
+// model isn't catalogued, so callers never render a blank name.
+func (r *Registry) DisplayName(spec string) string {
+	p, _, err := r.ParseModel(spec)
+	if err != nil {
+		return spec
+	}
+	for _, m := range p.Models {
+		if m.Spec == spec {
+			if m.DisplayName != "" {
+				return m.DisplayName
+			}
+			break
+		}
+	}
+	return spec
+}
+
 // AuthLogin returns the auth login spec with the given id.
 func (r *Registry) AuthLogin(id string) (AuthLogin, bool) {
 	i, ok := r.authByID[id]

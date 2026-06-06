@@ -112,6 +112,12 @@ type Session struct {
 	// Active LLM call cancellation
 	cancelStream context.CancelFunc
 
+	// configErr is non-nil when the session has no usable LLM client (e.g. no
+	// credential for the selected model's provider). While set, s.llm is nil
+	// and the session refuses to stream; the error surfaces to the UI on the
+	// next input attempt.
+	configErr error
+
 	// Active plan/workflow cancellation
 	planCancel context.CancelFunc
 
@@ -546,21 +552,19 @@ func (s *Session) Run() {
 				if data.Model != "" {
 					// Every model spec must carry an explicit provider
 					// prefix (anthropic/, openai/, openrouter/, minimax/,
-					// mimo/).
-					// The UI picker dispatches the Spec field, which is
-					// already prefixed; bare names will fail in
+					// mimo/). The UI picker dispatches the Spec field, which
+					// is already prefixed; bare names will fail in
 					// llm.NewFromModel with a clear error.
 					spec := data.Model
-					client, err := llm.NewFromModel(spec, s.server.pluginConfig, llm.DefaultEffortFromSpec(spec), 0)
-					if err != nil {
+					// applyModel commits only on success, so a failed switch
+					// leaves a previously-working session untouched.
+					if err := s.applyModel(spec, 0); err != nil {
 						s.emit("event.error", protocol.EventError{Message: fmt.Sprintf("Cannot switch to model %q: %v", spec, err)})
 						log.Printf("[session] set_model failed for %s: %v", spec, err)
 						continue
 					}
-					s.llm = client
-					s.model = spec
 
-					log.Printf("[session] model switched to %s (provider=%s)", spec, client.Provider())
+					log.Printf("[session] model switched to %s (provider=%s)", spec, s.llm.Provider())
 
 					// Persist the choice to the chat agent's frontmatter so
 					// future sessions start with the same model. Best-effort:
@@ -579,6 +583,33 @@ func (s *Session) Run() {
 			}
 		}
 	}
+}
+
+// applyModel resolves spec → LLM client and, on success, swaps in the client,
+// updates s.model, and clears configErr. On failure it mutates no session state
+// and returns the error for the caller to handle (initBrain records it as the
+// unconfigured state; set_model keeps the prior working client). It never
+// fabricates a client, so a missing credential can't leak into an LLM request.
+func (s *Session) applyModel(spec string, maxTokens int64) error {
+	client, err := llm.NewFromModel(spec, s.server.pluginConfig, llm.DefaultEffortFromSpec(spec), maxTokens)
+	if err != nil {
+		return err
+	}
+	s.llm = client
+	s.model = spec
+	s.configErr = nil
+	return nil
+}
+
+// unconfiguredMessage renders the user-facing error for the session's current
+// configErr. Missing credentials get a friendly, actionable message keyed by
+// the model's display name; any other construction failure shows the raw error.
+func (s *Session) unconfiguredMessage() string {
+	if errors.Is(s.configErr, llm.ErrNoCredential) {
+		name := providers.Default().DisplayName(s.model)
+		return fmt.Sprintf("There are no credentials set to access %s. Go to Models (F3) to set your credentials.", name)
+	}
+	return s.configErr.Error()
 }
 
 // initBrain ensures the brain index exists (running brain.init if needed),
@@ -655,30 +686,35 @@ func (s *Session) initBrain() {
 	}
 
 	// Apply tool filtering AND model selection from the chat agent's
-	// frontmatter (e.g. general.md). This mirrors what subagents do via
-	// FilterToolSchemasWithBounds — the chat agent's `model:` field is the
-	// authoritative source for the session's model.
+	// frontmatter (e.g. general.md). The chat agent's `model:` field is the
+	// authoritative source for the session's model, falling back to the
+	// daemon default (s.model) when the frontmatter omits it.
 	agentFilePath := s.resolveAgentPath(s.chatAgent + ".md")
+	modelSpec := s.model
+	var modelMaxTokens int64
 	if agentCfg, err := parseAgentFile(agentFilePath); err == nil {
 		if len(agentCfg.Tools) > 0 {
 			s.tools = FilterToolSchemasWithBounds(agentCfg.Tools, tDef, tMax)
 			log.Printf("[session] chat agent tools from frontmatter: %v", agentCfg.Tools)
 		}
 		if agentCfg.Model != "" {
-			spec := agentCfg.Model
-			// Every model spec must carry an explicit provider prefix.
-			// Bare names (e.g. legacy "claude-sonnet-4-6") will fail in
-			// llm.NewFromModel with a clear error and the session keeps
-			// the daemon default.
-			client, err := llm.NewFromModel(spec, s.server.pluginConfig, llm.DefaultEffortFromSpec(spec), int64(agentCfg.MaxTokens))
-			if err != nil {
-				log.Printf("[session] WARN: cannot construct LLM for agent %q (model=%q): %v — keeping default", s.chatAgent, spec, err)
-			} else {
-				s.llm = client
-				s.model = spec
-				log.Printf("[session] chat agent model: %s (provider=%s)", spec, client.Provider())
-			}
+			modelSpec = agentCfg.Model
+			modelMaxTokens = int64(agentCfg.MaxTokens)
 		}
+	}
+
+	// Resolve the session's LLM client from the authoritative model spec. On
+	// failure (e.g. no credential for the provider) the session enters the
+	// unconfigured state: s.llm stays nil and the error surfaces to the UI on
+	// the next input attempt, rather than fabricating a client that would leak
+	// the missing credential into a doomed LLM request.
+	if err := s.applyModel(modelSpec, modelMaxTokens); err != nil {
+		s.configErr = err
+		s.model = modelSpec
+		s.llm = nil
+		log.Printf("[session] WARN: no usable LLM client for %q (model=%q): %v — session unconfigured", s.chatAgent, modelSpec, err)
+	} else {
+		log.Printf("[session] chat agent model: %s (provider=%s)", s.model, s.llm.Provider())
 	}
 
 	if projectConfig.HasFeature(FeatureToolOrchestrator) {
@@ -1573,6 +1609,15 @@ func (s *Session) handleInput(text string, attachments []protocol.Attachment) {
 		return
 	}
 
+	// Unconfigured session: no usable LLM client (e.g. no credential for the
+	// selected model's provider). Surface the error to the UI without ever
+	// contacting the LLM. Placed before /compact, which also needs the client.
+	if s.configErr != nil {
+		s.emit("event.error", protocol.EventError{Message: s.unconfiguredMessage()})
+		s.emit("event.agent_done", nil)
+		return
+	}
+
 	// /compact [N] — summarize older turns to free context. Handled daemon-side
 	// because it mutates s.messages and needs an LLM call.
 	if text == "/compact" || strings.HasPrefix(text, "/compact ") {
@@ -2325,6 +2370,14 @@ func providerFor(model string) string {
 // handleWorkflowCommand handles a session.workflow command by looking up and executing
 // the workflow matching the given name.
 func (s *Session) handleWorkflowCommand(name, text string) {
+	// Unconfigured session: no usable LLM client. Workflows stream too, so
+	// refuse before doing any work and surface the error to the UI.
+	if s.configErr != nil {
+		s.emit("event.error", protocol.EventError{Message: s.unconfiguredMessage()})
+		s.emit("event.agent_done", nil)
+		return
+	}
+
 	var wf *WorkflowDef
 	for _, w := range s.workflows {
 		if w.Name == name {

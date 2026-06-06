@@ -144,6 +144,28 @@ func TestParseModel(t *testing.T) {
 	}
 }
 
+// TestDisplayName checks spec→display-name lookup, including the raw-spec
+// fallback for models that aren't catalogued (or have no display name).
+func TestDisplayName(t *testing.T) {
+	reg, _ := loadEmbedded()
+	cases := []struct {
+		spec string
+		want string
+	}{
+		{"anthropic/claude-sonnet-4-6", "Claude Sonnet 4 6"},
+		{"anthropic/claude-opus-4-8", "Claude Opus 4 8"},
+		// Uncatalogued model under a known provider → falls back to raw spec.
+		{"anthropic/not-a-real-model", "anthropic/not-a-real-model"},
+		// Unknown provider prefix → falls back to raw spec.
+		{"weirdco/whatever", "weirdco/whatever"},
+	}
+	for _, c := range cases {
+		if got := reg.DisplayName(c.spec); got != c.want {
+			t.Errorf("DisplayName(%q) = %q, want %q", c.spec, got, c.want)
+		}
+	}
+}
+
 // TestDefaultEffort mirrors the old llm.DefaultEffortFromSpec cases.
 func TestDefaultEffort(t *testing.T) {
 	reg, _ := loadEmbedded()
