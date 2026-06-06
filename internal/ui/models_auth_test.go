@@ -80,11 +80,11 @@ func TestAuthButtonsFor(t *testing.T) {
 	}
 }
 
-// TestTabBarHasModelsAndSettings verifies the tab bar shows the Models (F3) and
-// Settings (F4) tabs after the remap.
+// TestTabBarHasModelsAndSettings verifies the tab bar shows the Models [F3] and
+// Settings [F4] tabs after the remap.
 func TestTabBarHasModelsAndSettings(t *testing.T) {
-	bar := renderTabBar(TabKindModels, 120, NewStyles(false), true, false)
-	for _, want := range []string{"Models (F3)", "Settings (F4)", "Sessions (F1)", "Workspace (F2)"} {
+	bar := renderTabBar(TabKindModels, 120, NewStyles(false), true, false, false)
+	for _, want := range []string{"Models [F3]", "Settings [F4]", "Sessions [F1]", "Workspace [F2]"} {
 		if !strings.Contains(bar, want) {
 			t.Errorf("tab bar missing %q\n%s", want, bar)
 		}

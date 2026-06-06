@@ -561,16 +561,18 @@ const keyValNotAvailable = "(not available)"
 
 // renderTabBar renders the two-tab bar: Sessions | Chat.
 // alertBlink is true when some session needs user attention (shown on Chat tab label).
-func renderTabBar(activeTab TabKind, width int, s Styles, viewportFocused bool, alertBlink bool) string {
+// hasUnread is true when any session has unread messages; it shows a secondary-colored
+// dot in front of the Sessions tab title.
+func renderTabBar(activeTab TabKind, width int, s Styles, viewportFocused bool, alertBlink bool, hasUnread bool) string {
 	type tabDef struct {
 		label string
 		kind  TabKind
 	}
 	defs := []tabDef{
-		{" Sessions (F1) ", TabKindSessions},
-		{" Workspace (F2) ", TabKindChat},
-		{" Models (F3) ", TabKindModels},
-		{" Settings (F4) ", TabKindSettings},
+		{" Sessions [F1] ", TabKindSessions},
+		{" Workspace [F2] ", TabKindChat},
+		{" Models [F3] ", TabKindModels},
+		{" Settings [F4] ", TabKindSettings},
 	}
 
 	var sepStyle lipgloss.Style
@@ -613,7 +615,14 @@ func renderTabBar(activeTab TabKind, width int, s Styles, viewportFocused bool, 
 		}
 
 		top.WriteString(sepStyle.Render(topLine))
-		mid.WriteString(sepStyle.Render("│") + textStyle.Render(d.label) + sepStyle.Render("│"))
+		if hasUnread && d.kind == TabKindSessions {
+			// Replace the label's leading space with a secondary-colored dot,
+			// keeping the overall label width (and thus the box) unchanged.
+			rest := strings.TrimPrefix(d.label, " ")
+			mid.WriteString(sepStyle.Render("│") + unreadDotStyle.Render("●") + textStyle.Render(rest) + sepStyle.Render("│"))
+		} else {
+			mid.WriteString(sepStyle.Render("│") + textStyle.Render(d.label) + sepStyle.Render("│"))
+		}
 		bot.WriteString(sepStyle.Render(botLine))
 		visPos += lw + 2
 	}

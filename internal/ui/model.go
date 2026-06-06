@@ -2186,7 +2186,14 @@ func (m Model) View() tea.View {
 	if m.activeTab == TabKindSessions || m.activeTab == TabKindModels || m.activeTab == TabKindSettings {
 		tabBarWidth = m.width
 	}
-	tabBar := renderTabBar(m.activeTab, tabBarWidth, m.styles, viewportFocused, m.tabAlertBlinkOn)
+	anyUnread := false
+	for _, sess := range m.sessions {
+		if sess.unreadCount > 0 {
+			anyUnread = true
+			break
+		}
+	}
+	tabBar := renderTabBar(m.activeTab, tabBarWidth, m.styles, viewportFocused, m.tabAlertBlinkOn, anyUnread)
 	uv.NewStyledString(tabBar).Draw(canvas, image.Rect(0, y, tabBarWidth, y+layout.TabBarHeight))
 	y += layout.TabBarHeight
 
