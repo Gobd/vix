@@ -82,6 +82,10 @@ func Init(cfg Config) {
 			Endpoint:  posthogHost,
 			BatchSize: 20,
 			Interval:  30 * time.Second,
+			// Enable server-side GeoIP enrichment. The SDK disables it by
+			// default for Go (server-side assumption); pass false explicitly so
+			// PostHog derives location properties from the request IP.
+			DisableGeoIP: posthog.Ptr(false),
 			// Bound Close() so a flush-on-crash can't hang the dying
 			// process indefinitely on a dead network (Close waits forever
 			// when ShutdownTimeout is unset).
