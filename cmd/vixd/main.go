@@ -42,6 +42,7 @@ func main() {
 	webPort := flag.Int("web-port", 1337, "Port for the local web UI. 0 disables it. Env: VIX_WEB_PORT.")
 	noMissionControl := flag.Bool("no-mission-control", false, "Disable the mission-control web UI server. Env: VIX_NO_MISSION_CONTROL.")
 	pprofPort := flag.Int("pprof-port", 0, "Port for the pprof HTTP server (GET /debug/pprof/*). 0 disables it. Env: VIX_PPROF_PORT.")
+	exitWithClients := flag.Bool("exit-with-clients", false, "Shut down automatically once the last attached vix instance disconnects (after a short grace period). Off by default so a directly-launched vixd runs until signalled. vix sets this when it spawns a daemon. Env: VIX_EXIT_WITH_CLIENTS.")
 	flag.Parse()
 
 	// Env-var fallbacks for path-bearing flags. Precedence: explicit
@@ -75,6 +76,11 @@ func main() {
 	if v := os.Getenv("VIX_PPROF_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil {
 			*pprofPort = p
+		}
+	}
+	if !*exitWithClients {
+		if v := os.Getenv("VIX_EXIT_WITH_CLIENTS"); v == "1" || v == "true" {
+			*exitWithClients = true
 		}
 	}
 
@@ -161,6 +167,7 @@ func main() {
 	pluginCfg := daemon.LoadPlugins(pluginPaths.Plugins(), Version, model)
 
 	server := daemon.NewServer(*socketPathFlag, cred, sessionID, model, daemonConfig, pluginCfg)
+	server.SetExitWithClients(*exitWithClients)
 	daemon.RegisterBuiltinHandlers(server)
 	brain.RegisterBrainHandlers(func(cmd string, handler func(map[string]any) (map[string]any, error)) {
 		server.RegisterHandler(cmd, handler)

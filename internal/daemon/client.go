@@ -268,6 +268,11 @@ func (sc *SessionClient) ConnectFork(cwd, configDir, model string, forceInit boo
 // first flush). Callers should orphan the session rather than retry.
 var ErrSessionNotFound = errors.New("session not found")
 
+// ErrSessionBusy is returned by Attach when the requested session is already
+// open in another connection (exclusive single-writer ownership). Callers can
+// retry later (the owner may disconnect) or restore/attach a different session.
+var ErrSessionBusy = errors.New("session busy")
+
 // Attach establishes a persistent connection and resumes the persisted session
 // with the given ID. On success the daemon replays the conversation via
 // event.replay. Returns ErrSessionNotFound when no record exists on disk.
@@ -317,6 +322,9 @@ func (sc *SessionClient) connectWith(startData protocol.SessionStartData) error 
 		json.Unmarshal(raw, &ee)
 		if ee.Code == "session_not_found" {
 			return ErrSessionNotFound
+		}
+		if ee.Code == "session_busy" {
+			return ErrSessionBusy
 		}
 		if ee.Message != "" {
 			return fmt.Errorf("session start failed: %s", ee.Message)
@@ -485,4 +493,47 @@ func (sc *SessionClient) sendCommand(cmd protocol.SessionCommand) error {
 	data = append(data, '\n')
 	_, err = sc.conn.Write(data)
 	return err
+}
+
+// InstanceClient is a long-lived control connection that registers the running
+// vix process as an "instance" with the daemon. The daemon counts these to know
+// how many vix processes are attached (independently of sessions). The client
+// sends a single instance.register command and then holds the connection open
+// for the process lifetime; closing it (clean exit or process death) tells the
+// daemon this instance is gone.
+type InstanceClient struct {
+	conn net.Conn
+}
+
+// RegisterInstance dials the daemon and registers this process as an attached
+// instance, returning a handle whose Close ends the registration. mode is
+// advisory ("tui" | "headless"). On any failure it returns an error and the
+// caller may simply proceed without registration (the daemon then can't
+// exit-with-clients on this process, which is a safe degradation).
+func RegisterInstance(socketPath, authToken, mode string) (*InstanceClient, error) {
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("daemon connect: %w", err)
+	}
+	data, _ := json.Marshal(protocol.InstanceRegisterData{Mode: mode})
+	cmd := protocol.SessionCommand{Type: "instance.register", AuthToken: authToken, Data: data}
+	payload, err := json.Marshal(cmd)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	payload = append(payload, '\n')
+	if _, err := conn.Write(payload); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("register instance: %w", err)
+	}
+	return &InstanceClient{conn: conn}, nil
+}
+
+// Close ends the instance registration, signalling the daemon that this process
+// has detached.
+func (ic *InstanceClient) Close() {
+	if ic != nil && ic.conn != nil {
+		ic.conn.Close()
+	}
 }

@@ -63,6 +63,24 @@ type Server struct {
 	// Web UI pub/sub
 	subscribers  []chan struct{}
 	subscriberMu sync.Mutex
+
+	// Instance counting + exit-with-clients. Each vix process (TUI or headless)
+	// holds one long-lived "instance.register" connection for its lifetime, so
+	// instanceCount tracks how many vix processes are attached to this daemon.
+	// When exitWithClients is set, the daemon shuts itself down once the count
+	// returns to 0 after having seen at least one instance (everHadInstance) —
+	// guarded by a grace period so a quick quit→relaunch doesn't kill it. A
+	// daemon launched directly (vixd) leaves exitWithClients false and runs
+	// until signalled.
+	exitWithClients bool
+	instanceMu      sync.Mutex
+	instanceCount   int
+	everHadInstance bool
+	exitGraceGen    int // generation guard for the grace timer
+
+	// cancel cancels serverCtx; set in ListenAndServe so internal triggers
+	// (e.g. exit-with-clients) can initiate a graceful shutdown.
+	cancel context.CancelFunc
 }
 
 // NewServer creates a new daemon server.
@@ -85,6 +103,71 @@ func NewServer(sockPath string, cred config.Credential, sessionID, model string,
 	}
 
 	return s
+}
+
+// SetExitWithClients configures whether the daemon shuts itself down once the
+// last attached vix instance disconnects (after a grace period). Off by default
+// so a directly-launched vixd runs until signalled; vix sets it when it spawns a
+// daemon. Must be called before ListenAndServe.
+func (s *Server) SetExitWithClients(v bool) {
+	s.exitWithClients = v
+}
+
+// exitGracePeriod is how long the daemon waits after its last vix instance
+// disconnects before shutting down (when exitWithClients is set). The grace
+// absorbs a quick quit→relaunch or a transient instance-channel re-open without
+// tearing down a daemon another client is about to reuse. It is a var so tests
+// can shorten it.
+var exitGracePeriod = 60 * time.Second
+
+// instanceConnected records a newly attached vix instance.
+func (s *Server) instanceConnected() {
+	s.instanceMu.Lock()
+	s.instanceCount++
+	s.everHadInstance = true
+	s.exitGraceGen++ // cancel any pending grace timer: we have a client again
+	n := s.instanceCount
+	s.instanceMu.Unlock()
+	LogInfo("vix instance connected (now %d attached)", n)
+	s.notifySubscribers()
+}
+
+// instanceDisconnected records a detached vix instance and, when configured,
+// arms the exit-with-clients grace timer if none remain.
+func (s *Server) instanceDisconnected() {
+	s.instanceMu.Lock()
+	if s.instanceCount > 0 {
+		s.instanceCount--
+	}
+	n := s.instanceCount
+	arm := s.exitWithClients && s.everHadInstance && n == 0
+	s.exitGraceGen++
+	gen := s.exitGraceGen
+	s.instanceMu.Unlock()
+	LogInfo("vix instance disconnected (now %d attached)", n)
+	s.notifySubscribers()
+	if arm {
+		s.armExitGrace(gen)
+	}
+}
+
+// armExitGrace schedules a shutdown after exitGracePeriod, unless a new instance
+// connects (or another disconnect re-arms) in the meantime — detected via the
+// generation guard. Fires on a timer so a quick relaunch keeps the daemon alive.
+func (s *Server) armExitGrace(gen int) {
+	LogInfo("No vix instances attached — exiting in %s unless one reconnects.", exitGracePeriod)
+	time.AfterFunc(exitGracePeriod, func() {
+		s.instanceMu.Lock()
+		stale := gen != s.exitGraceGen || s.instanceCount > 0
+		s.instanceMu.Unlock()
+		if stale {
+			return
+		}
+		LogInfo("No vix instances attached for %s — shutting down.", exitGracePeriod)
+		if s.cancel != nil {
+			s.cancel()
+		}
+	})
 }
 
 // LogAccess logs a tool access event. Safe to call even if accessDB is nil.
@@ -126,6 +209,11 @@ func (s *Server) authOK(token string) bool {
 
 // ListenAndServe starts the Unix socket server and blocks until ctx is cancelled.
 func (s *Server) ListenAndServe(ctx context.Context) error {
+	// Wrap the incoming context so internal triggers (exit-with-clients) can
+	// cancel the server the same way an external signal does.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	s.cancel = cancel
 	s.serverCtx = ctx
 
 	// Remove stale socket file
@@ -192,6 +280,19 @@ func (s *Server) handleClient(conn net.Conn) {
 		return
 	}
 
+	// instance.register: a vix process holds this connection open for its whole
+	// lifetime so the daemon can count attached instances independently of
+	// sessions. Block until the connection closes, then decrement.
+	if cmd.Type == "instance.register" {
+		if !s.authOK(cmd.AuthToken) {
+			LogError("Instance register rejected: auth_token mismatch")
+			s.writeError(conn, "auth")
+			return
+		}
+		s.handleInstance(conn, scanner)
+		return
+	}
+
 	var request map[string]any
 	if err := json.Unmarshal(line, &request); err != nil {
 		s.writeError(conn, fmt.Sprintf("invalid JSON: %v", err))
@@ -236,6 +337,20 @@ func (s *Server) handleClient(conn net.Conn) {
 
 	LogInfo("Completed action=%s status=%v", action, response["status"])
 	s.writeResponse(conn, response)
+}
+
+// handleInstance holds an instance.register connection open for the lifetime of
+// a vix process, counting it as an attached instance. It blocks reading until
+// the peer closes the connection (clean exit or process death both deliver EOF
+// on a local Unix socket), then records the disconnect — which may arm the
+// exit-with-clients grace timer if no instances remain.
+func (s *Server) handleInstance(conn net.Conn, scanner *bufio.Scanner) {
+	s.instanceConnected()
+	defer s.instanceDisconnected()
+	// Drain anything the client sends (it normally sends nothing). The loop
+	// exits when the connection closes.
+	for scanner.Scan() {
+	}
 }
 
 // handleSession upgrades a connection to a persistent bidirectional session.
@@ -325,7 +440,30 @@ func (s *Server) handleSession(conn net.Conn, scanner *bufio.Scanner, startCmd p
 		}
 	}
 	s.mu.Unlock()
+	// Register the session, enforcing exclusive ownership: a persisted session
+	// may be attached by only one connection at a time. If another live
+	// connection already owns this ID (e.g. a second vix instance, or a stale
+	// reconnect), refuse with a machine-readable code so the client can react
+	// (retry, restore something else, or surface a message) instead of forking a
+	// divergent in-memory copy that races to persist. The check and the insert
+	// are done under the same lock so two concurrent attaches can't both win.
+	// Ownership is released automatically when the owning connection drops (the
+	// delete(s.sessions, …) in the teardown below).
 	s.sessionMu.Lock()
+	if attachRec != nil {
+		if _, live := s.sessions[sessionID]; live {
+			s.sessionMu.Unlock()
+			LogInfo("Attach refused: session %s is already open in another connection", sessionID)
+			s.writeEvent(conn, protocol.SessionEvent{
+				Type: "event.error",
+				Data: protocol.EventError{
+					Message: "session is already open in another window",
+					Code:    "session_busy",
+				},
+			})
+			return
+		}
+	}
 	s.sessions[sessionID] = session
 	s.sessionMu.Unlock()
 	s.notifySubscribers()

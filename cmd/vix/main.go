@@ -241,8 +241,6 @@ func main() {
 	// arrives, instead of flashing the welcome screen.
 	var initialAttached bool
 
-	var daemonCmd *exec.Cmd
-
 	// Load the socket auth token (if -auth-token-path was given) once,
 	// before any daemon RPC. Same file the spawned vixd will read on the
 	// other side, so client and daemon arrive at identical bytes. We
@@ -266,13 +264,14 @@ func main() {
 		client := daemon.NewClient(cfg.SocketPath)
 		client.SetAuthToken(authToken)
 		if !client.Ping() {
-			// No daemon answered the ping — spawn our own private daemon
-			// (silently, in both interactive and headless mode). An already
-			// running daemon is reused; only the instance that spawned the
-			// daemon tears it down on exit (see the daemonCmd cleanup below).
-			var err error
-			daemonCmd, err = startDaemon(apiKey, resolvedLogDir, cfg.SocketPath, *authTokenPath)
-			if err != nil {
+			// No daemon answered the ping — spawn a detached, long-lived daemon
+			// (silently, in both interactive and headless mode). It is NOT tied
+			// to this client's lifecycle: it runs in its own session (setsid) and
+			// survives this process exiting, so other clients sharing it keep
+			// working. It self-terminates once its last attached vix instance
+			// disconnects (--exit-with-clients; see startDaemon). An already
+			// running daemon is reused.
+			if _, err := startDaemon(apiKey, resolvedLogDir, cfg.SocketPath, *authTokenPath); err != nil {
 				fmt.Fprintf(os.Stderr, "Error starting daemon: %v\n", err)
 				os.Exit(1)
 			}
@@ -284,19 +283,43 @@ func main() {
 
 		// Connect session if daemon is running
 		if client.Ping() {
+			// Register this vix process as an attached instance for its whole
+			// lifetime. The daemon counts these (independently of sessions) so a
+			// vix-spawned daemon can shut down once its last client leaves
+			// (--exit-with-clients). Best-effort: if registration fails we still
+			// run — the daemon just won't auto-exit on our account.
+			instanceMode := "tui"
+			if *prompt != "" {
+				instanceMode = "headless"
+			}
+			if ic, err := daemon.RegisterInstance(cfg.SocketPath, authToken, instanceMode); err == nil {
+				defer ic.Close()
+			}
+
 			session = daemon.NewSessionClient(cfg.SocketPath)
 			session.SetAuthToken(authToken)
 
-			// TUI mode: reopen previously-open sessions for this cwd. The first
-			// open session becomes the initial client; the rest are attached by
-			// the TUI on Init. Headless mode (prompt set) always starts fresh.
+			// TUI mode: reopen previously-open sessions for this cwd. Sessions
+			// already live in the daemon (Attached) are owned by another vix
+			// instance — skip them, since exclusive ownership would refuse the
+			// attach anyway. The first non-attached session becomes the initial
+			// client; the rest are attached by the TUI on Init. Headless mode
+			// (prompt set) always starts fresh.
 			attached := false
 			if *prompt == "" {
-				if sums, err := client.ListSessions(cfg.CWD, cfg.ConfigDir); err == nil && len(sums) > 0 {
-					if err := session.Attach(cfg.CWD, cfg.ConfigDir, cfg.Model, cfg.ForceInit, !*disableWritePermission, !*disableDirAccess, false, sums[0].ID); err == nil {
-						restoreSessions = sums[1:]
-						attached = true
-						initialAttached = true
+				if sums, err := client.ListSessions(cfg.CWD, cfg.ConfigDir); err == nil {
+					var claimable []protocol.SessionSummary
+					for _, sum := range sums {
+						if !sum.Attached {
+							claimable = append(claimable, sum)
+						}
+					}
+					if len(claimable) > 0 {
+						if err := session.Attach(cfg.CWD, cfg.ConfigDir, cfg.Model, cfg.ForceInit, !*disableWritePermission, !*disableDirAccess, false, claimable[0].ID); err == nil {
+							restoreSessions = claimable[1:]
+							attached = true
+							initialAttached = true
+						}
 					}
 				}
 			}
@@ -308,23 +331,6 @@ func main() {
 			}
 			defer session.SendClose()
 		}
-	}
-
-	// Cleanup daemon subprocess on exit
-	if daemonCmd != nil {
-		defer func() {
-			daemonCmd.Process.Signal(syscall.SIGTERM)
-			done := make(chan struct{})
-			go func() {
-				daemonCmd.Wait()
-				close(done)
-			}()
-			select {
-			case <-done:
-			case <-time.After(3 * time.Second):
-				daemonCmd.Process.Kill()
-			}
-		}()
 	}
 
 	// Headless mode: send prompt and print result
@@ -404,7 +410,18 @@ func startDaemon(apiKey, logDir, socketPath, authTokenPath string) (*exec.Cmd, e
 	// serve the mission-control web UI (which would otherwise contend for
 	// the fixed web port). Standalone `vixd` keeps serving it.
 	args = append(args, "--no-mission-control")
+	// A vix-spawned daemon is detached and long-lived (see SysProcAttr below),
+	// but it should not outlive the vix processes using it: --exit-with-clients
+	// makes it shut down shortly after the last attached vix instance leaves. A
+	// directly-launched vixd omits this and runs until signalled.
+	args = append(args, "--exit-with-clients")
 	cmd := exec.Command(daemonPath, args...)
+	// Detach the daemon from this client: start it in a new session (setsid) so
+	// it is not in the client's process group and is unaffected by terminal
+	// signals (SIGHUP on terminal close, SIGINT/SIGTERM to the foreground
+	// group). Combined with not killing it on exit, this makes the daemon a
+	// shared, long-lived process that outlives the instance that spawned it.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if apiKey != "" {
 		cmd.Env = append(os.Environ(), "ANTHROPIC_API_KEY="+apiKey)
 	}

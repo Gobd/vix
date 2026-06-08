@@ -30,6 +30,18 @@ type SessionEvent struct {
 
 // --- Client → Daemon command payloads ---
 
+// InstanceRegisterData is the payload of an "instance.register" command. A vix
+// process opens one such connection at startup and holds it open for its whole
+// lifetime so the daemon can count attached instances independently of sessions
+// (a single vix instance may hold several session connections, or none). The
+// connection closing — on clean exit or process death — is the liveness signal;
+// no heartbeat is sent. The fields are advisory (logging/observability only);
+// counting relies on the connection itself.
+type InstanceRegisterData struct {
+	InstanceID string `json:"instance_id,omitempty"`
+	Mode       string `json:"mode,omitempty"` // "tui" | "headless"
+}
+
 // SessionStartData is sent to start a new agent session.
 type SessionStartData struct {
 	CWD                            string `json:"cwd"`
@@ -62,6 +74,10 @@ type SessionSummary struct {
 	FirstMessage  string `json:"first_message,omitempty"`
 	StartedAt     string `json:"started_at,omitempty"`      // RFC3339
 	LastRequestAt string `json:"last_request_at,omitempty"` // RFC3339
+	// Attached is true when this session is currently live in the daemon (open
+	// in some connection). The launching client uses it to avoid attaching a
+	// session another instance already owns (exclusive single-writer ownership).
+	Attached bool `json:"attached,omitempty"`
 }
 
 // SessionInputData carries user chat input.
@@ -277,10 +293,12 @@ type EventUserQuestion struct {
 // EventError carries an error message.
 type EventError struct {
 	Message string `json:"message"`
-	// Code is an optional machine-readable discriminator. Currently used by
-	// the attach flow: "session_not_found" tells the client a resume target no
-	// longer exists on disk so it can orphan the session (offer /copy) instead
-	// of retrying the reconnect forever.
+	// Code is an optional machine-readable discriminator. Used by the attach
+	// flow: "session_not_found" tells the client a resume target no longer
+	// exists on disk so it can orphan the session (offer /copy) instead of
+	// retrying the reconnect forever; "session_busy" tells the client the
+	// session is already open in another connection (exclusive single-writer
+	// ownership) so it should retry later or attach a different session.
 	Code string `json:"code,omitempty"`
 }
 

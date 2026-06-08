@@ -56,7 +56,13 @@ func RegisterBuiltinHandlers(s *Server) {
 			if cwd != "" && r.CWD != cwd {
 				continue
 			}
-			summaries = append(summaries, r.summary())
+			sum := r.summary()
+			// Mark sessions currently live in this daemon so the launching
+			// client can skip the ones another instance already owns.
+			s.sessionMu.Lock()
+			_, sum.Attached = s.sessions[r.ID]
+			s.sessionMu.Unlock()
+			summaries = append(summaries, sum)
 		}
 		return map[string]any{"status": "ok", "sessions": summaries}, nil
 	})
