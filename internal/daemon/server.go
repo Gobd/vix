@@ -174,7 +174,7 @@ func (s *Server) SetExitWithClients(v bool) {
 // absorbs a quick quit→relaunch or a transient instance-channel re-open without
 // tearing down a daemon another client is about to reuse. It is a var so tests
 // can shorten it.
-var exitGracePeriod = 60 * time.Second
+var exitGracePeriod = 3 * time.Second
 
 // instanceConnected records a newly attached vix instance.
 func (s *Server) instanceConnected() {
