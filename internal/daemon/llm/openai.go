@@ -138,14 +138,15 @@ func (o *openaiClient) StreamMessageWith(
 	if instructions != "" {
 		params.Instructions = param.NewOpt(instructions)
 	}
-	if maxTokens > 0 {
+	if maxTokens > 0 && !o.codexBackend {
 		params.MaxOutputTokens = param.NewOpt(maxTokens)
 	}
 
 	// The ChatGPT/Codex backend rejects the Responses API's default
-	// store=true with a 400 Bad Request. We run stateless (the full
-	// conversation is re-sent each turn), so server-side storage is
-	// unnecessary anyway — send store=false for that endpoint.
+	// store=true and max_output_tokens with a 400 Bad Request. We run
+	// stateless (the full conversation is re-sent each turn), so server-side
+	// storage is unnecessary anyway. Let that backend enforce its own output
+	// limit instead of sending the public Responses API field.
 	if o.codexBackend {
 		params.Store = param.NewOpt(false)
 	}
