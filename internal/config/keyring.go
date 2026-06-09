@@ -1,12 +1,18 @@
 package config
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go/option"
 
@@ -74,6 +80,9 @@ func ResolveEnvVar(name string) (string, bool) {
 	if v := loadKeyFromEnvFile(loadExeEnvFilePath(), name); v != "" {
 		return v, true
 	}
+	if v := loadKeyFromEnvFile(filepath.Join(HomeVixDir(), ".env"), name); v != "" {
+		return v, true
+	}
 	if v := loadKeyFromEnvFile(".env", name); v != "" {
 		return v, true
 	}
@@ -93,8 +102,9 @@ func providerKeyringUser(provider string) string {
 	return provider + "-api-key"
 }
 
-// resolveKey searches env var, OS keychain, and .env files for the given variable name
-// and optional keyring user. Returns the value and source, or empty if not found.
+// resolveKey searches env var, apiKeyHelper, OS keychain, and .env files for
+// the given variable name and optional keyring user. Returns the value and
+// source, or empty if not found.
 func resolveKey(envVar, keyringUser string) (string, KeySource) {
 	// 1. Environment variable
 	if envVar != "" {
@@ -103,26 +113,138 @@ func resolveKey(envVar, keyringUser string) (string, KeySource) {
 		}
 	}
 
-	// 2. Stored credential (OS keychain, or auth.json fallback)
+	// 2. apiKeyHelper command from settings.json
+	if key := runAPIKeyHelper(); key != "" {
+		return key, KeySourceEnv
+	}
+
+	// 3. Stored credential (OS keychain, or auth.json fallback)
 	if keyringUser != "" {
 		if key, err := defaultStore().Get(keyringUser); err == nil && key != "" {
 			return key, KeySourceKeychain
 		}
 	}
 
-	// 3. .env next to executable
+	// 4. .env next to executable
 	if envVar != "" {
 		if key := loadKeyFromEnvFile(loadExeEnvFilePath(), envVar); key != "" {
 			return key, KeySourceEnvFile
 		}
 
-		// 4. .env in CWD
+		// 5. .env in CWD
 		if key := loadKeyFromEnvFile(".env", envVar); key != "" {
 			return key, KeySourceEnvFile
 		}
 	}
 
 	return "", KeySourceNone
+}
+
+// apiKeyHelperCache caches the last token returned by apiKeyHelper, along with
+// its expiry so it can be reused until close to expiration.
+var apiKeyHelperCache struct {
+	sync.Mutex
+	token     string
+	expiresAt time.Time // zero means no JWT expiry known
+}
+
+// runAPIKeyHelper reads the `apiKeyHelper` command from the layered settings
+// files (home then project), runs it via the shell, and returns trimmed stdout.
+// When the returned token is a JWT, the expiry claim is parsed and the token is
+// reused until 5 minutes before it expires. Returns "" on any error or when no
+// helper is configured.
+func runAPIKeyHelper() string {
+	cmd := loadAPIKeyHelper()
+	if cmd == "" {
+		return ""
+	}
+
+	apiKeyHelperCache.Lock()
+	defer apiKeyHelperCache.Unlock()
+
+	// Return cached token if still valid (>5 min remaining, or no expiry set
+	// but we have a token from a previous run within the same process).
+	if apiKeyHelperCache.token != "" {
+		exp := apiKeyHelperCache.expiresAt
+		if exp.IsZero() || time.Until(exp) > 5*time.Minute {
+			return apiKeyHelperCache.token
+		}
+	}
+
+	var buf bytes.Buffer
+	c := exec.Command("sh", "-c", cmd)
+	c.Stdout = &buf
+	if err := c.Run(); err != nil {
+		return ""
+	}
+	tok := strings.TrimSpace(buf.String())
+	if tok == "" {
+		return ""
+	}
+
+	apiKeyHelperCache.token = tok
+	apiKeyHelperCache.expiresAt = jwtExpiry(tok) // zero if not a JWT
+	return tok
+}
+
+// jwtExpiry decodes the payload segment of a JWT and returns the time encoded
+// in the "exp" claim. Returns zero time if the token is not a valid JWT or has
+// no "exp" claim.
+func jwtExpiry(token string) time.Time {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return time.Time{}
+	}
+	// JWT uses base64url without padding — add it back.
+	payload := parts[1]
+	switch len(payload) % 4 {
+	case 2:
+		payload += "=="
+	case 3:
+		payload += "="
+	}
+	data, err := base64.URLEncoding.DecodeString(payload)
+	if err != nil {
+		// Try standard base64 as a fallback (some issuers use it).
+		data, err = base64.StdEncoding.DecodeString(payload)
+		if err != nil {
+			return time.Time{}
+		}
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(data, &claims); err != nil || claims.Exp == 0 {
+		return time.Time{}
+	}
+	return time.Unix(claims.Exp, 0)
+}
+
+// loadAPIKeyHelper returns the apiKeyHelper shell command from the layered
+// settings files (home, then project). The last non-empty value wins.
+func loadAPIKeyHelper() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = ""
+	}
+	paths := NewVixPaths("", HomeVixDir(), cwd)
+	result := ""
+	for _, p := range paths.Settings() {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var cfg struct {
+			APIKeyHelper string `json:"apiKeyHelper"`
+		}
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			continue
+		}
+		if cfg.APIKeyHelper != "" {
+			result = cfg.APIKeyHelper
+		}
+	}
+	return result
 }
 
 // ResolveProviderCredential resolves a Credential for the given provider by
@@ -230,6 +352,10 @@ func buildCredential(value string, src KeySource, m AuthMethod) Credential {
 		if u := resolveMethodBaseURL(m); u != "" {
 			baseURL = u
 		}
+	} else if m.BaseURLEnv != "" {
+		if u := resolveMethodBaseURL(m); u != "" {
+			baseURL = u
+		}
 	}
 	cred := Credential{Value: value, Source: src, HeaderStyle: m.HeaderStyle, BaseURL: baseURL}
 	if m.Extra != nil {
@@ -243,7 +369,7 @@ func buildCredential(value string, src KeySource, m AuthMethod) Credential {
 // the key. Returns "" when neither is set.
 func resolveMethodBaseURL(m AuthMethod) string {
 	if m.BaseURLEnv != "" {
-		if v := os.Getenv(m.BaseURLEnv); v != "" {
+		if v, ok := ResolveEnvVar(m.BaseURLEnv); ok {
 			return v
 		}
 	}
@@ -589,7 +715,7 @@ func loadKeyFromEnvFile(path, varName string) string {
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimPrefix(strings.TrimSpace(line), "export ")
 		if strings.HasPrefix(line, prefix) {
-			return strings.TrimSpace(strings.SplitN(line, "=", 2)[1])
+			return strings.Trim(strings.TrimSpace(strings.SplitN(line, "=", 2)[1]), `"'`)
 		}
 	}
 	return ""

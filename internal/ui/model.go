@@ -489,6 +489,83 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateChatWidth()
 		return m, nil
 
+	case tea.MouseWheelMsg:
+		if sess := m.currentSession(); sess != nil {
+			if msg.Button == tea.MouseWheelUp {
+				sess.chatScrollOffset += 3
+			} else {
+				sess.chatScrollOffset -= 3
+			}
+			m.clampScrollOffset(sess)
+		}
+		return m, nil
+
+	case tea.MouseClickMsg:
+		if sess := m.currentSession(); sess != nil && msg.Button == tea.MouseLeft {
+			if msg.Mod&tea.ModShift != 0 && (sess.chatSelection.hasArea() || sess.chatSelection.startRow != 0) {
+				// Shift+click: extend existing selection to this point.
+				sess.chatSelection.endCol = msg.X
+				sess.chatSelection.endRow = msg.Y
+				if sess.chatSelection.hasArea() {
+					layout := computeLayout(m.width, m.height, m.visualLineCount())
+					chatTopRow := layout.TabBarHeight + 1
+					text := extractSelectedText(sess.lastChatLines, chatTopRow, sess.chatSelection)
+					if text != "" {
+						_ = clipboard.WriteAll(text)
+					}
+				}
+			} else {
+				// Normal click: anchor a new selection.
+				sess.chatSelection = chatSelection{
+					active:   true,
+					startCol: msg.X,
+					startRow: msg.Y,
+					endCol:   msg.X,
+					endRow:   msg.Y,
+				}
+			}
+		}
+		return m, nil
+
+	case tea.MouseMotionMsg:
+		if sess := m.currentSession(); sess != nil && sess.chatSelection.active {
+			sess.chatSelection.endCol = msg.X
+			sess.chatSelection.endRow = msg.Y
+
+			// Auto-scroll when dragging near the chat viewport edges.
+			layout := computeLayout(m.width, m.height, m.visualLineCount())
+			chatTopRow := layout.TabBarHeight + 1
+			chatBottomRow := chatTopRow + layout.ChatHeight - 2 // -2 for borders
+			const edgeZone = 2
+			if msg.Y <= chatTopRow+edgeZone {
+				sess.chatScrollOffset++
+				m.clampScrollOffset(sess)
+			} else if msg.Y >= chatBottomRow-edgeZone {
+				sess.chatScrollOffset--
+				m.clampScrollOffset(sess)
+			}
+		}
+		return m, nil
+
+	case tea.MouseReleaseMsg:
+		if sess := m.currentSession(); sess != nil && sess.chatSelection.active {
+			sess.chatSelection.active = false
+			sess.chatSelection.endCol = msg.X
+			sess.chatSelection.endRow = msg.Y
+			if sess.chatSelection.hasArea() {
+				layout := computeLayout(m.width, m.height, m.visualLineCount())
+				chatTopRow := layout.TabBarHeight + 1
+				text := extractSelectedText(sess.lastChatLines, chatTopRow, sess.chatSelection)
+				if text != "" {
+					_ = clipboard.WriteAll(text)
+				}
+			} else {
+				// Click without drag — clear so no stale highlight lingers.
+				sess.chatSelection.clear()
+			}
+		}
+		return m, nil
+
 	case tea.KeyPressMsg:
 		// --- Global quit confirm overlay ---
 		if msg.String() == "ctrl+c" || msg.String() == "ctrl+d" {
@@ -2469,6 +2546,7 @@ func (m Model) View() tea.View {
 	if m.width == 0 {
 		v := tea.NewView("Initializing...")
 		v.AltScreen = true
+		v.MouseMode = tea.MouseModeAllMotion
 		return v
 	}
 
@@ -2579,6 +2657,15 @@ func (m Model) View() tea.View {
 		}
 
 		chatLines := allLines[startLogical:endLogical]
+
+		// Store for copy-on-release; apply selection highlight.
+		if sess != nil {
+			sess.lastChatLines = chatLines
+			if sess.chatSelection.hasArea() {
+				chatTopRow := layout.TabBarHeight + 1
+				chatLines = applyHighlight(chatLines, chatTopRow, sess.chatSelection)
+			}
+		}
 
 		var chatBorderStyle lipgloss.Style
 		if sess != nil && sess.focus == FocusChat {
@@ -2788,6 +2875,7 @@ func (m Model) View() tea.View {
 	content := strings.ReplaceAll(canvas.Render(), "\r\n", "\n")
 	v := tea.NewView(content)
 	v.AltScreen = true
+	v.MouseMode = tea.MouseModeAllMotion
 	return v
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/get-vix/vix/internal/config"
 	"github.com/get-vix/vix/internal/daemon/brain/lsp"
@@ -81,5 +82,66 @@ func doBrainInit(data map[string]any, cred config.Credential) (map[string]any, e
 }
 
 func doBrainUpdateFiles(data map[string]any, cred config.Credential) (map[string]any, error) {
-	return map[string]any{"status": "ok"}, nil
+	start := time.Now()
+	params, _ := data["params"].(map[string]any)
+
+	var files []string
+	if raw, ok := params["files"].([]string); ok {
+		files = raw
+	} else if raw, ok := params["files"].([]any); ok {
+		for _, v := range raw {
+			if s, ok := v.(string); ok {
+				files = append(files, s)
+			}
+		}
+	}
+
+	root, _ := params["project_path"].(string)
+	if root == "" {
+		root = "."
+	}
+	root, _ = filepath.Abs(root)
+
+	pool := lsp.GetPool()
+	updated := 0
+
+	for _, f := range files {
+		abs := f
+		if !filepath.IsAbs(abs) {
+			abs = filepath.Join(root, f)
+		}
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			continue
+		}
+
+		rel, _ := filepath.Rel(root, abs)
+		lang := LanguageForExt(filepath.Ext(abs))
+		if lang == "" || pool == nil {
+			updated++
+			continue
+		}
+
+		client, err := pool.GetClient(lang)
+		if err != nil {
+			updated++
+			continue
+		}
+
+		uri := "file://" + abs
+		langID := lang
+		// DidOpen refreshes the LSP server's view of the file so subsequent
+		// symbol/definition queries see the current content.
+		_ = client.DidOpen(uri, langID, string(data))
+		_ = rel
+		updated++
+	}
+
+	return map[string]any{
+		"status": "ok",
+		"data": map[string]any{
+			"updated_files":    updated,
+			"duration_seconds": time.Since(start).Seconds(),
+		},
+	}, nil
 }

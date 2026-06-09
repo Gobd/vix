@@ -449,3 +449,228 @@ func uriToPath(uri, rootDir string) string {
 	}
 	return absPath
 }
+
+// getSymbolImpl implements the get_symbol tool. It resolves the symbol by name
+// (optionally qualified as "Parent/name") within a specific file or across all
+// files via workspace_symbols, then returns the source lines for each match.
+//
+// name may be:
+//   - "FuncName"            — matches any symbol with that name
+//   - "TypeName/MethodName" — matches only the named child of a parent
+//
+// When file is given, only that file is searched (fast, unambiguous).
+// When file is empty, every configured LSP language is queried via
+// workspace_symbols; matches are re-read from disk to extract their bodies.
+func getSymbolImpl(name, file, cwd string) (string, error) {
+	pool := lsp.GetPool()
+	if pool == nil {
+		return "", fmt.Errorf("LSP not available: brain.init has not been run or no LSP servers are configured")
+	}
+
+	// Parse optional "Parent/Child" qualification.
+	parent, child := parseSymbolName(name)
+
+	if file != "" {
+		return getSymbolInFile(pool, parent, child, file, cwd)
+	}
+	return getSymbolWorkspace(pool, parent, child, cwd)
+}
+
+// parseSymbolName splits "Parent/Child" into (parent, child). If there is no
+// slash, parent is "" and child is the whole name.
+func parseSymbolName(name string) (parent, child string) {
+	if idx := strings.LastIndex(name, "/"); idx >= 0 {
+		return name[:idx], name[idx+1:]
+	}
+	return "", name
+}
+
+// getSymbolInFile searches a single file for matching symbols and returns their bodies.
+func getSymbolInFile(pool *lsp.Pool, parent, child, file, cwd string) (string, error) {
+	absFile := file
+	if !filepath.IsAbs(file) {
+		absFile = filepath.Join(cwd, file)
+	}
+	if _, err := os.Stat(absFile); os.IsNotExist(err) {
+		return "", fmt.Errorf("file not found: %s", file)
+	}
+
+	ext := strings.ToLower(filepath.Ext(absFile))
+	language := brain.LanguageForExt(ext)
+	if language == "" {
+		return "", fmt.Errorf("unsupported file type %q — no LSP configured for this extension", ext)
+	}
+
+	client, err := pool.GetClient(language)
+	if err != nil || client == nil {
+		return "", fmt.Errorf("no LSP client available for %s", language)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	syms, err := lsp.ExtractSymbolsCtx(ctx, client, absFile, file, language)
+	if err != nil {
+		return "", fmt.Errorf("extracting symbols from %s: %w", file, err)
+	}
+
+	matches := filterSymbols(syms, parent, child)
+	if len(matches) == 0 {
+		return fmt.Sprintf("symbol %q not found in %s\nTip: use lsp_query with document_symbols to list all symbols in this file", formatSymbolName(parent, child), file), nil
+	}
+
+	return renderSymbolBodies(matches, absFile, file)
+}
+
+// getSymbolWorkspace searches all LSP-configured languages via workspace_symbols.
+func getSymbolWorkspace(pool *lsp.Pool, parent, child, cwd string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	rootDir := pool.RootDir()
+	query := child // workspace_symbols takes a plain name
+
+	type candidate struct {
+		sym     lsp.Symbol
+		absFile string
+		relFile string
+	}
+	var candidates []candidate
+
+	for _, lang := range pool.ConfiguredLanguages() {
+		client, err := pool.GetClient(lang)
+		if err != nil || client == nil {
+			continue
+		}
+		raw, err := client.WorkspaceSymbol(ctx, query)
+		if err != nil {
+			continue
+		}
+		// Parse workspace symbol results to find matching files/lines.
+		type wsSym struct {
+			Name          string `json:"name"`
+			Kind          int    `json:"kind"`
+			ContainerName string `json:"containerName"`
+			Location      struct {
+				URI   string `json:"uri"`
+				Range struct {
+					Start struct{ Line int `json:"line"` } `json:"start"`
+					End   struct{ Line int `json:"line"` } `json:"end"`
+				} `json:"range"`
+			} `json:"location"`
+		}
+		var wsSyms []wsSym
+		if err := json.Unmarshal(raw, &wsSyms); err != nil {
+			continue
+		}
+		for _, ws := range wsSyms {
+			if !strings.EqualFold(ws.Name, child) {
+				continue
+			}
+			if parent != "" && !strings.EqualFold(ws.ContainerName, parent) {
+				continue
+			}
+			absF := strings.TrimPrefix(ws.Location.URI, "file://")
+			relF := uriToPath(ws.Location.URI, rootDir)
+			startLine := ws.Location.Range.Start.Line + 1
+			endLine := ws.Location.Range.End.Line + 1
+			if endLine < startLine {
+				endLine = startLine
+			}
+			candidates = append(candidates, candidate{
+				sym: lsp.Symbol{
+					Name:      ws.Name,
+					Kind:      lsp.SymbolKindName(ws.Kind),
+					Parent:    ws.ContainerName,
+					StartLine: startLine,
+					EndLine:   endLine,
+				},
+				absFile: absF,
+				relFile: relF,
+			})
+		}
+	}
+
+	// Fallback: scan files directly when workspace_symbols returns nothing
+	// (some LSP servers don't implement it).
+	if len(candidates) == 0 {
+		_ = cwd // cwd available for future fallback expansion
+		return fmt.Sprintf("symbol %q not found via workspace search\nTip: provide the `file` parameter or use lsp_query with workspace_symbols to see available symbols", formatSymbolName(parent, child)), nil
+	}
+
+	var parts []string
+	for _, c := range candidates {
+		body, err := readLines(c.absFile, c.sym.StartLine, c.sym.EndLine)
+		if err != nil {
+			parts = append(parts, fmt.Sprintf("// %s:%d-%d (%s)\n// (could not read file: %v)",
+				c.relFile, c.sym.StartLine, c.sym.EndLine, c.sym.Kind, err))
+			continue
+		}
+		header := fmt.Sprintf("// %s:%d-%d (%s)", c.relFile, c.sym.StartLine, c.sym.EndLine, c.sym.Kind)
+		parts = append(parts, header+"\n"+body)
+	}
+	return strings.Join(parts, "\n\n"), nil
+}
+
+// filterSymbols returns symbols from syms that match parent/child.
+// parent="" means match any parent. Matching is case-sensitive by exact name.
+func filterSymbols(syms []lsp.Symbol, parent, child string) []lsp.Symbol {
+	var out []lsp.Symbol
+	for _, s := range syms {
+		if s.Name != child {
+			continue
+		}
+		if parent != "" && s.Parent != parent {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// renderSymbolBodies reads source lines for each matched symbol and returns
+// them as annotated blocks.
+func renderSymbolBodies(syms []lsp.Symbol, absFile, relFile string) (string, error) {
+	var parts []string
+	for _, s := range syms {
+		body, err := readLines(absFile, s.StartLine, s.EndLine)
+		if err != nil {
+			return "", fmt.Errorf("reading %s: %w", relFile, err)
+		}
+		qualifier := s.Name
+		if s.Parent != "" {
+			qualifier = s.Parent + "/" + s.Name
+		}
+		header := fmt.Sprintf("// %s:%d-%d (%s) %s", relFile, s.StartLine, s.EndLine, s.Kind, qualifier)
+		parts = append(parts, header+"\n"+body)
+	}
+	return strings.Join(parts, "\n\n"), nil
+}
+
+// readLines returns the 1-based [start, end] lines from a file as a single string.
+func readLines(absFile string, start, end int) (string, error) {
+	data, err := os.ReadFile(absFile)
+	if err != nil {
+		return "", err
+	}
+	lines := strings.Split(string(data), "\n")
+	// Clamp to valid range.
+	if start < 1 {
+		start = 1
+	}
+	if end > len(lines) {
+		end = len(lines)
+	}
+	if start > end {
+		return "", fmt.Errorf("empty range %d-%d", start, end)
+	}
+	return strings.Join(lines[start-1:end], "\n"), nil
+}
+
+// formatSymbolName renders "parent/child" or just "child" for display.
+func formatSymbolName(parent, child string) string {
+	if parent != "" {
+		return parent + "/" + child
+	}
+	return child
+}

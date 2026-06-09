@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.vixd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__VIX_REPO__/bin/vixd</string>
+    </array>
+
+    <!-- Start at login and restart if it crashes -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Log output -->
+    <key>StandardOutPath</key>
+    <string>/tmp/vixd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/vixd.log</string>
+
+    <!-- PATH captured from user's shell at install time so tools like az, gopls, etc. are found -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__PATH__</string>
+    </dict>
+
+    <!-- Start in home dir so .vix/settings.json is resolved correctly -->
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+</dict>
+</plist>

@@ -1,6 +1,6 @@
 ---
 name: implementer
-model: anthropic/claude-opus-4-8
+model: anthropic/claude-sonnet-4-6
 tools: read_file, read_minified_file, write_file, edit_file, edit_minified_file, delete_file, bash, grep, glob_files, lsp_query, web_fetch, spawn_agent, task_output, todo_write, todo_read
 max_turns: 100
 ---

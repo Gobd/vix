@@ -288,6 +288,27 @@ func buildToolSchemas(def, max time.Duration) []anthropic.ToolUnionParam {
 			},
 		}},
 		{OfTool: &anthropic.ToolParam{
+			Name:        "get_symbol",
+			Description: anthropic.String("Retrieve the source body of a named symbol (function, method, class, struct, interface, etc.) directly from the codebase. Prefer this over read_file when you need a specific symbol — it returns only the relevant lines, saving context. Supports all languages with LSP configured (Go, Python, C#, TypeScript, JavaScript, Rust, Java, Kotlin, Swift, C, C++, Ruby, PHP, and more). Use 'Parent/Child' notation for methods/nested types (e.g. 'Session/applyModel', 'MyClass/MyMethod')."),
+			InputSchema: anthropic.ToolInputSchemaParam{
+				Properties: map[string]any{
+					"symbol": map[string]any{
+						"type":        "string",
+						"description": "Symbol name to look up. Use plain name ('resolveKey') or qualified 'Parent/Child' form ('Session/applyModel') for methods and nested types.",
+					},
+					"file": map[string]any{
+						"type":        "string",
+						"description": "(Optional) Relative or absolute path to the file containing the symbol. Providing this is faster and avoids ambiguity when the same name exists in multiple files.",
+					},
+					"reason": map[string]any{
+						"type":        "string",
+						"description": "Explain why you need this symbol and how it helps accomplish your current goal.",
+					},
+				},
+				Required: []string{"symbol", "reason"},
+			},
+		}},
+		{OfTool: &anthropic.ToolParam{
 			Name:        "lsp_query",
 			Description: anthropic.String("Query LSP servers for code intelligence. Use for precise code navigation: finding definitions, references, type info, compile errors, and interface implementations. Prefer over grep for structural code queries."),
 			InputSchema: anthropic.ToolInputSchemaParam{
@@ -473,6 +494,7 @@ var readOnlyToolNames = map[string]bool{
 	"read_minified_file": true,
 	"grep":               true,
 	"glob_files":         true,
+	"get_symbol":         true,
 	"lsp_query":          true,
 	"web_fetch":          true,
 	"web_search":         true,
@@ -623,6 +645,12 @@ func SummarizeToolInput(name string, input map[string]any) string {
 			pattern = fmt.Sprintf("%s in %s", pattern, p)
 		}
 		return pattern
+	case "get_symbol":
+		sym, _ := input["symbol"].(string)
+		if f, ok := input["file"].(string); ok && f != "" {
+			return fmt.Sprintf("%s in %s", sym, f)
+		}
+		return sym
 	case "lsp_query":
 		op, _ := input["operation"].(string)
 		if f, ok := input["file"].(string); ok && f != "" {

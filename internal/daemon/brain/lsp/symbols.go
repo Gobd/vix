@@ -70,6 +70,11 @@ type location struct {
 
 // ExtractSymbols calls documentSymbol on an LSP client and returns flat symbols.
 func ExtractSymbols(client *Client, filePath, relPath, languageID string) ([]Symbol, error) {
+	return ExtractSymbolsCtx(context.Background(), client, filePath, relPath, languageID)
+}
+
+// ExtractSymbolsCtx is like ExtractSymbols but accepts a context for cancellation.
+func ExtractSymbolsCtx(ctx context.Context, client *Client, filePath, relPath, languageID string) ([]Symbol, error) {
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("read file: %w", err)
@@ -82,7 +87,7 @@ func ExtractSymbols(client *Client, filePath, relPath, languageID string) ([]Sym
 	}
 	defer client.DidClose(uri)
 
-	raw, err := client.DocumentSymbol(context.Background(), uri)
+	raw, err := client.DocumentSymbol(ctx, uri)
 	if err != nil {
 		return nil, fmt.Errorf("documentSymbol: %w", err)
 	}

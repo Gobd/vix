@@ -33,6 +33,8 @@ type SessionState struct {
 	// Accumulated chat display — built from daemon events
 	chatMessages     []ChatMessage
 	chatScrollOffset int
+	chatSelection    chatSelection
+	lastChatLines    []string // most recent visible chat lines, updated each View() for copy-on-release
 
 	// Live streaming buffers
 	assistantBuf      string

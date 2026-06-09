@@ -1480,6 +1480,25 @@ func RegisterToolHandlers(s *Server) {
 		s.LogAccess("lsp_query", params)
 		return toolOK(output, false), nil
 	})
+
+	s.RegisterHandler("tool.get_symbol", func(data map[string]any) (map[string]any, error) {
+		params, _ := data["params"].(map[string]any)
+		symbol, _ := params["symbol"].(string)
+		file, _ := params["file"].(string)
+		cwd, _ := params["cwd"].(string)
+		if cwd == "" {
+			cwd = "."
+		}
+		if symbol == "" {
+			return toolOK("Error: symbol parameter is required", true), nil
+		}
+		output, err := getSymbolImpl(symbol, file, cwd)
+		if err != nil {
+			return toolOK(fmt.Sprintf("Error: %v", err), true), nil
+		}
+		s.LogAccess("get_symbol", params)
+		return toolOK(output, false), nil
+	})
 }
 
 // doGetTopFiles retrieves the top N most accessed files with their content.
