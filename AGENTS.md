@@ -67,6 +67,30 @@ Start the daemon and client in separate terminals:
 ./bin/vix
 ```
 
+### Detecting whether `vixd` is running (sandbox caveat)
+
+When you (an AI coding agent) are working inside a live vix session, **a `vixd`
+daemon is by definition already running** — it is the process serving the LLM
+turns you are responding to. Do not conclude it is dead just because you can't
+find it.
+
+The agent's `bash` tool runs inside vix's sandbox (Seatbelt on macOS, bwrap on
+Linux). From in there the **process table view is partial and inconsistent**: it
+does not reliably show the host process that launched the session, even though it
+*does* show processes the tool spawns itself. So:
+
+- `pgrep -fl vixd` returning nothing means "not visible from inside the
+  sandbox", **not** "not running". `pgrep` and `ps` can even disagree with each
+  other in the same session.
+- The reliable signal is the **Unix socket plus a working session**: a live
+  `/tmp/vixd.sock` (`srwxr-xr-x`) and the fact that the chat is responding are
+  far stronger evidence than `pgrep`.
+- **Never `rm` the socket or kill/respawn `vixd` based on a `pgrep` miss.**
+  Removing `/tmp/vixd.sock` or starting a second daemon can disrupt the running
+  session. If you genuinely need a daemon for an out-of-band task (e.g. driving
+  the TUI for a VHS recording), prefer an explicit, isolated instance (e.g. a
+  separate `--config-dir` and socket path) rather than touching the default one.
+
 ## Key Conventions
 
 - **Go style** - follow standard Go conventions, use `gofmt`.
