@@ -288,11 +288,11 @@ func TestOpenAI_StreamMessage_RequestsIncludeForReasoning(t *testing.T) {
 	}
 }
 
-// TestOpenAI_StreamMessage_CodexBackendSetsStoreFalse verifies that requests to
-// the ChatGPT/Codex backend carry store=false. That endpoint rejects the
-// Responses API default (store=true) with a 400 — see issue #27. The regular
-// OpenAI endpoint must NOT receive store at all (leaving the server default).
-func TestOpenAI_StreamMessage_CodexBackendSetsStoreFalse(t *testing.T) {
+// TestOpenAI_StreamMessage_CodexBackendPayloadQuirks verifies that requests to
+// the ChatGPT/Codex backend carry store=false and omit max_output_tokens. That
+// endpoint rejects the public Responses API defaults/fields with a 400. The
+// regular OpenAI endpoint must keep the public Responses API shape.
+func TestOpenAI_StreamMessage_CodexBackendPayloadQuirks(t *testing.T) {
 	capture := func(codex bool) map[string]any {
 		t.Helper()
 		var (
@@ -355,10 +355,16 @@ func TestOpenAI_StreamMessage_CodexBackendSetsStoreFalse(t *testing.T) {
 	if store != false {
 		t.Errorf("codex backend: expected store=false, got %v", store)
 	}
+	if _, ok := codexBody["max_output_tokens"]; ok {
+		t.Errorf("codex backend: expected max_output_tokens omitted, got %v", codexBody["max_output_tokens"])
+	}
 
 	regularBody := capture(false)
 	if _, ok := regularBody["store"]; ok {
 		t.Errorf("regular backend: expected store omitted, got %v", regularBody["store"])
+	}
+	if got := regularBody["max_output_tokens"]; got != float64(1024) {
+		t.Errorf("regular backend: expected max_output_tokens=1024, got %v", got)
 	}
 }
 
