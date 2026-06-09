@@ -3,7 +3,8 @@ package config
 import "testing"
 
 // TestProviderAuthWellFormed checks every known provider has at least one auth
-// method and that API-key methods declare both an env var and a keychain user.
+// method and that API-key methods declare a keychain user plus at least one way
+// to resolve the key (env var or keychain).
 func TestProviderAuthWellFormed(t *testing.T) {
 	for _, p := range KnownProviders() {
 		methods := AuthMethodsFor(p)
@@ -12,11 +13,8 @@ func TestProviderAuthWellFormed(t *testing.T) {
 		}
 		for i, m := range methods {
 			if m.Kind == APIKeyAuth {
-				if m.EnvVar == "" {
-					t.Errorf("provider %q method %d: APIKeyAuth with empty EnvVar", p, i)
-				}
-				if m.Keyring == "" {
-					t.Errorf("provider %q method %d: APIKeyAuth with empty Keyring", p, i)
+				if m.EnvVar == "" && m.Keyring == "" {
+					t.Errorf("provider %q method %d: APIKeyAuth needs an env var or keychain user", p, i)
 				}
 			}
 		}

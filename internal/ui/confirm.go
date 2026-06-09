@@ -17,10 +17,18 @@ func maskSecret(sval string) string {
 	return string(r[:6]) + strings.Repeat("•", len(r)-6)
 }
 
+// keyInputDialog holds the data the credential-entry popup renders.
+type keyInputDialog struct {
+	Provider     string // human-readable provider label
+	MethodLabel  string // credential method label ("API Key", "Token Plan")
+	KeyMasked    string // masked key value (see maskSecret)
+	NeedsBaseURL bool   // also show a base-URL field
+	BaseURL      string // base-URL field value (shown verbatim)
+	Focus        int    // 0 = key field, 1 = base-URL field
+}
+
 // renderKeyInputDialog renders the credential-entry popup as a centered overlay.
-// provider is the human-readable provider label; masked is the masked value to
-// display (see maskSecret).
-func renderKeyInputDialog(width, height int, s Styles, provider, masked string) string {
+func renderKeyInputDialog(width, height int, s Styles, d keyInputDialog) string {
 	dialogWidth := 56
 	if dialogWidth > width-4 {
 		dialogWidth = width - 4
@@ -29,25 +37,45 @@ func renderKeyInputDialog(width, height int, s Styles, provider, masked string) 
 
 	title := lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).
 		Width(innerWidth).Align(lipgloss.Center).
-		Render("Set " + provider + " API key")
+		Render("Set " + d.Provider + " " + d.MethodLabel)
 
 	sep := s.CommandPaletteSepStyle.Width(innerWidth).Render(strings.Repeat("─", innerWidth))
 
-	field := masked
-	if field == "" {
-		field = lipgloss.NewStyle().Foreground(s.ColorDimGray).Render("Paste your key…")
+	boxed := func(label, value, placeholder string, active bool) string {
+		field := value
+		if field == "" {
+			field = lipgloss.NewStyle().Foreground(s.ColorDimGray).Render(placeholder)
+		}
+		border := colorSecondary
+		if !active {
+			border = s.ColorDimGray
+		}
+		box := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(border).
+			Width(innerWidth - 2).
+			Render(field)
+		if label == "" {
+			return box
+		}
+		return lipgloss.NewStyle().Foreground(s.ColorDimGray).Render(label) + "\n" + box
 	}
-	box := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colorSecondary).
-		Width(innerWidth - 2).
-		Render(field)
 
-	hint := lipgloss.NewStyle().Foreground(s.ColorDimGray).
-		Width(innerWidth).Align(lipgloss.Center).
-		Render("Enter save · Esc cancel")
-
-	content := title + "\n" + sep + "\n" + box + "\n" + hint
+	var content string
+	if d.NeedsBaseURL {
+		keyBox := boxed("API key", d.KeyMasked, "Paste your key…", d.Focus == 0)
+		urlBox := boxed("Base URL", d.BaseURL, "https://…/v1 (from your subscription page)", d.Focus == 1)
+		hint := lipgloss.NewStyle().Foreground(s.ColorDimGray).
+			Width(innerWidth).Align(lipgloss.Center).
+			Render("Tab switch · Enter save · Esc cancel")
+		content = title + "\n" + sep + "\n" + keyBox + "\n" + urlBox + "\n" + hint
+	} else {
+		box := boxed("", d.KeyMasked, "Paste your key…", true)
+		hint := lipgloss.NewStyle().Foreground(s.ColorDimGray).
+			Width(innerWidth).Align(lipgloss.Center).
+			Render("Enter save · Esc cancel")
+		content = title + "\n" + sep + "\n" + box + "\n" + hint
+	}
 	return s.CommandPaletteStyle.Width(dialogWidth).Render(content)
 }
 

@@ -44,6 +44,40 @@ type AuthMethod struct {
 	BaseURL     string                               // optional endpoint override implied by this method
 	HeaderStyle HeaderStyle                          // wire auth header style
 	Extra       func(value string) map[string]string // optional extra headers derived from the credential value
+	Label       string                               // human-readable name (also the method's identity; see ID)
+	// RequiresBaseURL marks a method whose endpoint is supplied by the user and
+	// stored alongside the key (e.g. MiMo Token Plan).
+	RequiresBaseURL bool
+	// BaseURLEnv, when set, names an env var that overrides the stored
+	// user-supplied base URL for a RequiresBaseURL method.
+	BaseURLEnv string
+}
+
+// ID returns a stable identity for this method within its provider, used as the
+// default-method marker value when a provider exposes more than one method of
+// the same kind. It prefers the explicit Label, falling back to the keyring
+// user, the OAuth login id, and finally the kind name.
+func (m AuthMethod) ID() string {
+	switch {
+	case m.Label != "":
+		return m.Label
+	case m.Keyring != "":
+		return m.Keyring
+	case m.LoginID != "":
+		return m.LoginID
+	default:
+		return authKindName(m.Kind)
+	}
+}
+
+// authKindName is the fallback identity for a method with no label/keyring/login.
+func authKindName(k AuthKind) string {
+	switch k {
+	case OAuthMintKey, OAuthToken:
+		return AuthDefaultOAuth
+	default:
+		return AuthDefaultAPIKey
+	}
 }
 
 // extraHeaderProducers maps a providers.json extra_headers_producer name to the
@@ -70,11 +104,14 @@ func credKindToAuthKind(kind string) AuthKind {
 // authMethodFromSpec projects a registry credential method into an AuthMethod.
 func authMethodFromSpec(m providers.CredentialMethod) AuthMethod {
 	am := AuthMethod{
-		Kind:    credKindToAuthKind(m.Kind),
-		EnvVar:  m.EnvVar,
-		Keyring: m.Keyring,
-		LoginID: m.LoginID,
-		BaseURL: m.BaseURL,
+		Kind:            credKindToAuthKind(m.Kind),
+		EnvVar:          m.EnvVar,
+		Keyring:         m.Keyring,
+		LoginID:         m.LoginID,
+		BaseURL:         m.BaseURL,
+		Label:           m.Label,
+		RequiresBaseURL: m.RequiresBaseURL,
+		BaseURLEnv:      m.BaseURLEnv,
 	}
 	if m.HeaderStyle == providers.AuthSchemeBearer {
 		am.HeaderStyle = BearerHeader

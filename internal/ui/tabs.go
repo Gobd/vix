@@ -187,7 +187,6 @@ const (
 	settingShowThinking
 	settingReadAgentsMD
 	settingReadClaudeMD
-	settingToolOrchestrator
 	settingTelemetry
 	settingCompactionAuto
 	settingCompactionThreshold
@@ -201,7 +200,6 @@ type settingsState struct {
 	showThinking        bool
 	readAgentsMD        bool
 	readClaudeMD        bool
-	toolOrchestrator    bool
 	telemetry           bool
 	compactionAuto      bool
 	compactionThreshold float64
@@ -233,8 +231,6 @@ func (m *Model) toggleSetting(item settingsItem) {
 		_ = config.SetReadAgentsMD(!config.ReadAgentsMD())
 	case settingReadClaudeMD:
 		_ = config.SetReadClaudeMD(!config.ReadClaudeMD())
-	case settingToolOrchestrator:
-		_ = config.SetToolOrchestrator(!config.ToolOrchestrator())
 	case settingTelemetry:
 		_ = config.SetTelemetryEnabled(!config.TelemetryEnabled())
 	case settingCompactionAuto:
@@ -413,9 +409,6 @@ func renderSettingsView(width, height int, s Styles, st settingsState) string {
 	toggleRow("Read AGENTS.md", st.readAgentsMD)
 	toggleRow("Read CLAUDE.md", st.readClaudeMD)
 
-	section("Agent")
-	toggleRow("Tool orchestrator", st.toolOrchestrator)
-
 	section("Privacy")
 	toggleRow("Send anonymous telemetry", st.telemetry)
 
@@ -436,45 +429,24 @@ type authButton struct {
 	label string
 }
 
-// authRow indices for the Models-tab authentication panel.
-const (
-	authRowAPIKey = 0
-	authRowOAuth  = 1
-)
-
-// authButtonsFor returns the ordered buttons shown for a given authentication
-// row, given the provider's stored-credential status. This is the single source
-// of truth shared by the renderer and the key handler so navigation indices and
-// drawn controls never diverge. Delete buttons appear only when that credential
-// is actually stored; "Make it default" only when the method isn't already the
-// default and is usable. The OAuth row has no buttons for providers without an
-// OAuth login.
-func authButtonsFor(st config.ProviderAuthStatus, row int) []authButton {
-	var btns []authButton
-	switch row {
-	case authRowAPIKey:
-		if st.APIKeyStored {
-			btns = append(btns, authButton{"set_key", "Update key"})
-			btns = append(btns, authButton{"del_key", "Delete key"})
-			if st.Default != config.AuthDefaultAPIKey {
-				btns = append(btns, authButton{"default_key", "Make it default"})
-			}
-		} else {
-			btns = append(btns, authButton{"set_key", "Create key"})
-		}
-	case authRowOAuth:
-		if !st.OAuthSupported {
-			return nil
-		}
-		if st.OAuthStored {
-			btns = append(btns, authButton{"set_token", "Update token"})
-			btns = append(btns, authButton{"del_token", "Delete token"})
-			if st.Default != config.AuthDefaultOAuth {
-				btns = append(btns, authButton{"default_token", "Make it default"})
-			}
-		} else {
-			btns = append(btns, authButton{"set_token", "Create token"})
-		}
+// authButtonsFor returns the ordered buttons shown for a single credential
+// method, given its stored-credential status. This is the single source of
+// truth shared by the renderer and the key handler so navigation indices and
+// drawn controls never diverge. Delete appears only when the credential is
+// stored; "Make it default" only when stored and not already the default.
+func authButtonsFor(ms config.MethodStatus) []authButton {
+	setID, delID, defID := "set_key", "del_key", "default_key"
+	createLabel, updateLabel, deleteLabel := "Create key", "Update key", "Delete key"
+	if ms.OAuth {
+		setID, delID, defID = "set_token", "del_token", "default_token"
+		createLabel, updateLabel, deleteLabel = "Create token", "Update token", "Delete token"
+	}
+	if !ms.Stored {
+		return []authButton{{setID, createLabel}}
+	}
+	btns := []authButton{{setID, updateLabel}, {delID, deleteLabel}}
+	if !ms.IsDefault {
+		btns = append(btns, authButton{defID, "Make it default"})
 	}
 	return btns
 }
@@ -548,11 +520,13 @@ const modelsViewportChrome = 1
 // clamp agree on how many rows fit.
 func modelsHeaderLines(st config.ProviderAuthStatus, loginStatus string) int {
 	n := 2 // "Credentials" title + separator
-	n += 2 // API Key row + its buttons row
-	if st.OAuthSupported {
-		n += 2 // OAuth token row + its buttons row
-	} else {
-		n++ // "OAuth token: (not available)"
+	// Each credential method renders a status row plus a buttons row; a method
+	// with a stored user-supplied base URL adds one more line.
+	for _, ms := range st.Methods {
+		n += 2
+		if ms.RequiresBaseURL && ms.Stored && ms.BaseURL != "" {
+			n++
+		}
 	}
 	if loginStatus != "" {
 		n++
@@ -668,8 +642,7 @@ func renderModelsView(width, height int, s Styles,
 		}
 		return ""
 	}
-	renderButtons := func(row int) string {
-		btns := authButtonsFor(st, row)
+	renderButtons := func(row int, btns []authButton) string {
 		if len(btns) == 0 {
 			return ""
 		}
@@ -685,24 +658,21 @@ func renderModelsView(width, height int, s Styles,
 		return "    " + strings.Join(cells, "  ")
 	}
 
-	// API key row.
-	keyVal := "(empty)"
-	if st.APIKeyStored {
-		keyVal = st.APIKeyPrefix + "..."
-	}
-	rightLines = append(rightLines, "API Key: "+keyVal+defaultTag(st.Default == config.AuthDefaultAPIKey))
-	rightLines = append(rightLines, renderButtons(authRowAPIKey))
-
-	// OAuth row.
-	if st.OAuthSupported {
-		tokVal := "(empty)"
-		if st.OAuthStored {
-			tokVal = "active"
+	// One status row + buttons row per credential method, in declared order.
+	for row, ms := range st.Methods {
+		val := "(empty)"
+		if ms.Stored {
+			if ms.OAuth {
+				val = "active"
+			} else {
+				val = ms.Prefix + "..."
+			}
 		}
-		rightLines = append(rightLines, "OAuth token: "+tokVal+defaultTag(st.Default == config.AuthDefaultOAuth))
-		rightLines = append(rightLines, renderButtons(authRowOAuth))
-	} else {
-		rightLines = append(rightLines, dimStyle.Render("OAuth token: "+keyValNotAvailable))
+		rightLines = append(rightLines, ms.Label+": "+val+defaultTag(ms.IsDefault))
+		if ms.RequiresBaseURL && ms.Stored && ms.BaseURL != "" {
+			rightLines = append(rightLines, dimStyle.Render("    ↳ "+ms.BaseURL))
+		}
+		rightLines = append(rightLines, renderButtons(row, authButtonsFor(ms)))
 	}
 
 	if loginStatus != "" {
@@ -797,10 +767,6 @@ func renderModelsView(width, height int, s Styles,
 
 	return s.ViewportFocusedStyle.Width(width).Height(height).Render(body)
 }
-
-// keyValNotAvailable is the marker shown for an auth method a provider doesn't
-// offer (e.g. OAuth for MiniMax / Xiaomi MiMo).
-const keyValNotAvailable = "(not available)"
 
 // renderTabBar renders the two-tab bar: Sessions | Chat.
 // alertActive is true when some session is waiting for user input; the Sessions

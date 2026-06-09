@@ -23,6 +23,7 @@ import (
 	"github.com/get-vix/vix/internal/config"
 	"github.com/get-vix/vix/internal/daemon"
 	"github.com/get-vix/vix/internal/protocol"
+	"github.com/get-vix/vix/internal/telemetry"
 )
 
 // teaProgram holds the Bubble Tea program reference for event injection via Send().
@@ -298,7 +299,7 @@ type Model struct {
 	modelsStatus           map[string]config.ProviderAuthStatus // per-provider auth status (refreshed on change)
 	modelsProviderSel      int                                  // index into modelsLoggedIn ++ modelsAvailable
 	modelsFocus            modelsFocusArea                      // which Models-tab area has the cursor
-	modelsAuthRow          int                                  // authRowAPIKey | authRowOAuth (focus == auth)
+	modelsAuthRow          int                                  // credential-method row index (focus == auth)
 	modelsAuthBtn          int                                  // button index within the focused auth row
 	modelsModelSel         int                                  // index into the filtered model list for the selected provider
 	modelsModelScroll      int                                  // index of the top visible grid row (windowed scrolling)
@@ -306,12 +307,18 @@ type Model struct {
 	modelsModelPending     string                               // model spec awaiting a credential
 	modelsInKeyInput       bool                                 // key-entry popup open
 	modelsKeyInputProvider string                               // provider the popup is entering a key for
-	modelsKeyInput         textinput.Model                      // popup text input (holds the real value)
+	modelsKeyInputMethodID string                               // credential method the popup is entering a key for
+	modelsKeyInputLabel    string                               // method label for the popup title
+	modelsKeyInput         textinput.Model                      // popup text input (holds the real key value)
+	modelsKeyInputBaseURL  bool                                 // popup also collects a user-supplied base URL
+	modelsBaseURLInput     textinput.Model                      // popup base-URL input (RequiresBaseURL methods)
+	modelsKeyInputFocus    int                                  // 0 = key field, 1 = base-URL field
 	modelsLoginStatus      string                               // transient OAuth login progress/result text
 
 	// Models tab credential-delete confirmation (driven by StateKeyDeleteConfirm)
 	keyDeleteProvider string
 	keyDeleteKind     string // "api_key" | "oauth"
+	keyDeleteMethodID string // credential method id (api_key deletes)
 	keyDeleteSelected int    // 0 = Yes, 1 = No
 
 	// Shared rendering
@@ -539,35 +546,11 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				sess.input.Focus()
 				return m, nil
 			}
-			action, payload := sess.rightPanel.HandleKey(msg)
-			switch action {
-			case rpActionClose:
+			if sess.rightPanel.HandleKey(msg) == rpActionClose {
 				sess.rightPanel.Close()
 				m.updateChatWidth()
 				sess.input.Focus()
 				sess.focus = FocusEditor
-			case rpActionNeedKey:
-				parts := strings.SplitN(payload, ":", 2)
-				if len(parts) == 2 {
-					sess.rightPanel.OpenKeyInput(parts[0], m.height)
-				}
-			case rpActionKeyStored:
-				parts := strings.SplitN(payload, ":", 2)
-				if len(parts) == 2 {
-					provider, key := parts[0], parts[1]
-					_ = config.StoreProviderKey(provider, key)
-					if sess.client != nil && sess.modelName != "" {
-						_ = sess.client.SendSetModel(sess.modelName)
-					}
-					sess.rightPanel.OpenKeyManager(m.height)
-					sess.focus = FocusRightPanel
-					sess.input.Blur()
-				}
-			case rpActionKeyDeleted:
-				_ = config.DeleteProviderKey(payload)
-				sess.rightPanel.OpenKeyManager(m.height)
-				sess.focus = FocusRightPanel
-				sess.input.Blur()
 			}
 			return m, nil
 		}
@@ -1252,15 +1235,15 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.PasteMsg:
 		if m.activeTab == TabKindModels && m.modelsInKeyInput {
-			m.modelsKeyInput, _ = m.modelsKeyInput.Update(msg)
+			if m.modelsKeyInputBaseURL && m.modelsKeyInputFocus == 1 {
+				m.modelsBaseURLInput, _ = m.modelsBaseURLInput.Update(msg)
+			} else {
+				m.modelsKeyInput, _ = m.modelsKeyInput.Update(msg)
+			}
 			return m, nil
 		}
 		sess := m.currentSession()
 		if sess == nil {
-			return m, nil
-		}
-		if sess.rightPanel.IsVisible() && sess.focus == FocusRightPanel && sess.rightPanel.mode == rpModeKeyInput {
-			sess.rightPanel.keyInput, _ = sess.rightPanel.keyInput.Update(msg)
 			return m, nil
 		}
 		if sess.agentState == StateWaitingForInput || sess.agentState == StatePlanReview ||
@@ -1410,7 +1393,7 @@ func (m *Model) switchTab(k TabKind) tea.Cmd {
 // model.
 func (m *Model) enterModelsTab() {
 	m.modelsFocus = modelsFocusProviders
-	m.modelsAuthRow = authRowAPIKey
+	m.modelsAuthRow = 0
 	m.modelsAuthBtn = 0
 	m.modelsModelPending = ""
 	m.modelsInKeyInput = false
@@ -1425,22 +1408,59 @@ func (m *Model) enterModelsTab() {
 	m.clampModelsScroll()
 }
 
+// credClient returns a connection-level daemon client for credential RPCs.
+// Credentials are daemon-owned: the TUI never touches the keychain/auth.json
+// directly, it asks the daemon to store/read them (config_dir-agnostic, since
+// credentials are user-global).
+func (m *Model) credClient() *daemon.Client {
+	c := daemon.NewClient(m.socketPath)
+	c.SetAuthToken(m.authToken)
+	return c
+}
+
+// providerHasCredential reports whether a provider has any stored/available
+// credential, preferring the cached status and falling back to a fresh daemon
+// query on a cache miss.
+func (m *Model) providerHasCredential(provider string) bool {
+	if st, ok := m.modelsStatus[provider]; ok {
+		return st.HasCredential()
+	}
+	if cs, err := m.credClient().ProviderCredStatus(); err == nil {
+		m.modelsStatus = cs.Providers
+		return cs.Providers[provider].HasCredential()
+	}
+	return false
+}
+
 // refreshModelsProviders recomputes the logged-in / available provider split and
-// per-provider auth status, clamping the provider cursor to the new bounds.
+// per-provider auth status, clamping the provider cursor to the new bounds. The
+// status is read from the daemon (the credential owner); on RPC failure the
+// last-known status is reused so the panel doesn't flicker to "no credential".
 func (m *Model) refreshModelsProviders() {
+	// Snapshot the provider under the cursor before the split is rebuilt.
+	// Granting or removing a credential moves a provider between the
+	// logged-in and available groups, which reorders the flat list; without
+	// re-anchoring, the positional cursor would land on a different provider.
+	prevProvider := m.modelsSelectedProvider()
+
 	m.modelsLoggedIn = m.modelsLoggedIn[:0]
 	m.modelsAvailable = m.modelsAvailable[:0]
 	if m.modelsStatus == nil {
 		m.modelsStatus = map[string]config.ProviderAuthStatus{}
 	}
+	if cs, err := m.credClient().ProviderCredStatus(); err == nil {
+		m.modelsStatus = cs.Providers
+	}
 	for _, p := range AvailableProviders() {
-		st := config.GetProviderAuthStatus(p.Name)
-		m.modelsStatus[p.Name] = st
-		if st.APIKeyStored || st.OAuthStored {
+		st := m.modelsStatus[p.Name]
+		if st.HasCredential() {
 			m.modelsLoggedIn = append(m.modelsLoggedIn, p.Name)
 		} else {
 			m.modelsAvailable = append(m.modelsAvailable, p.Name)
 		}
+	}
+	if prevProvider != "" {
+		m.modelsProviderSel = m.providerFlatIndex(prevProvider)
 	}
 	total := len(m.modelsLoggedIn) + len(m.modelsAvailable)
 	if m.modelsProviderSel >= total {
@@ -1510,27 +1530,68 @@ func (m *Model) applyModelSelection(spec string) {
 	}
 }
 
-// openModelsKeyInput opens the credential-entry popup for a provider.
-func (m *Model) openModelsKeyInput(provider string) {
+// openModelsKeyInput opens the credential-entry popup for a specific credential
+// method of a provider. When the method carries a user-supplied endpoint
+// (RequiresBaseURL), the popup also collects a base URL, prefilled with any
+// stored value for update.
+func (m *Model) openModelsKeyInput(provider, methodID string) {
+	st := m.modelsStatus[provider]
+	var ms config.MethodStatus
+	for _, c := range st.Methods {
+		if c.ID == methodID {
+			ms = c
+			break
+		}
+	}
+
 	ti := textinput.New()
-	ti.Placeholder = "Paste your " + provider + " API key..."
+	ti.Placeholder = "Paste your " + DisplayNameForProvider(provider) + " API key..."
 	ti.Focus()
 	m.modelsKeyInput = ti
 	m.modelsKeyInputProvider = provider
+	m.modelsKeyInputMethodID = methodID
+	m.modelsKeyInputLabel = ms.Label
+	if m.modelsKeyInputLabel == "" {
+		m.modelsKeyInputLabel = "API Key"
+	}
+	m.modelsKeyInputBaseURL = ms.RequiresBaseURL
+	m.modelsKeyInputFocus = 0
+	if ms.RequiresBaseURL {
+		bi := textinput.New()
+		bi.Placeholder = "https://…/v1 (from your subscription page)"
+		bi.SetValue(ms.BaseURL)
+		m.modelsBaseURLInput = bi
+	}
 	m.modelsInKeyInput = true
 }
 
-// clampModelsAuth keeps the focused auth button index within range after the
-// button set changes (e.g. a credential was added/removed or made default).
+// clampModelsAuth keeps the focused auth row and button index within range after
+// the method/button set changes (e.g. a credential was added/removed or made
+// default).
 func (m *Model) clampModelsAuth() {
 	st := m.modelsStatus[m.modelsSelectedProvider()]
-	btns := authButtonsFor(st, m.modelsAuthRow)
+	if m.modelsAuthRow >= len(st.Methods) {
+		m.modelsAuthRow = len(st.Methods) - 1
+	}
+	if m.modelsAuthRow < 0 {
+		m.modelsAuthRow = 0
+	}
+	btns := m.authButtonsForRow(st, m.modelsAuthRow)
 	if m.modelsAuthBtn >= len(btns) {
 		m.modelsAuthBtn = len(btns) - 1
 	}
 	if m.modelsAuthBtn < 0 {
 		m.modelsAuthBtn = 0
 	}
+}
+
+// authButtonsForRow returns the buttons for the credential-method row at index
+// row, or nil when out of range.
+func (m *Model) authButtonsForRow(st config.ProviderAuthStatus, row int) []authButton {
+	if row < 0 || row >= len(st.Methods) {
+		return nil
+	}
+	return authButtonsFor(st.Methods[row])
 }
 
 // handleModelsKey handles all key input for the Models tab.
@@ -1543,20 +1604,51 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case "esc":
 			m.modelsInKeyInput = false
 			m.modelsModelPending = ""
+		case "tab", "shift+tab":
+			if m.modelsKeyInputBaseURL {
+				m.modelsKeyInputFocus ^= 1
+				if m.modelsKeyInputFocus == 1 {
+					m.modelsKeyInput.Blur()
+					m.modelsBaseURLInput.Focus()
+				} else {
+					m.modelsBaseURLInput.Blur()
+					m.modelsKeyInput.Focus()
+				}
+			}
 		case "enter":
 			val := strings.TrimSpace(m.modelsKeyInput.Value())
-			if val != "" {
-				_ = config.StoreProviderKey(m.modelsKeyInputProvider, val)
+			baseURL := ""
+			if m.modelsKeyInputBaseURL {
+				baseURL = strings.TrimSpace(m.modelsBaseURLInput.Value())
 			}
+			if val == "" {
+				m.modelsLoginStatus = "API key is required."
+				return m, tea.Batch(cmds...)
+			}
+			if m.modelsKeyInputBaseURL && baseURL == "" {
+				m.modelsLoginStatus = "Base URL is required for this plan."
+				return m, tea.Batch(cmds...)
+			}
+			if _, err := m.credClient().StoreProviderMethodKey(m.modelsKeyInputProvider, m.modelsKeyInputMethodID, val, baseURL); err != nil {
+				m.modelsLoginStatus = "Could not store credential: " + err.Error()
+				m.modelsInKeyInput = false
+				return m, tea.Batch(cmds...)
+			}
+			m.modelsLoginStatus = ""
 			m.modelsInKeyInput = false
 			m.refreshModelsProviders()
-			if m.modelsModelPending != "" && val != "" {
+			m.clampModelsAuth()
+			if m.modelsModelPending != "" {
 				m.applyModelSelection(m.modelsModelPending)
 			}
 			m.modelsModelPending = ""
 		default:
 			var cmd tea.Cmd
-			m.modelsKeyInput, cmd = m.modelsKeyInput.Update(msg)
+			if m.modelsKeyInputBaseURL && m.modelsKeyInputFocus == 1 {
+				m.modelsBaseURLInput, cmd = m.modelsBaseURLInput.Update(msg)
+			} else {
+				m.modelsKeyInput, cmd = m.modelsKeyInput.Update(msg)
+			}
 			cmds = append(cmds, cmd)
 		}
 		return m, tea.Batch(cmds...)
@@ -1571,7 +1663,7 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.modelsModelSel = 0
 				m.modelsModelScroll = 0
 				m.modelsFilter = ""
-				m.modelsAuthRow = authRowAPIKey
+				m.modelsAuthRow = 0
 				m.modelsAuthBtn = 0
 				m.modelsLoginStatus = ""
 			}
@@ -1581,13 +1673,13 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.modelsModelSel = 0
 				m.modelsModelScroll = 0
 				m.modelsFilter = ""
-				m.modelsAuthRow = authRowAPIKey
+				m.modelsAuthRow = 0
 				m.modelsAuthBtn = 0
 				m.modelsLoginStatus = ""
 			}
 		case "right", "l", "enter", "tab":
 			m.modelsFocus = modelsFocusAuth
-			m.modelsAuthRow = authRowAPIKey
+			m.modelsAuthRow = 0
 			m.modelsAuthBtn = 0
 		}
 	case modelsFocusAuth:
@@ -1600,19 +1692,19 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.modelsFocus = modelsFocusProviders
 			}
 		case "right", "l":
-			if btns := authButtonsFor(st, m.modelsAuthRow); m.modelsAuthBtn < len(btns)-1 {
+			if btns := m.authButtonsForRow(st, m.modelsAuthRow); m.modelsAuthBtn < len(btns)-1 {
 				m.modelsAuthBtn++
 			}
 		case "up", "k":
-			if m.modelsAuthRow == authRowOAuth {
-				m.modelsAuthRow = authRowAPIKey
+			if m.modelsAuthRow > 0 {
+				m.modelsAuthRow--
 				m.modelsAuthBtn = 0
 			} else {
 				m.modelsFocus = modelsFocusProviders
 			}
 		case "down", "j":
-			if m.modelsAuthRow == authRowAPIKey && len(authButtonsFor(st, authRowOAuth)) > 0 {
-				m.modelsAuthRow = authRowOAuth
+			if m.modelsAuthRow < len(st.Methods)-1 {
+				m.modelsAuthRow++
 				m.modelsAuthBtn = 0
 			} else {
 				m.modelsFocus = modelsFocusModels
@@ -1708,14 +1800,20 @@ func (m Model) modelsViewportHeight() int {
 }
 
 // selectModel applies the chosen model when its provider has a resolvable
-// credential, otherwise opens the key popup and remembers the pending model.
+// credential, otherwise opens the key popup (for the provider's default method)
+// and remembers the pending model.
 func (m Model) selectModel(mod ModelInfo) (tea.Model, tea.Cmd) {
-	if key, _ := config.ResolveProviderKey(mod.Provider); key != "" {
+	if m.providerHasCredential(mod.Provider) {
 		m.applyModelSelection(mod.Spec)
 		return m, nil
 	}
 	m.modelsModelPending = mod.Spec
-	m.openModelsKeyInput(mod.Provider)
+	st := m.modelsStatus[mod.Provider]
+	methodID := st.Default()
+	if methodID == "" && len(st.Methods) > 0 {
+		methodID = st.Methods[0].ID
+	}
+	m.openModelsKeyInput(mod.Provider, methodID)
 	return m, nil
 }
 
@@ -1726,20 +1824,25 @@ func (m Model) activateAuthButton() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	st := m.modelsStatus[provider]
-	btns := authButtonsFor(st, m.modelsAuthRow)
+	if m.modelsAuthRow < 0 || m.modelsAuthRow >= len(st.Methods) {
+		return m, nil
+	}
+	method := st.Methods[m.modelsAuthRow]
+	btns := authButtonsFor(method)
 	if m.modelsAuthBtn < 0 || m.modelsAuthBtn >= len(btns) {
 		return m, nil
 	}
 	switch btns[m.modelsAuthBtn].id {
 	case "set_key":
-		m.openModelsKeyInput(provider)
+		m.openModelsKeyInput(provider, method.ID)
 	case "del_key":
 		m.keyDeleteProvider = provider
 		m.keyDeleteKind = "api_key"
+		m.keyDeleteMethodID = method.ID
 		m.keyDeleteSelected = 1
 		m.state = StateKeyDeleteConfirm
 	case "default_key":
-		_ = config.SetProviderAuthDefault(provider, config.AuthDefaultAPIKey)
+		_, _ = m.credClient().SetProviderAuthDefault(provider, method.ID)
 		m.refreshModelsProviders()
 		m.clampModelsAuth()
 	case "set_token":
@@ -1750,10 +1853,11 @@ func (m Model) activateAuthButton() (tea.Model, tea.Cmd) {
 	case "del_token":
 		m.keyDeleteProvider = provider
 		m.keyDeleteKind = "oauth"
+		m.keyDeleteMethodID = method.ID
 		m.keyDeleteSelected = 1
 		m.state = StateKeyDeleteConfirm
 	case "default_token":
-		_ = config.SetProviderAuthDefault(provider, config.AuthDefaultOAuth)
+		_, _ = m.credClient().SetProviderAuthDefault(provider, method.ID)
 		m.refreshModelsProviders()
 		m.clampModelsAuth()
 	}
@@ -1788,12 +1892,12 @@ func (m Model) handleKeyDeleteKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 func (m *Model) doKeyDelete() {
 	switch m.keyDeleteKind {
 	case "api_key":
-		_ = config.DeleteProviderKey(m.keyDeleteProvider)
+		_, _ = m.credClient().DeleteProviderMethodKey(m.keyDeleteProvider, m.keyDeleteMethodID)
 	case "oauth":
 		if loginID, ok := oauthLoginID(m.keyDeleteProvider); ok {
 			_ = auth.DefaultStorage().Remove(loginID)
 		}
-		_ = config.ClearProviderAuthDefault(m.keyDeleteProvider)
+		_, _ = m.credClient().SetProviderAuthDefault(m.keyDeleteProvider, "")
 	}
 	m.refreshModelsProviders()
 	m.clampModelsAuth()
@@ -1991,6 +2095,7 @@ func (m Model) handleEnter(sess *SessionState) (tea.Model, tea.Cmd) {
 		animCmd := sess.thinkingAnim.Start()
 
 		if sess.client != nil {
+			telemetry.TrackTurn(sess.modelName)
 			if sess.activeWorkflow != "" && !strings.HasPrefix(displayText, "/") {
 				sess.client.SendWorkflow(sess.activeWorkflow, displayText)
 			} else {
@@ -2295,6 +2400,7 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 			pending := sess.pendingInput
 			sess.pendingInput = nil
 			if sess.client != nil {
+				telemetry.TrackTurn(sess.modelName)
 				if sess.activeWorkflow != "" && !strings.HasPrefix(pending.text, "/") {
 					sess.client.SendWorkflow(sess.activeWorkflow, pending.text)
 				} else {
@@ -2545,7 +2651,6 @@ func (m Model) View() tea.View {
 			showThinking:        config.ShowThinking(),
 			readAgentsMD:        config.ReadAgentsMD(),
 			readClaudeMD:        config.ReadClaudeMD(),
-			toolOrchestrator:    config.ToolOrchestrator(),
 			telemetry:           config.TelemetryEnabled(),
 			compactionAuto:      config.CompactionAuto(),
 			compactionThreshold: config.CompactionThreshold(),
@@ -2626,7 +2731,14 @@ func (m Model) View() tea.View {
 
 	// Credential-entry popup overlay (Models tab)
 	if m.modelsInKeyInput {
-		overlay := renderKeyInputDialog(m.width, m.height, m.styles, DisplayNameForProvider(m.modelsKeyInputProvider), maskSecret(m.modelsKeyInput.Value()))
+		overlay := renderKeyInputDialog(m.width, m.height, m.styles, keyInputDialog{
+			Provider:     DisplayNameForProvider(m.modelsKeyInputProvider),
+			MethodLabel:  m.modelsKeyInputLabel,
+			KeyMasked:    maskSecret(m.modelsKeyInput.Value()),
+			NeedsBaseURL: m.modelsKeyInputBaseURL,
+			BaseURL:      m.modelsBaseURLInput.Value(),
+			Focus:        m.modelsKeyInputFocus,
+		})
 		w, h := lipgloss.Size(overlay)
 		center := centerRect(canvas.Bounds(), w, h)
 		uv.NewStyledString(overlay).Draw(canvas, center)
@@ -2660,7 +2772,7 @@ func (m Model) View() tea.View {
 
 	// Slash menu overlay
 	if sess != nil && sess.slashMenu.IsVisible() {
-		popupWidth := 70
+		popupWidth := 80
 		overlay := sess.slashMenu.View(popupWidth, 8, m.styles)
 		if overlay != "" {
 			_, h := lipgloss.Size(overlay)
@@ -2686,13 +2798,6 @@ func (m Model) View() tea.View {
 func (m *Model) handleCommandAction(action string, sess *SessionState) []tea.Cmd {
 	var cmds []tea.Cmd
 	switch action {
-	case "manage_keys":
-		if sess != nil {
-			sess.rightPanel.OpenKeyManager(m.height)
-			m.updateChatWidth()
-			sess.focus = FocusRightPanel
-			sess.input.Blur()
-		}
 	case "clear":
 		if sess != nil && sess.client != nil {
 			sess.client.SendCancel()

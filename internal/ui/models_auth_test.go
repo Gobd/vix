@@ -27,8 +27,8 @@ func TestMaskSecret(t *testing.T) {
 }
 
 // TestAuthButtonsFor checks that delete/make-default buttons appear only when the
-// credential is stored / not already the default, and that OAuth-less providers
-// expose no OAuth-row buttons.
+// credential is stored / not already the default, for both API-key and OAuth
+// (token) methods.
 func TestAuthButtonsFor(t *testing.T) {
 	ids := func(btns []authButton) []string {
 		out := make([]string, len(btns))
@@ -50,32 +50,32 @@ func TestAuthButtonsFor(t *testing.T) {
 	}
 
 	// API key absent: only "create".
-	st := config.ProviderAuthStatus{APIKeyStored: false, Default: config.AuthDefaultAPIKey}
-	if got := ids(authButtonsFor(st, authRowAPIKey)); !eq(got, []string{"set_key"}) {
+	ms := config.MethodStatus{Stored: false}
+	if got := ids(authButtonsFor(ms)); !eq(got, []string{"set_key"}) {
 		t.Errorf("api key absent: got %v", got)
 	}
 
 	// API key stored and default: update + delete (no make-default).
-	st = config.ProviderAuthStatus{APIKeyStored: true, Default: config.AuthDefaultAPIKey}
-	if got := ids(authButtonsFor(st, authRowAPIKey)); !eq(got, []string{"set_key", "del_key"}) {
+	ms = config.MethodStatus{Stored: true, IsDefault: true}
+	if got := ids(authButtonsFor(ms)); !eq(got, []string{"set_key", "del_key"}) {
 		t.Errorf("api key stored+default: got %v", got)
 	}
 
 	// API key stored but NOT default: update + delete + make-default.
-	st = config.ProviderAuthStatus{APIKeyStored: true, Default: config.AuthDefaultOAuth}
-	if got := ids(authButtonsFor(st, authRowAPIKey)); !eq(got, []string{"set_key", "del_key", "default_key"}) {
+	ms = config.MethodStatus{Stored: true, IsDefault: false}
+	if got := ids(authButtonsFor(ms)); !eq(got, []string{"set_key", "del_key", "default_key"}) {
 		t.Errorf("api key stored+not-default: got %v", got)
 	}
 
-	// OAuth unsupported: no buttons on the OAuth row.
-	st = config.ProviderAuthStatus{OAuthSupported: false}
-	if got := authButtonsFor(st, authRowOAuth); len(got) != 0 {
-		t.Errorf("oauth unsupported: expected no buttons, got %v", ids(got))
+	// OAuth method absent: only "create token".
+	ms = config.MethodStatus{OAuth: true, Stored: false}
+	if got := ids(authButtonsFor(ms)); !eq(got, []string{"set_token"}) {
+		t.Errorf("oauth absent: got %v", got)
 	}
 
 	// OAuth stored but not default: update + delete + make-default.
-	st = config.ProviderAuthStatus{OAuthSupported: true, OAuthStored: true, Default: config.AuthDefaultAPIKey}
-	if got := ids(authButtonsFor(st, authRowOAuth)); !eq(got, []string{"set_token", "del_token", "default_token"}) {
+	ms = config.MethodStatus{OAuth: true, Stored: true, IsDefault: false}
+	if got := ids(authButtonsFor(ms)); !eq(got, []string{"set_token", "del_token", "default_token"}) {
 		t.Errorf("oauth stored+not-default: got %v", got)
 	}
 }

@@ -137,6 +137,19 @@ type CredentialMethod struct {
 	BaseURL              string `json:"base_url"`               // endpoint override implied by this method
 	HeaderStyle          string `json:"header_style"`           // "" | "bearer"
 	ExtraHeadersProducer string `json:"extra_headers_producer"` // "" | anthropic_oauth | codex_oauth
+	// Label is a human-readable name for this method, shown in the credential
+	// panel and used as the method's stable identity for the default-method
+	// marker when a provider exposes more than one method of the same kind
+	// (e.g. MiMo's pay-as-you-go key vs. its Token Plan key).
+	Label string `json:"label"`
+	// RequiresBaseURL marks a method whose endpoint is supplied by the user at
+	// credential-entry time (e.g. MiMo Token Plan's region-specific base URL),
+	// rather than baked into the provider spec. The UI prompts for it and it is
+	// stored alongside the key.
+	RequiresBaseURL bool `json:"requires_base_url"`
+	// BaseURLEnv, when set, is an environment variable that overrides the stored
+	// user-supplied base URL for a RequiresBaseURL method.
+	BaseURLEnv string `json:"base_url_env"`
 }
 
 // ModelSpec is one catalogue entry shown in the model picker.

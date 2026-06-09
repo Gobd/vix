@@ -115,6 +115,7 @@ func validateProvider(p ProviderSpec) error {
 	if len(p.Credential) == 0 {
 		return fmt.Errorf("provider %q: no credential_methods", p.ID)
 	}
+	seenLabel := make(map[string]bool, len(p.Credential))
 	for i, m := range p.Credential {
 		if !validCredKinds[m.Kind] {
 			return fmt.Errorf("provider %q credential[%d]: unknown kind %q", p.ID, i, m.Kind)
@@ -125,6 +126,12 @@ func validateProvider(p ProviderSpec) error {
 		if m.HeaderStyle != "" && m.HeaderStyle != AuthSchemeBearer {
 			return fmt.Errorf("provider %q credential[%d]: unknown header_style %q", p.ID, i, m.HeaderStyle)
 		}
+		if m.Label != "" {
+			if seenLabel[m.Label] {
+				return fmt.Errorf("provider %q credential[%d]: duplicate label %q", p.ID, i, m.Label)
+			}
+			seenLabel[m.Label] = true
+		}
 		switch m.Kind {
 		case CredAPIKey:
 			if m.EnvVar == "" && m.Keyring == "" {
@@ -134,6 +141,9 @@ func validateProvider(p ProviderSpec) error {
 			if m.LoginID == "" {
 				return fmt.Errorf("provider %q credential[%d]: %s needs login_id", p.ID, i, m.Kind)
 			}
+		}
+		if m.RequiresBaseURL && m.Keyring == "" {
+			return fmt.Errorf("provider %q credential[%d]: requires_base_url needs keyring to store the endpoint", p.ID, i)
 		}
 		if m.BaseURL != "" {
 			if err := checkURL(interpolate(m.BaseURL), false); err != nil {

@@ -177,3 +177,50 @@ func TestListStoredProviderKeys(t *testing.T) {
 		t.Errorf("anthropic not found in ListStoredProviderKeys")
 	}
 }
+
+// TestMiMoTokenPlanCredential covers the Token Plan credential method: a key and
+// a user-supplied base URL are stored together, resolution returns both, and the
+// BaseURLEnv override wins over the stored endpoint.
+func TestMiMoTokenPlanCredential(t *testing.T) {
+	t.Setenv("MIMO_API_KEY", "")
+	t.Setenv("MIMO_TOKENPLAN_BASE_URL", "")
+	DeleteProviderMethodKey("mimo", "API Key")
+	DeleteProviderMethodKey("mimo", "Token Plan")
+
+	const tpKey = "tp-secret-key"
+	const tpURL = "https://eu.tokenplan.example/v1"
+	if err := StoreProviderMethodKey("mimo", "Token Plan", tpKey, tpURL); err != nil {
+		t.Fatalf("StoreProviderMethodKey: %v", err)
+	}
+	defer DeleteProviderMethodKey("mimo", "Token Plan")
+
+	// Billing key is empty, so resolution falls through to the Token Plan method.
+	cred := ResolveProviderCredential("mimo")
+	if cred.Value != tpKey {
+		t.Errorf("value = %q, want %q", cred.Value, tpKey)
+	}
+	if cred.BaseURL != tpURL {
+		t.Errorf("baseURL = %q, want stored token-plan endpoint %q", cred.BaseURL, tpURL)
+	}
+
+	// The status panel reports both methods, with Token Plan stored + its endpoint.
+	st := GetProviderAuthStatus("mimo")
+	if len(st.Methods) != 2 {
+		t.Fatalf("expected 2 mimo methods, got %d", len(st.Methods))
+	}
+	var tp MethodStatus
+	for _, ms := range st.Methods {
+		if ms.ID == "Token Plan" {
+			tp = ms
+		}
+	}
+	if !tp.Stored || tp.BaseURL != tpURL || !tp.RequiresBaseURL {
+		t.Errorf("token-plan status = %+v, want stored with base URL %q", tp, tpURL)
+	}
+
+	// Env override wins over the stored endpoint.
+	t.Setenv("MIMO_TOKENPLAN_BASE_URL", "https://override.example/v1")
+	if got := ResolveProviderCredential("mimo").BaseURL; got != "https://override.example/v1" {
+		t.Errorf("env override baseURL = %q, want the override", got)
+	}
+}

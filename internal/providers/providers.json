@@ -528,7 +528,8 @@
         "effort_style": "reasoning_effort"
       },
       "credential_methods": [
-        { "kind": "api_key", "env_var": "MIMO_API_KEY", "keyring": "mimo-api-key" }
+        { "kind": "api_key", "env_var": "MIMO_API_KEY", "keyring": "mimo-api-key", "label": "API Key" },
+        { "kind": "api_key", "keyring": "mimo-tokenplan-api-key", "label": "Token Plan", "requires_base_url": true, "base_url_env": "MIMO_TOKENPLAN_BASE_URL" }
       ],
       "models": [
         { "spec": "mimo/mimo-v2-flash", "display_name": "Mimo v2 Flash" },
