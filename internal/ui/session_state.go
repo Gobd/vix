@@ -36,6 +36,14 @@ type SessionState struct {
 	chatSelection    chatSelection
 	lastChatLines    []string // most recent visible chat lines, updated each View() for copy-on-release
 
+	// Scroll-lock tracking: when the user has scrolled up (chatScrollOffset > 0)
+	// new content appended at the bottom should not shift the reading position.
+	// chatViewLastTotal and chatViewLastWidth track the totalVisualRows and
+	// innerWidth of the previous frame so View() can detect growth and
+	// compensate by adjusting chatScrollOffset upward by the delta.
+	chatViewLastTotal int
+	chatViewLastWidth int
+
 	// Live streaming buffers
 	assistantBuf      string
 	assistantRendered string

@@ -508,7 +508,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				sess.chatSelection.endRow = msg.Y
 				if sess.chatSelection.hasArea() {
 					layout := computeLayout(m.width, m.height, m.visualLineCount())
-					chatTopRow := layout.TabBarHeight + 1
+					chatTopRow := layout.TabBarHeight
 					text := extractSelectedText(sess.lastChatLines, chatTopRow, sess.chatSelection)
 					if text != "" {
 						_ = clipboard.WriteAll(text)
@@ -534,8 +534,8 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Auto-scroll when dragging near the chat viewport edges.
 			layout := computeLayout(m.width, m.height, m.visualLineCount())
-			chatTopRow := layout.TabBarHeight + 1
-			chatBottomRow := chatTopRow + layout.ChatHeight - 2 // -2 for borders
+			chatTopRow := layout.TabBarHeight
+			chatBottomRow := chatTopRow + layout.ChatHeight - 1 // -1 for bottom border (no top border)
 			const edgeZone = 2
 			if msg.Y <= chatTopRow+edgeZone {
 				sess.chatScrollOffset++
@@ -554,7 +554,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			sess.chatSelection.endRow = msg.Y
 			if sess.chatSelection.hasArea() {
 				layout := computeLayout(m.width, m.height, m.visualLineCount())
-				chatTopRow := layout.TabBarHeight + 1
+				chatTopRow := layout.TabBarHeight
 				text := extractSelectedText(sess.lastChatLines, chatTopRow, sess.chatSelection)
 				if text != "" {
 					_ = clipboard.WriteAll(text)
@@ -2629,6 +2629,31 @@ func (m Model) View() tea.View {
 		}
 		totalVisualRows := visualRowStart[len(allLines)]
 
+		// Scroll lock: when the user has scrolled up (chatScrollOffset > 0),
+		// compensate for new content appended at the bottom so the reading
+		// position stays fixed. We detect growth by comparing totalVisualRows to
+		// the value from the previous frame (chatViewLastTotal). The innerWidth
+		// check avoids false-firing on a resize (which also changes row counts).
+		if sess != nil && sess.chatScrollOffset > 0 &&
+			innerWidth == sess.chatViewLastWidth &&
+			sess.chatViewLastTotal > 0 &&
+			totalVisualRows > sess.chatViewLastTotal {
+			delta := totalVisualRows - sess.chatViewLastTotal
+			sess.chatScrollOffset += delta
+			// Inline clamp to max (avoids a full re-render inside clampScrollOffset).
+			maxOff := totalVisualRows - contentHeight
+			if maxOff < 0 {
+				maxOff = 0
+			}
+			if sess.chatScrollOffset > maxOff {
+				sess.chatScrollOffset = maxOff
+			}
+		}
+		if sess != nil {
+			sess.chatViewLastTotal = totalVisualRows
+			sess.chatViewLastWidth = innerWidth
+		}
+
 		chatScrollOffset := 0
 		if sess != nil {
 			chatScrollOffset = sess.chatScrollOffset
@@ -2662,7 +2687,7 @@ func (m Model) View() tea.View {
 		if sess != nil {
 			sess.lastChatLines = chatLines
 			if sess.chatSelection.hasArea() {
-				chatTopRow := layout.TabBarHeight + 1
+				chatTopRow := layout.TabBarHeight
 				chatLines = applyHighlight(chatLines, chatTopRow, sess.chatSelection)
 			}
 		}

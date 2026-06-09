@@ -373,7 +373,15 @@ func toAnthropicMessages(messages []MessageParam) ([]anthropic.MessageParam, err
 				}
 				blocks = append(blocks, anthropic.NewThinkingBlock(b.Signature, b.Text))
 			case BlockToolUse:
-				blocks = append(blocks, anthropic.NewToolUseBlock(b.ID, b.Input, b.Name))
+				// Input is map[string]any with omitempty, so a nil map round-trips
+				// through JSON storage as nil. The Anthropic SDK serialises nil as
+				// JSON null which the API (and strict proxies) reject — it requires
+				// a dictionary, even an empty one.
+				input := b.Input
+				if input == nil {
+					input = map[string]any{}
+				}
+				blocks = append(blocks, anthropic.NewToolUseBlock(b.ID, input, b.Name))
 			case BlockToolResult:
 				blocks = append(blocks, anthropic.NewToolResultBlock(b.ToolUseID, b.Output, b.IsError))
 			default:

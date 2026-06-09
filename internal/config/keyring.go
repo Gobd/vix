@@ -145,14 +145,16 @@ func resolveKey(envVar, keyringUser string) (string, KeySource) {
 var apiKeyHelperCache struct {
 	sync.Mutex
 	token     string
-	expiresAt time.Time // zero means no JWT expiry known
+	expiresAt time.Time // for JWTs: token expiry; zero means no exp claim
+	fetchedAt time.Time // when the token was last fetched from the helper
 }
 
 // runAPIKeyHelper reads the `apiKeyHelper` command from the layered settings
 // files (home then project), runs it via the shell, and returns trimmed stdout.
-// When the returned token is a JWT, the expiry claim is parsed and the token is
-// reused until 5 minutes before it expires. Returns "" on any error or when no
-// helper is configured.
+// When the returned token is a JWT with an "exp" claim, it is reused until 5
+// minutes before that expiry. When the token is not a JWT or has no "exp"
+// claim, it is re-fetched every 5 minutes.
+// Returns "" on any error or when no helper is configured.
 func runAPIKeyHelper() string {
 	cmd := loadAPIKeyHelper()
 	if cmd == "" {
@@ -162,11 +164,16 @@ func runAPIKeyHelper() string {
 	apiKeyHelperCache.Lock()
 	defer apiKeyHelperCache.Unlock()
 
-	// Return cached token if still valid (>5 min remaining, or no expiry set
-	// but we have a token from a previous run within the same process).
+	// Return cached token if still valid.
 	if apiKeyHelperCache.token != "" {
 		exp := apiKeyHelperCache.expiresAt
-		if exp.IsZero() || time.Until(exp) > 5*time.Minute {
+		if exp.IsZero() {
+			// Not a JWT or no exp claim — refresh every 5 minutes.
+			if time.Since(apiKeyHelperCache.fetchedAt) < 5*time.Minute {
+				return apiKeyHelperCache.token
+			}
+		} else if time.Until(exp) > 5*time.Minute {
+			// JWT with exp: refresh 5 minutes before it expires.
 			return apiKeyHelperCache.token
 		}
 	}
@@ -183,7 +190,8 @@ func runAPIKeyHelper() string {
 	}
 
 	apiKeyHelperCache.token = tok
-	apiKeyHelperCache.expiresAt = jwtExpiry(tok) // zero if not a JWT
+	apiKeyHelperCache.expiresAt = jwtExpiry(tok) // zero if not a JWT or no exp claim
+	apiKeyHelperCache.fetchedAt = time.Now()
 	return tok
 }
 
