@@ -2560,7 +2560,11 @@ func (m Model) View() tea.View {
 		// Chat content
 		innerWidth := layout.ChatWidth - 4
 		var chatContent string
-		if sess != nil {
+		if sess != nil && sess.awaitingReplay && !m.testMode {
+			// While waiting for the replay the spinner runs, which would
+			// otherwise make chatContent non-empty and bypass the placeholder.
+			chatContent = renderRestoringInline(innerWidth, layout.ChatHeight-1, m.styles, sess.thinkingAnim.View())
+		} else if sess != nil {
 			chatContent = buildRenderedChat(sess.chatMessages, m.styles, innerWidth)
 			if sess.showThinking && sess.thinkingRendered != "" {
 				chatContent += sess.thinkingRendered + "\n"
@@ -2572,11 +2576,7 @@ func (m Model) View() tea.View {
 			}
 		}
 		if chatContent == "" && !m.testMode {
-			if sess != nil && sess.awaitingReplay {
-				chatContent = renderRestoringInline(innerWidth, layout.ChatHeight-1, m.styles, sess.thinkingAnim.View())
-			} else {
-				chatContent = renderWelcomeInline(innerWidth, layout.ChatHeight-1, m.styles)
-			}
+			chatContent = renderWelcomeInline(innerWidth, layout.ChatHeight-1, m.styles)
 		}
 
 		contentHeight := layout.ChatHeight - 1

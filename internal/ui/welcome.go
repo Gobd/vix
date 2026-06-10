@@ -67,17 +67,20 @@ func renderWelcomeInline(width, height int, s Styles) string {
 	return centered
 }
 
-// renderRestoringInline renders a centered "restoring conversation" placeholder
-// for a session that was attached on launch and is still waiting for its
-// event.replay. spinner is the current animation frame (from ThinkingAnim.View);
-// it may be empty, in which case only the subtitle is shown.
+// renderRestoringInline renders a centered loading placeholder for a session
+// that was attached on launch and is still waiting for its event.replay. It
+// mirrors the welcome screen (vix banner + subtitle) but without version or
+// shortcuts. spinner is the current animation frame (from ThinkingAnim.View);
+// it may be empty, in which case only the banner and subtitle are shown.
 func renderRestoringInline(width, height int, s Styles, spinner string) string {
 	var block strings.Builder
+	block.WriteString(renderVixBanner())
+	block.WriteString("\n")
+	subtitle := lipgloss.NewStyle().Foreground(s.ColorWhite).Italic(true).Render("loading sessions")
+	block.WriteString(subtitle + "\n\n")
 	if spinner != "" {
-		block.WriteString(strings.TrimLeft(spinner, " ") + "\n\n")
+		block.WriteString(strings.TrimLeft(spinner, " "))
 	}
-	subtitle := lipgloss.NewStyle().Foreground(s.ColorDimGray).Italic(true).Render("Restoring conversation…")
-	block.WriteString(subtitle)
 	centered := lipgloss.NewStyle().Width(width).Height(height).AlignHorizontal(lipgloss.Center).AlignVertical(lipgloss.Center).Render(block.String())
 	return centered
 }
