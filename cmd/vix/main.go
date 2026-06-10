@@ -333,7 +333,15 @@ func main() {
 					os.Exit(1)
 				}
 			}
-			defer session.SendClose()
+			// Headless sessions are one-shot: close the record explicitly so
+			// it isn't restored by the next TUI launch. TUI exits must NOT
+			// send session.close here — the bare disconnect leaves records in
+			// open/ so they restore on relaunch; an explicit close-all is
+			// handled by the quit dialog (closeSessionsForQuit) when the user
+			// opts in.
+			if *prompt != "" {
+				defer session.SendClose()
+			}
 		}
 	}
 
