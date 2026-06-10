@@ -189,6 +189,14 @@ func ShowThinking() bool { return feature("show_thinking", false) }
 // SetShowThinking writes the show_thinking feature flag to ~/.vix/settings.json.
 func SetShowThinking(v bool) error { return setFeature("show_thinking", v) }
 
+// CloseAllSessionsOnQuit reads the close_all_sessions_on_quit feature flag.
+// Defaults to false: quitting vix leaves all session records open so they are
+// restored on next launch. When true, quitting explicitly closes every session.
+func CloseAllSessionsOnQuit() bool { return feature("close_all_sessions_on_quit", false) }
+
+// SetCloseAllSessionsOnQuit writes the close_all_sessions_on_quit feature flag.
+func SetCloseAllSessionsOnQuit(v bool) error { return setFeature("close_all_sessions_on_quit", v) }
+
 // ReadAgentsMD reads the read_agents_md feature flag. Defaults to false.
 func ReadAgentsMD() bool { return feature("read_agents_md", false) }
 

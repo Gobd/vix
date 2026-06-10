@@ -253,6 +253,9 @@ func (m *Model) toggleSetting(item settingsItem) {
 func (m *Model) handleUpdateAction() tea.Cmd {
 	switch {
 	case m.updateInstalled:
+		// Intentionally no closeSessionsForQuit here: an update quit-all is a
+		// restart, not an exit — sessions must stay in open/ and restore on
+		// relaunch regardless of the close_all_sessions_on_quit preference.
 		if sess := m.currentSession(); sess != nil {
 			_ = sess.client.SendUpdateQuit()
 		}

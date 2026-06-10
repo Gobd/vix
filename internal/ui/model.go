@@ -287,6 +287,7 @@ type Model struct {
 	// Normal operation = StateWaitingForInput (no overlay).
 	state                AppState
 	quitSelected         int
+	quitCloseAll         bool // quit-dialog checkbox: close all sessions on quit
 	sessionCloseIdx      int
 	sessionCloseSelected int
 
@@ -493,15 +494,12 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// --- Global quit confirm overlay ---
 		if msg.String() == "ctrl+c" || msg.String() == "ctrl+d" {
 			if m.state == StateQuitConfirm {
-				sess := m.currentSession()
-				if sess != nil && sess.client != nil {
-					sess.client.SendCancel()
-					sess.client.SendClose()
-				}
+				m.closeSessionsForQuit(m.quitCloseAll)
 				return m, tea.Quit
 			}
 			m.state = StateQuitConfirm
 			m.quitSelected = 0
+			m.quitCloseAll = config.CloseAllSessionsOnQuit()
 			return m, nil
 		}
 
@@ -1923,11 +1921,7 @@ func (m Model) handleDialogKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if m.state == StateQuitConfirm {
 			if m.quitSelected == 0 {
-				sess := m.currentSession()
-				if sess != nil && sess.client != nil {
-					sess.client.SendCancel()
-					sess.client.SendClose()
-				}
+				m.closeSessionsForQuit(m.quitCloseAll)
 				return m, tea.Quit
 			}
 			m.state = StateWaitingForInput
@@ -1937,13 +1931,14 @@ func (m Model) handleDialogKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 			m.state = StateWaitingForInput
 		}
+	case "space", " ":
+		if m.state == StateQuitConfirm {
+			m.quitCloseAll = !m.quitCloseAll
+			_ = config.SetCloseAllSessionsOnQuit(m.quitCloseAll)
+		}
 	case "y", "Y":
 		if m.state == StateQuitConfirm {
-			sess := m.currentSession()
-			if sess != nil && sess.client != nil {
-				sess.client.SendCancel()
-				sess.client.SendClose()
-			}
+			m.closeSessionsForQuit(m.quitCloseAll)
 			return m, tea.Quit
 		}
 		if m.state == StateSessionCloseConfirm {
@@ -2458,6 +2453,9 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 		sess.chatMessages = append(sess.chatMessages, renderErrorMessage(fmt.Errorf("%s", errEvent.Message)))
 
 	case "event.quit":
+		// Daemon-driven quit-all (post-update restart). Intentionally no
+		// closeSessionsForQuit: the bare disconnect leaves every record in
+		// open/ so all sessions restore on relaunch.
 		cmds = append(cmds, tea.Quit)
 	}
 
@@ -2701,7 +2699,7 @@ func (m Model) View() tea.View {
 
 	// Quit confirm overlay
 	if m.state == StateQuitConfirm {
-		overlay := renderQuitDialog(m.width, m.height, m.styles, m.quitSelected)
+		overlay := renderQuitDialog(m.width, m.height, m.styles, m.quitSelected, m.quitCloseAll)
 		w, h := lipgloss.Size(overlay)
 		center := centerRect(canvas.Bounds(), w, h)
 		uv.NewStyledString(overlay).Draw(canvas, center)
@@ -2861,10 +2859,7 @@ func (m *Model) handleCommandAction(action string, sess *SessionState) []tea.Cmd
 			_ = config.SetShowThinking(sess.showThinking)
 		}
 	case "quit":
-		if sess != nil && sess.client != nil {
-			sess.client.SendCancel()
-			sess.client.SendClose()
-		}
+		m.closeSessionsForQuit(config.CloseAllSessionsOnQuit())
 		cmds = append(cmds, tea.Quit)
 	default:
 		if strings.HasPrefix(action, "switch_tab_") {
@@ -3302,6 +3297,28 @@ func (m *Model) doTrim(sep TurnSepInfo) (Model, tea.Cmd) {
 		return nil
 	}
 	return *m, cmd
+}
+
+// closeSessionsForQuit runs right before the TUI exits. When closeAll is set
+// (the quit-dialog checkbox / persisted preference), every session is
+// explicitly closed: session.close moves each record open/ -> closed/ in the
+// daemon, so nothing is restored on next launch. When unset, it sends nothing —
+// the process exit bare-disconnects every connection; the daemon cancels any
+// running agent on EOF and leaves all records in open/ for next-run restore.
+//
+// Deliberately not called from the update quit-all flow (handleUpdateAction,
+// event.quit): an update quit is a restart, not an exit, so sessions must
+// survive it regardless of the preference.
+func (m *Model) closeSessionsForQuit(closeAll bool) {
+	if !closeAll {
+		return
+	}
+	for _, sess := range m.sessions {
+		if sess.client != nil {
+			sess.client.SendCancel()
+			sess.client.SendClose()
+		}
+	}
 }
 
 // doCloseSession closes the session at sessionIdx and returns to the Sessions tab.
