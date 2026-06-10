@@ -28,7 +28,13 @@ type SessionState struct {
 	// Daemon connection
 	client       *daemon.SessionClient
 	reconnecting bool
-	initState    protocol.InitState
+	// closing is set when the TUI itself initiated this session's close (the
+	// quit-time "close all sessions" flow). The daemon tears the connection
+	// down as part of handling session.close, so the subsequent disconnect is
+	// expected: the handler must not treat it as a lost connection and
+	// auto-reconnect, which would resurrect the just-closed session.
+	closing   bool
+	initState protocol.InitState
 
 	// Accumulated chat display — built from daemon events
 	chatMessages     []ChatMessage

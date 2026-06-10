@@ -58,9 +58,10 @@ type SessionStartData struct {
 	ForkTurnIdx   int    `json:"fork_turn_idx,omitempty"`
 	// AttachSessionID, when non-empty, asks the daemon to resume a persisted
 	// session by ID instead of creating a fresh one: it loads the on-disk
-	// record (open/ or closed/), reuses that ID, and replays the conversation
-	// to the client via event.replay. If no record exists the daemon answers
-	// with event.error carrying Code "session_not_found".
+	// record from open/, reuses that ID, and replays the conversation to the
+	// client via event.replay. Records in closed/ are not attachable — an
+	// explicitly closed session stays closed. If no open record exists the
+	// daemon answers with event.error carrying Code "session_not_found".
 	AttachSessionID string `json:"attach_session_id,omitempty"`
 }
 

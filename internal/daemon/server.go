@@ -448,11 +448,13 @@ func (s *Server) handleSession(conn net.Conn, scanner *bufio.Scanner, startCmd p
 	// Attach: resume a persisted session by ID instead of minting a new one.
 	// Load the record up front so we can reuse its ID and seed history; a
 	// missing record is reported with a machine-readable code so the client can
-	// orphan the session (offer /copy) rather than retry forever.
+	// orphan the session (offer /copy) rather than retry forever. Only open/
+	// records are attachable — a record in closed/ was explicitly closed by the
+	// user and must not be resurrected by a stale reconnect.
 	var attachRec *sessionRecord
 	if startData.AttachSessionID != "" {
 		p := config.NewVixPaths(startData.ConfigDir, s.homeVixDir, cwd)
-		rec, found, err := loadSessionRecord(p, startData.AttachSessionID)
+		rec, found, err := loadOpenSessionRecord(p, startData.AttachSessionID)
 		if err != nil {
 			LogError("attach: failed to load session %s: %v", startData.AttachSessionID, err)
 		}

@@ -1144,6 +1144,12 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sessionDisconnectedMsg:
 		_, sess := m.findSessionByDaemonID(msg.daemonSessionID)
 		if sess != nil {
+			if sess.closing {
+				// Expected disconnect: the TUI sent session.close (quit flow).
+				// Don't reconnect — attaching again would resurrect the
+				// session the daemon just closed.
+				return m, nil
+			}
 			sess.reconnecting = true
 			sess.pendingInput = nil
 			// If the connection dropped before the replay arrived, abandon the
@@ -3322,6 +3328,11 @@ func (m *Model) closeSessionsForQuit(closeAll bool) {
 	}
 	for _, sess := range m.sessions {
 		if sess.client != nil {
+			// Mark the session so the disconnect that follows session.close is
+			// treated as expected rather than triggering a reconnect (which
+			// would race the daemon's open/ -> closed/ move and resurrect the
+			// record in open/).
+			sess.closing = true
 			sess.client.SendCancel()
 			sess.client.SendClose()
 		}

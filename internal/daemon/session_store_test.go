@@ -49,7 +49,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	got, found, err := loadSessionRecord(paths, rec.ID)
+	got, found, err := loadOpenSessionRecord(paths, rec.ID)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -105,16 +105,17 @@ func TestMoveToClosed(t *testing.T) {
 	if _, err := os.Stat(sessionRecordPath(paths.SessionsOpen(), rec.ID)); !os.IsNotExist(err) {
 		t.Error("record still present in open/ after move")
 	}
-	// Present in closed/ and still loadable.
+	// Present in closed/.
 	if _, err := os.Stat(sessionRecordPath(paths.SessionsClosed(), rec.ID)); err != nil {
 		t.Errorf("record not in closed/: %v", err)
 	}
-	got, found, err := loadSessionRecord(paths, rec.ID)
-	if err != nil || !found {
-		t.Fatalf("load after move: found=%v err=%v", found, err)
+	// No longer attachable: a closed record must not be resurrected.
+	_, found, err := loadOpenSessionRecord(paths, rec.ID)
+	if err != nil {
+		t.Fatalf("load after move: %v", err)
 	}
-	if got.ID != rec.ID {
-		t.Errorf("loaded wrong record: %s", got.ID)
+	if found {
+		t.Error("closed record still loadable for attach")
 	}
 }
 
@@ -158,7 +159,7 @@ func TestPersistenceDisabledNoHome(t *testing.T) {
 	if err := saveSessionRecord(paths, sampleRecord()); err != nil {
 		t.Errorf("save should be a no-op (nil), got %v", err)
 	}
-	_, found, err := loadSessionRecord(paths, "sess-abc")
+	_, found, err := loadOpenSessionRecord(paths, "sess-abc")
 	if err != nil || found {
 		t.Errorf("load on disabled store: found=%v err=%v", found, err)
 	}

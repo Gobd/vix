@@ -90,28 +90,28 @@ func saveSessionRecord(paths config.VixPaths, rec sessionRecord) error {
 	return os.Rename(tmpName, sessionRecordPath(dir, rec.ID))
 }
 
-// loadSessionRecord reads the record for id, checking the open/ directory first
-// and then closed/. The bool reports whether a record was found.
-func loadSessionRecord(paths config.VixPaths, id string) (sessionRecord, bool, error) {
-	for _, dir := range []string{paths.SessionsOpen(), paths.SessionsClosed()} {
-		p := sessionRecordPath(dir, id)
-		if p == "" {
-			continue
-		}
-		data, err := os.ReadFile(p)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return sessionRecord{}, false, err
-		}
-		var rec sessionRecord
-		if err := json.Unmarshal(data, &rec); err != nil {
-			return sessionRecord{}, false, err
-		}
-		return rec, true, nil
+// loadOpenSessionRecord reads the record for id from the open/ directory. The
+// bool reports whether a record was found. Records in closed/ are deliberately
+// not consulted: attach (the only caller) must never resurrect a session the
+// user explicitly closed — e.g. a stale TUI reconnect racing a quit-time close
+// would otherwise re-persist the just-archived record back into open/.
+func loadOpenSessionRecord(paths config.VixPaths, id string) (sessionRecord, bool, error) {
+	p := sessionRecordPath(paths.SessionsOpen(), id)
+	if p == "" {
+		return sessionRecord{}, false, nil
 	}
-	return sessionRecord{}, false, nil
+	data, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return sessionRecord{}, false, nil
+		}
+		return sessionRecord{}, false, err
+	}
+	var rec sessionRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return sessionRecord{}, false, err
+	}
+	return rec, true, nil
 }
 
 // listOpenSessionRecords returns every parseable record in the open/ directory.
