@@ -142,7 +142,7 @@ func TestDaemonStopRPC(t *testing.T) {
 }
 
 // TestSessionVersionGate: a session start from a mismatched client build is
-// refused with code "version_mismatch"; matching and dev builds pass.
+// refused with code "version_mismatch"; only an exact match passes.
 func TestSessionVersionGate(t *testing.T) {
 	srv := newInstanceTestServer(t)
 	srv.SetVersion("v1.2.3")
@@ -196,9 +196,9 @@ func TestSessionVersionGate(t *testing.T) {
 		t.Fatalf("matching client: got event %q, want event.session_started", ev.Type)
 	}
 
-	// Dev client → gate skipped.
+	// Dev client against a stamped daemon → refused like any other mismatch.
 	ev = startSession("dev")
-	if ev.Type != "event.session_started" {
-		t.Fatalf("dev client: got event %q, want event.session_started", ev.Type)
+	if ev.Type != "event.error" {
+		t.Fatalf("dev client: got event %q, want event.error", ev.Type)
 	}
 }

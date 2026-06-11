@@ -71,7 +71,8 @@ Start the daemon and client in separate terminals:
 "vixd is not running — start it with `vix daemon start`". The subcommand group
 `vix daemon start|stop|status|install|uninstall` manages the long-lived daemon
 (`install` registers a login LaunchAgent/systemd user unit). Client and daemon
-enforce an exact version match (hard gate; `dev` builds skip it) — a mismatch
+enforce an exact version match (hard gate, no `dev` exemption; two local `dev`
+builds match each other literally) — a mismatch
 means restart the daemon: `vix daemon stop && vix daemon start`.
 
 ## Scheduled jobs

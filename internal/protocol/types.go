@@ -54,8 +54,7 @@ type SessionStartData struct {
 	// ClientVersion is the vix binary version opening this session. The daemon
 	// refuses the session (event.error, code "version_mismatch") when it does
 	// not exactly match the daemon's own version — a long-lived daemon must
-	// never serve a client from a different build. Builds reporting "dev" skip
-	// the check so local development against a running daemon stays possible.
+	// never serve a client from a different build.
 	ClientVersion string `json:"client_version,omitempty"`
 	// Fork fields: when ForkSessionID is non-empty the new session is seeded
 	// with the conversation history of the named session up to and including

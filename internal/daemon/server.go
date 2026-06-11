@@ -505,11 +505,10 @@ func (s *Server) handleSession(conn net.Conn, scanner *bufio.Scanner, startCmd p
 	json.Unmarshal(startCmd.Data, &startData)
 
 	// Version gate: a long-lived daemon must never serve a client from a
-	// different build. Exact match required; "dev" on either side skips the
-	// check (local development); empty daemon version means an in-process test
-	// embedding (gate off). Old clients that predate the gate send no
-	// ClientVersion and are refused like any other mismatch.
-	if s.version != "" && s.version != "dev" && startData.ClientVersion != "dev" && startData.ClientVersion != s.version {
+	// different build. Exact match required; an empty daemon version means an
+	// in-process test embedding (gate off). Old clients that predate the gate
+	// send no ClientVersion and are refused like any other mismatch.
+	if s.version != "" && startData.ClientVersion != s.version {
 		LogError("Session refused: client version %q != daemon version %q", startData.ClientVersion, s.version)
 		s.writeEvent(conn, protocol.SessionEvent{
 			Type: "event.error",

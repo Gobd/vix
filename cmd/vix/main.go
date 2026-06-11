@@ -269,11 +269,10 @@ func main() {
 
 		// Version gate: refuse to talk to a daemon from a different build. The
 		// daemon enforces the same rule on session start; this client-side check
-		// fires first and produces the friendlier message. "dev" on either side
-		// skips the gate (local development); an empty daemon version means a
-		// pre-gate build, which is a mismatch for any released client.
+		// fires first and produces the friendlier message. An empty daemon
+		// version means a pre-gate build, which is a mismatch for any client.
 		daemonVersion, _ := client.DaemonVersion()
-		if Version != "dev" && daemonVersion != "dev" && daemonVersion != Version {
+		if daemonVersion != Version {
 			dv := daemonVersion
 			if dv == "" {
 				dv = "(unknown, pre-gate build)"
@@ -490,7 +489,7 @@ Flags:
 		}
 		v, _ := client.DaemonVersion()
 		fmt.Printf("vixd is running (version %s) on %s\n", orUnknown(v), sock)
-		if Version != "dev" && v != "dev" && v != Version {
+		if v != Version {
 			fmt.Printf("WARNING: this vix is %s — version mismatch, sessions will be refused.\nRestart the daemon: vix daemon stop && vix daemon start\n", Version)
 		}
 		return 0
