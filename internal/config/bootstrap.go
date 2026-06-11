@@ -13,16 +13,12 @@ import (
 //go:embed defaults/*
 var defaultFiles embed.FS
 
-// versionMarkerName is the file in the .vix root recording which vix version
-// last seeded/refreshed the managed defaults in that directory.
-const versionMarkerName = ".version"
-
 // managedDefaultFiles are the .vix-relative files that vix owns: on a version
 // change they are overwritten with the embedded defaults (the previous copy is
-// preserved as <name>.bak). User-owned files — settings the TUI writes, and
-// agents/*.md which carry the persisted model choice — are deliberately NOT in
-// this list. Prompt files are appended dynamically (managedPromptFiles) so
-// shipped workflows always find the prompt revisions they were written for.
+// preserved as <name>.bak). Prompt and agent files are appended dynamically
+// (managedTreeFiles) so shipped workflows always find the prompt/agent
+// revisions they were written for. User state (the chosen chat model, update
+// bookkeeping) lives in state.json, which is never managed.
 var managedDefaultFiles = []string{
 	"settings.json",
 	"config/workflow.json",
@@ -36,11 +32,11 @@ var managedDefaultFiles = []string{
 //
 // Behaviour:
 //   - First run (no settings.json): seed everything from the embedded
-//     defaults and stamp the .version marker.
-//   - Version change (marker differs from version, including a missing
-//     marker): overwrite the managed files (settings.json, config/*.json,
-//     prompts/**) with the embedded defaults, preserving each replaced file
-//     as <name>.bak, then stamp the marker.
+//     defaults and record the version in state.json.
+//   - Version change (state.json defaults_version differs from version,
+//     including a missing one): overwrite the managed files (settings.json,
+//     config/*.json, prompts/**, agents/**) with the embedded defaults,
+//     preserving each replaced file as <name>.bak, then record the version.
 //   - Same version: only re-seed managed config files that went missing.
 func BootstrapHomeVixDir(homeVixDir, version string) error {
 	configPath := filepath.Join(homeVixDir, "settings.json")
@@ -49,16 +45,16 @@ func BootstrapHomeVixDir(homeVixDir, version string) error {
 		if err := seedAllDefaults(homeVixDir); err != nil {
 			return err
 		}
-		writeVersionMarker(homeVixDir, version)
+		stampDefaultsVersion(homeVixDir, version)
 		return nil
 	}
 
-	if marker := readVersionMarker(homeVixDir); marker != version {
+	if marker := defaultsVersion(homeVixDir); marker != version {
 		log.Printf("[config] defaults version %q -> %q: refreshing managed defaults in %s", marker, version, homeVixDir)
 		if err := refreshManagedDefaults(homeVixDir); err != nil {
 			log.Printf("[config] bootstrap: failed to refresh managed defaults: %v", err)
 		} else {
-			writeVersionMarker(homeVixDir, version)
+			stampDefaultsVersion(homeVixDir, version)
 		}
 		return nil
 	}
@@ -117,11 +113,11 @@ func seedAllDefaults(homeVixDir string) error {
 // (clobbering any previous .bak).
 func refreshManagedDefaults(homeVixDir string) error {
 	files := append([]string(nil), managedDefaultFiles...)
-	prompts, err := managedPromptFiles()
+	trees, err := managedTreeFiles()
 	if err != nil {
 		return err
 	}
-	files = append(files, prompts...)
+	files = append(files, trees...)
 
 	for _, rel := range files {
 		data, err := defaultFiles.ReadFile("defaults/" + rel)
@@ -151,21 +147,29 @@ func refreshManagedDefaults(homeVixDir string) error {
 	return nil
 }
 
-// managedPromptFiles lists every embedded defaults/prompts/** file as a
-// .vix-relative slash path.
-func managedPromptFiles() ([]string, error) {
+// managedTreeFiles lists every embedded defaults/prompts/** and
+// defaults/agents/** file as a .vix-relative slash path. Both trees are fully
+// vix-managed — agents carry no user state (the chat model choice lives in
+// state.json) — so they are refreshed on version change like the rest of the
+// managed defaults.
+func managedTreeFiles() ([]string, error) {
 	var out []string
-	err := fs.WalkDir(defaultFiles, "defaults/prompts", func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
+	for _, root := range []string{"defaults/prompts", "defaults/agents"} {
+		err := fs.WalkDir(defaultFiles, root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			out = append(out, strings.TrimPrefix(path, "defaults/"))
 			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
-		out = append(out, strings.TrimPrefix(path, "defaults/"))
-		return nil
-	})
-	return out, err
+	}
+	return out, nil
 }
 
 // writeFileAtomic writes data via a temp file + rename so a crash mid-write
@@ -193,21 +197,20 @@ func writeFileAtomic(target string, data []byte) error {
 	return os.Rename(tmpName, target)
 }
 
-// readVersionMarker returns the version recorded in <dir>/.version, or ""
-// when absent/unreadable.
-func readVersionMarker(homeVixDir string) string {
-	data, err := os.ReadFile(filepath.Join(homeVixDir, versionMarkerName))
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(data))
+// defaultsVersion returns the defaults version recorded in <dir>/state.json,
+// or "" when absent.
+func defaultsVersion(homeVixDir string) string {
+	return ReadState(filepath.Join(homeVixDir, "state.json")).DefaultsVersion
 }
 
-// writeVersionMarker stamps <dir>/.version. Best-effort: a failure only means
-// the next startup re-runs the refresh.
-func writeVersionMarker(homeVixDir, version string) {
-	p := filepath.Join(homeVixDir, versionMarkerName)
-	if err := os.WriteFile(p, []byte(version+"\n"), 0o644); err != nil {
+// stampDefaultsVersion records version in <dir>/state.json, preserving the
+// other state fields. Best-effort: a failure only means the next startup
+// re-runs the refresh.
+func stampDefaultsVersion(homeVixDir, version string) {
+	p := filepath.Join(homeVixDir, "state.json")
+	st := ReadState(p)
+	st.DefaultsVersion = version
+	if err := WriteState(p, st); err != nil {
 		log.Printf("[config] bootstrap: failed to write %s: %v", p, err)
 	}
 }

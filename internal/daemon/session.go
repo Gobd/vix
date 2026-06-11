@@ -607,12 +607,15 @@ func (s *Session) Run() {
 
 					log.Printf("[session] model switched to %s (provider=%s)", spec, s.llm.Provider())
 
-					// Persist the choice to the chat agent's frontmatter so
-					// future sessions start with the same model. Best-effort:
-					// log on failure rather than fail the (already-successful)
-					// in-memory switch.
-					if err := WriteChatAgentModel(s.paths, s.chatAgent, spec); err != nil {
-						log.Printf("[session] WARN: failed to persist model choice to %s.md: %v", s.chatAgent, err)
+					// Persist the choice to state.json so future sessions
+					// start with the same model. Best-effort: log on failure
+					// rather than fail the (already-successful) in-memory
+					// switch.
+					statePath := s.paths.StateFile()
+					st := config.ReadState(statePath)
+					st.Model = spec
+					if err := config.WriteState(statePath, st); err != nil {
+						log.Printf("[session] WARN: failed to persist model choice to state.json: %v", err)
 					}
 					s.persist()
 				}
@@ -747,13 +750,17 @@ func (s *Session) initBrain() {
 		s.denyListMu.Unlock()
 	}
 
-	// Apply tool filtering AND model selection from the chat agent's
-	// frontmatter (e.g. general.md). The chat agent's `model:` field is the
-	// authoritative source for the session's model, falling back to the
-	// daemon default (s.model) when the frontmatter omits it.
+	// Apply tool filtering AND model selection. Resolution order for the
+	// session's model: the chat agent's frontmatter `model:` (explicit pin,
+	// used by custom agents) → the user's saved choice in state.json (written
+	// by the model picker) → the daemon default (s.model). Shipped agents
+	// carry no `model:` line.
 	agentFilePath := s.resolveAgentPath(s.chatAgent + ".md")
 	modelSpec := s.model
 	var modelMaxTokens int64
+	if saved := config.ReadState(s.paths.StateFile()).Model; saved != "" {
+		modelSpec = saved
+	}
 	if agentCfg, err := parseAgentFile(agentFilePath); err == nil {
 		if len(agentCfg.Tools) > 0 {
 			s.tools = FilterToolSchemasWithBounds(agentCfg.Tools, tDef, tMax)

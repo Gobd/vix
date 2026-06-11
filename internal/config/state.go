@@ -7,8 +7,8 @@ import (
 )
 
 // State is the global, non-project-scoped session bookkeeping persisted to
-// state.json (see VixPaths.StateFile). It currently records only the
-// once-per-day update check; keep fields additive and tolerant of absence.
+// state.json (see VixPaths.StateFile). Keep fields additive and tolerant of
+// absence.
 type State struct {
 	// LastUpdateCheck is the date (YYYY-MM-DD) of the most recent GitHub
 	// release check. Empty when never checked.
@@ -17,6 +17,15 @@ type State struct {
 	LatestKnown string `json:"latest_known,omitempty"`
 	// LatestURL is the release page for LatestKnown.
 	LatestURL string `json:"latest_url,omitempty"`
+	// Model is the user's chosen chat model spec (e.g. "openai/gpt-5.1"),
+	// persisted when the user picks a model in the UI. Empty means use the
+	// built-in default. Agent frontmatter `model:` (custom agents) still
+	// overrides this.
+	Model string `json:"model,omitempty"`
+	// DefaultsVersion is the binary version that last seeded/refreshed the
+	// managed default files (settings.json, config/*.json, prompts/**,
+	// agents/**). A mismatch with the running version triggers a refresh.
+	DefaultsVersion string `json:"defaults_version,omitempty"`
 }
 
 // ReadState loads state.json at path. A missing or unreadable file yields a

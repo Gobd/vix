@@ -49,8 +49,8 @@ func TestBootstrap_FirstRunSeedsEverythingAndStampsMarker(t *testing.T) {
 			t.Errorf("first run should seed %s", rel)
 		}
 	}
-	if got := readVersionMarker(dir); got != "v0.4.3" {
-		t.Errorf("marker = %q, want v0.4.3", got)
+	if got := defaultsVersion(dir); got != "v0.4.3" {
+		t.Errorf("defaults version = %q, want v0.4.3", got)
 	}
 	if exists(filepath.Join(dir, "settings.json.bak")) {
 		t.Error("first run must not create .bak files")
@@ -65,15 +65,14 @@ func TestBootstrap_VersionChangeOverwritesManagedFilesWithBak(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	// Customize the managed files and a managed prompt.
+	// Customize the managed files, a managed prompt, and a managed agent.
 	customSettings := `{"version":1,"custom":"mine"}`
 	customWorkflow := `{"workflows":[]}`
 	customPrompt := "my custom pursue prompt"
+	customAgent := "---\nname: general\n---\nagent body"
 	os.WriteFile(filepath.Join(dir, "settings.json"), []byte(customSettings), 0o644)
 	os.WriteFile(filepath.Join(dir, "config", "workflow.json"), []byte(customWorkflow), 0o644)
 	os.WriteFile(filepath.Join(dir, "prompts", "goal", "pursue.md"), []byte(customPrompt), 0o644)
-	// Customize an agent file — must NOT be touched (model persistence).
-	customAgent := "---\nmodel: openai/gpt-5.1\n---\nagent body"
 	os.WriteFile(filepath.Join(dir, "agents", "general.md"), []byte(customAgent), 0o644)
 
 	if err := BootstrapHomeVixDir(dir, "v0.4.3"); err != nil {
@@ -88,6 +87,7 @@ func TestBootstrap_VersionChangeOverwritesManagedFilesWithBak(t *testing.T) {
 		{"settings.json", customSettings},
 		{"config/workflow.json", customWorkflow},
 		{"prompts/goal/pursue.md", customPrompt},
+		{"agents/general.md", customAgent},
 	}
 	for _, tc := range cases {
 		p := filepath.Join(dir, filepath.FromSlash(tc.rel))
@@ -99,12 +99,31 @@ func TestBootstrap_VersionChangeOverwritesManagedFilesWithBak(t *testing.T) {
 		}
 	}
 
-	// Agents untouched.
-	if got := readFileT(t, filepath.Join(dir, "agents", "general.md")); got != customAgent {
-		t.Error("agents/*.md must never be overwritten by a version refresh")
+	if got := defaultsVersion(dir); got != "v0.4.3" {
+		t.Errorf("defaults version = %q, want v0.4.3", got)
 	}
-	if got := readVersionMarker(dir); got != "v0.4.3" {
-		t.Errorf("marker = %q, want v0.4.3", got)
+}
+
+// stampDefaultsVersion must not clobber the other state.json fields (the
+// user's chosen model, update-check bookkeeping).
+func TestStampDefaultsVersionPreservesState(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+	if err := WriteState(statePath, State{Model: "openai/gpt-5.1", LastUpdateCheck: "2026-06-10"}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	stampDefaultsVersion(dir, "v0.4.6")
+
+	st := ReadState(statePath)
+	if st.DefaultsVersion != "v0.4.6" {
+		t.Errorf("DefaultsVersion = %q, want v0.4.6", st.DefaultsVersion)
+	}
+	if st.Model != "openai/gpt-5.1" {
+		t.Errorf("Model = %q, want openai/gpt-5.1 (must survive the stamp)", st.Model)
+	}
+	if st.LastUpdateCheck != "2026-06-10" {
+		t.Errorf("LastUpdateCheck = %q, want 2026-06-10", st.LastUpdateCheck)
 	}
 }
 
@@ -184,8 +203,8 @@ func TestBootstrap_VersionChangeSkipsIdenticalFilesWithoutBak(t *testing.T) {
 	if exists(filepath.Join(dir, "settings.json.bak")) {
 		t.Error("identical content must not produce a .bak")
 	}
-	if got := readVersionMarker(dir); got != "v0.4.3" {
-		t.Errorf("marker = %q, want v0.4.3", got)
+	if got := defaultsVersion(dir); got != "v0.4.3" {
+		t.Errorf("defaults version = %q, want v0.4.3", got)
 	}
 }
 
