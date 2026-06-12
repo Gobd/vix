@@ -308,8 +308,10 @@ type Model struct {
 	// Models tab UI
 	modelsLoggedIn         []string                             // providers with a stored credential
 	modelsAvailable        []string                             // providers without one
+	modelsLocal            []string                             // local providers (Ollama, llama.cpp), own group
+	modelsLocalUI          map[string]LocalProviderUI           // live probe state per local provider
 	modelsStatus           map[string]config.ProviderAuthStatus // per-provider auth status (refreshed on change)
-	modelsProviderSel      int                                  // index into modelsLoggedIn ++ modelsAvailable
+	modelsProviderSel      int                                  // index into modelsLoggedIn ++ modelsLocal ++ modelsAvailable
 	modelsFocus            modelsFocusArea                      // which Models-tab area has the cursor
 	modelsAuthRow          int                                  // credential-method row index (focus == auth)
 	modelsAuthBtn          int                                  // button index within the focused auth row
@@ -1317,6 +1319,24 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// disk; it will be offered again on the next launch.
 		return m, nil
 
+	case localProvidersMsg:
+		if m.modelsLocalUI == nil {
+			m.modelsLocalUI = map[string]LocalProviderUI{}
+		}
+		for id, st := range msg.states {
+			m.modelsLocalUI[id] = localProviderUIFromState(st)
+		}
+		// Re-anchor the model cursor: the grid for a local provider may have
+		// just gone from empty to populated.
+		if m.activeTab == TabKindModels {
+			prov := m.modelsSelectedProvider()
+			if IsLocalProvider(prov) && m.modelsFocus != modelsFocusModels {
+				m.modelsModelSel = m.modelIndexForActive(prov, m.activeModelSpec())
+				m.clampModelsScroll()
+			}
+		}
+		return m, nil
+
 	case vixSessionsMsg:
 		m.vixSessions = msg.sums
 		// One-shot launch seeding: unread job runs/alerts that accumulated
@@ -1498,6 +1518,7 @@ func (m *Model) switchTab(k TabKind) tea.Cmd {
 		}
 	case TabKindModels:
 		m.enterModelsTab()
+		return fetchLocalProviders(m.socketPath, m.authToken)
 	}
 	return nil
 }
@@ -1518,7 +1539,7 @@ func (m *Model) enterModelsTab() {
 	active := m.activeModelSpec()
 	prov := ProviderOf(active)
 	m.modelsProviderSel = m.providerFlatIndex(prov)
-	m.modelsModelSel = modelIndexForActive(prov, active)
+	m.modelsModelSel = m.modelIndexForActive(prov, active)
 	m.clampModelsScroll()
 }
 
@@ -1559,6 +1580,7 @@ func (m *Model) refreshModelsProviders() {
 
 	m.modelsLoggedIn = m.modelsLoggedIn[:0]
 	m.modelsAvailable = m.modelsAvailable[:0]
+	m.modelsLocal = m.modelsLocal[:0]
 	if m.modelsStatus == nil {
 		m.modelsStatus = map[string]config.ProviderAuthStatus{}
 	}
@@ -1566,6 +1588,10 @@ func (m *Model) refreshModelsProviders() {
 		m.modelsStatus = cs.Providers
 	}
 	for _, p := range AvailableProviders() {
+		if p.Local {
+			m.modelsLocal = append(m.modelsLocal, p.Name)
+			continue
+		}
 		st := m.modelsStatus[p.Name]
 		if st.HasCredential() {
 			m.modelsLoggedIn = append(m.modelsLoggedIn, p.Name)
@@ -1576,7 +1602,7 @@ func (m *Model) refreshModelsProviders() {
 	if prevProvider != "" {
 		m.modelsProviderSel = m.providerFlatIndex(prevProvider)
 	}
-	total := len(m.modelsLoggedIn) + len(m.modelsAvailable)
+	total := len(m.modelsLoggedIn) + len(m.modelsLocal) + len(m.modelsAvailable)
 	if m.modelsProviderSel >= total {
 		m.modelsProviderSel = total - 1
 	}
@@ -1586,9 +1612,11 @@ func (m *Model) refreshModelsProviders() {
 }
 
 // modelsFlat returns the provider names in display order (logged in, then
-// available) — the order the provider cursor navigates.
+// local, then available) — the order the provider cursor navigates.
 func (m *Model) modelsFlat() []string {
-	return append(append([]string{}, m.modelsLoggedIn...), m.modelsAvailable...)
+	out := append([]string{}, m.modelsLoggedIn...)
+	out = append(out, m.modelsLocal...)
+	return append(out, m.modelsAvailable...)
 }
 
 // modelsSelectedProvider returns the provider name under the provider cursor.
@@ -1611,10 +1639,20 @@ func (m *Model) providerFlatIndex(provider string) int {
 	return 0
 }
 
+// displayModelsForProvider returns the models shown in the grid for a
+// provider: the live-discovered list for local providers (empty until the
+// daemon probe answers), the static catalogue otherwise.
+func (m *Model) displayModelsForProvider(provider string) []ModelInfo {
+	if IsLocalProvider(provider) {
+		return m.modelsLocalUI[provider].Models
+	}
+	return DisplayModelsForProvider(provider)
+}
+
 // modelIndexForActive returns the grid index of spec within a provider's models,
 // or 0 when absent.
-func modelIndexForActive(provider, spec string) int {
-	for i, mod := range DisplayModelsForProvider(provider) {
+func (m *Model) modelIndexForActive(provider, spec string) int {
+	for i, mod := range m.displayModelsForProvider(provider) {
 		if mod.Spec == spec {
 			return i
 		}
@@ -1780,6 +1818,9 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.modelsAuthRow = 0
 				m.modelsAuthBtn = 0
 				m.modelsLoginStatus = ""
+				if IsLocalProvider(m.modelsSelectedProvider()) {
+					cmds = append(cmds, fetchLocalProviders(m.socketPath, m.authToken))
+				}
 			}
 		case "down", "j":
 			if m.modelsProviderSel < len(m.modelsFlat())-1 {
@@ -1790,6 +1831,9 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.modelsAuthRow = 0
 				m.modelsAuthBtn = 0
 				m.modelsLoginStatus = ""
+				if IsLocalProvider(m.modelsSelectedProvider()) {
+					cmds = append(cmds, fetchLocalProviders(m.socketPath, m.authToken))
+				}
 			}
 		case "right", "l", "enter", "tab":
 			m.modelsFocus = modelsFocusAuth
@@ -1831,7 +1875,7 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m.activateAuthButton()
 		}
 	case modelsFocusModels:
-		models := FilterModels(DisplayModelsForProvider(m.modelsSelectedProvider()), m.modelsFilter)
+		models := FilterModels(m.displayModelsForProvider(m.modelsSelectedProvider()), m.modelsFilter)
 		switch msg.String() {
 		case "up":
 			if m.modelsModelSel >= modelGridCols {
@@ -1888,8 +1932,9 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // stays within the visible window. It mirrors the renderer's row math via the
 // shared modelsGridRows helper.
 func (m *Model) clampModelsScroll() {
-	st := m.modelsStatus[m.modelsSelectedProvider()]
-	gridRows := modelsGridRows(m.modelsViewportHeight(), st, m.modelsLoginStatus)
+	provider := m.modelsSelectedProvider()
+	st := m.modelsStatus[provider]
+	gridRows := modelsGridRows(m.modelsViewportHeight(), st, m.modelsLoginStatus, IsLocalProvider(provider))
 	selRow := m.modelsModelSel / modelGridCols
 	if selRow < m.modelsModelScroll {
 		m.modelsModelScroll = selRow
@@ -1915,9 +1960,10 @@ func (m Model) modelsViewportHeight() int {
 
 // selectModel applies the chosen model when its provider has a resolvable
 // credential, otherwise opens the key popup (for the provider's default method)
-// and remembers the pending model.
+// and remembers the pending model. Local providers are always selectable: they
+// resolve a keyless placeholder credential.
 func (m Model) selectModel(mod ModelInfo) (tea.Model, tea.Cmd) {
-	if m.providerHasCredential(mod.Provider) {
+	if IsLocalProvider(mod.Provider) || m.providerHasCredential(mod.Provider) {
 		m.applyModelSelection(mod.Spec)
 		return m, nil
 	}
@@ -2846,7 +2892,7 @@ func (m Model) View() tea.View {
 	case TabKindModels:
 		modelsHeight := m.height - layout.TabBarHeight - layout.StatusBarHeight
 		mv := renderModelsView(m.width, modelsHeight, m.styles,
-			m.modelsLoggedIn, m.modelsAvailable, m.modelsStatus,
+			m.modelsLoggedIn, m.modelsLocal, m.modelsAvailable, m.modelsStatus, m.modelsLocalUI,
 			m.modelsProviderSel, m.modelsFocus,
 			m.modelsAuthRow, m.modelsAuthBtn, m.modelsModelSel, m.modelsModelScroll,
 			m.modelsFilter, m.activeModelSpec(), m.modelsLoginStatus)

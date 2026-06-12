@@ -643,6 +643,38 @@
         { "spec": "bedrock/zai.glm-4.7-flash", "display_name": "Zai.glm 4.7 Flash" },
         { "spec": "bedrock/zai.glm-5", "display_name": "Zai.glm 5" }
       ]
+    },
+    {
+      "id": "ollama",
+      "display_name": "Ollama",
+      "model_prefix": "ollama",
+      "wire_format": "chat_completions",
+      "local": true,
+      "inference": {
+        "base_url": "${env:OLLAMA_BASE_URL:-http://localhost:11434/v1}",
+        "auth_scheme": "bearer"
+      },
+      "credential_methods": [
+        { "kind": "api_key", "env_var": "OLLAMA_API_KEY", "keyring": "ollama-api-key" },
+        { "kind": "none" }
+      ],
+      "models": []
+    },
+    {
+      "id": "llamacpp",
+      "display_name": "llama.cpp",
+      "model_prefix": "llamacpp",
+      "wire_format": "chat_completions",
+      "local": true,
+      "inference": {
+        "base_url": "${env:LLAMACPP_BASE_URL:-http://localhost:8080/v1}",
+        "auth_scheme": "bearer"
+      },
+      "credential_methods": [
+        { "kind": "api_key", "env_var": "LLAMACPP_API_KEY", "keyring": "llamacpp-api-key" },
+        { "kind": "none" }
+      ],
+      "models": []
     }
   ],
   "auth_logins": [

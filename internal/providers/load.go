@@ -163,6 +163,9 @@ func mergeProvider(a, b ProviderSpec) ProviderSpec {
 	if b.EffortPolicy != "" {
 		out.EffortPolicy = b.EffortPolicy
 	}
+	if b.Local {
+		out.Local = true
+	}
 	out.Inference = mergeInference(a.Inference, b.Inference)
 	if b.Credential != nil {
 		out.Credential = b.Credential

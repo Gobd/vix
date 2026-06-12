@@ -14,7 +14,7 @@ func TestEmbeddedLoadsAndValidates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadEmbedded: %v", err)
 	}
-	wantIDs := []string{"anthropic", "openai", "openrouter", "minimax", "mimo", "bedrock"}
+	wantIDs := []string{"anthropic", "openai", "openrouter", "minimax", "mimo", "bedrock", "ollama", "llamacpp"}
 	if got := reg.IDs(); len(got) != len(wantIDs) {
 		t.Fatalf("IDs = %v, want %v", got, wantIDs)
 	}
@@ -47,6 +47,8 @@ func TestGoldenProviderData(t *testing.T) {
 		{"minimax", "minimax", WireChatCompletions, EffortAdaptive, AuthSchemeBearer, "https://api.minimax.io/v1", EffortStyleReasoningSplit},
 		{"mimo", "mimo", WireChatCompletions, EffortOpenAIReasoning, AuthSchemeBearer, "https://api.xiaomimimo.com/v1", EffortStyleReasoningEffort},
 		{"bedrock", "bedrock", WireMessages, EffortAdaptive, AuthSchemeBearer, "https://bedrock-runtime.us-east-1.amazonaws.com/", EffortStyleNone},
+		{"ollama", "ollama", WireChatCompletions, "", AuthSchemeBearer, "http://localhost:11434/v1", EffortStyleNone},
+		{"llamacpp", "llamacpp", WireChatCompletions, "", AuthSchemeBearer, "http://localhost:8080/v1", EffortStyleNone},
 	}
 	for _, c := range cases {
 		p, ok := reg.Lookup(c.id)
@@ -200,7 +202,7 @@ func TestDefaultEffort(t *testing.T) {
 func TestModelCatalogue(t *testing.T) {
 	reg, _ := loadEmbedded()
 	for _, p := range reg.All() {
-		if len(p.Models) == 0 {
+		if len(p.Models) == 0 && !p.Local {
 			t.Errorf("%s: no models — a shipped provider must list at least one", p.ID)
 		}
 		prefix := p.Prefix()
@@ -368,6 +370,83 @@ func TestValidationRejections(t *testing.T) {
 	// Sanity: the unmodified base validates.
 	if err := validate(base("")); err != nil {
 		t.Errorf("validate(ok): unexpected error %v", err)
+	}
+}
+
+// TestLocalProviderValidation covers the local-provider relaxations: loopback
+// HTTP base URLs and keyless ("none") credential methods are allowed only
+// within their constraints.
+func TestLocalProviderValidation(t *testing.T) {
+	mk := func(local bool, baseURL string, cred []CredentialMethod) File {
+		return File{
+			SchemaVersion: 1,
+			Providers: []ProviderSpec{{
+				ID: "x", ModelPrefix: "x", WireFormat: WireChatCompletions, Local: local,
+				Inference:  InferenceSpec{BaseURL: baseURL, AuthScheme: AuthSchemeBearer},
+				Credential: cred,
+			}},
+		}
+	}
+	noneCred := []CredentialMethod{{Kind: CredNone}}
+	keyCred := []CredentialMethod{{Kind: CredAPIKey, EnvVar: "X"}}
+
+	cases := []struct {
+		name    string
+		f       File
+		wantErr bool
+	}{
+		{"local loopback http ok", mk(true, "http://localhost:11434/v1", noneCred), false},
+		{"local 127.0.0.1 http ok", mk(true, "http://127.0.0.1:8080/v1", noneCred), false},
+		{"local https ok", mk(true, "https://ollama.example/v1", noneCred), false},
+		{"local non-loopback http rejected", mk(true, "http://192.168.1.10:11434/v1", noneCred), true},
+		{"non-local loopback http rejected", mk(false, "http://localhost:11434/v1", keyCred), true},
+		{"none with env_var rejected", mk(true, "http://localhost:11434/v1",
+			[]CredentialMethod{{Kind: CredNone, EnvVar: "X"}}), true},
+		{"none with keyring rejected", mk(true, "http://localhost:11434/v1",
+			[]CredentialMethod{{Kind: CredNone, Keyring: "x-api-key"}}), true},
+		{"api_key then none ok", mk(true, "http://localhost:11434/v1",
+			[]CredentialMethod{{Kind: CredAPIKey, EnvVar: "X"}, {Kind: CredNone}}), false},
+	}
+	for _, c := range cases {
+		err := validate(c.f)
+		if c.wantErr && err == nil {
+			t.Errorf("%s: expected error, got nil", c.name)
+		}
+		if !c.wantErr && err != nil {
+			t.Errorf("%s: unexpected error %v", c.name, err)
+		}
+	}
+}
+
+// TestLocalFlagMergeAndGolden pins the shipped local providers and checks an
+// overlay can mark a provider local.
+func TestLocalFlagMergeAndGolden(t *testing.T) {
+	reg, _ := loadEmbedded()
+	for _, id := range []string{"ollama", "llamacpp"} {
+		p, ok := reg.Lookup(id)
+		if !ok || !p.Local {
+			t.Errorf("%s: expected shipped local provider, got %+v", id, p)
+		}
+		hasNone := false
+		for _, m := range p.Credential {
+			if m.Kind == CredNone {
+				hasNone = true
+			}
+		}
+		if !hasNone {
+			t.Errorf("%s: expected a none credential method", id)
+		}
+	}
+	for _, id := range []string{"anthropic", "openai", "openrouter", "minimax", "mimo", "bedrock"} {
+		p, _ := reg.Lookup(id)
+		if p.Local {
+			t.Errorf("%s: must not be local", id)
+		}
+	}
+	// Overlay merge preserves the local flag when patching other fields.
+	merged := mergeProvider(ProviderSpec{ID: "ollama", Local: true}, ProviderSpec{ID: "ollama", DisplayName: "My Ollama"})
+	if !merged.Local || merged.DisplayName != "My Ollama" {
+		t.Errorf("mergeProvider lost local flag or patch: %+v", merged)
 	}
 }
 

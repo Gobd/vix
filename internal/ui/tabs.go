@@ -694,8 +694,9 @@ const modelsViewportChrome = 1
 // modelsHeaderLines returns the number of terminal lines the Models-tab right
 // column renders before the model grid, for the given auth + login state. The
 // renderer and the key handler both call it so the grid window and the scroll
-// clamp agree on how many rows fit.
-func modelsHeaderLines(st config.ProviderAuthStatus, loginStatus string) int {
+// clamp agree on how many rows fit. Local providers render one extra line: the
+// server reachability status.
+func modelsHeaderLines(st config.ProviderAuthStatus, loginStatus string, isLocal bool) int {
 	n := 2 // "Credentials" title + separator
 	// Each credential method renders a status row plus a buttons row; a method
 	// with a stored user-supplied base URL adds one more line.
@@ -708,6 +709,9 @@ func modelsHeaderLines(st config.ProviderAuthStatus, loginStatus string) int {
 	if loginStatus != "" {
 		n++
 	}
+	if isLocal {
+		n++ // server status line
+	}
 	// Models section header: blank, "Models:" title (with count), separator,
 	// filter line, two help lines, blank.
 	n += 7
@@ -716,8 +720,8 @@ func modelsHeaderLines(st config.ProviderAuthStatus, loginStatus string) int {
 
 // modelsGridRows returns how many grid rows fit in a Models-tab viewport of the
 // given height for the given auth/login state. Always >= 1.
-func modelsGridRows(height int, st config.ProviderAuthStatus, loginStatus string) int {
-	rows := height - modelsViewportChrome - modelsHeaderLines(st, loginStatus)
+func modelsGridRows(height int, st config.ProviderAuthStatus, loginStatus string, isLocal bool) int {
+	rows := height - modelsViewportChrome - modelsHeaderLines(st, loginStatus, isLocal)
 	if rows < 1 {
 		rows = 1
 	}
@@ -725,11 +729,13 @@ func modelsGridRows(height int, st config.ProviderAuthStatus, loginStatus string
 }
 
 // renderModelsView renders the Models tab: a provider column (split into logged
-// in / available) on the left, and an authentication panel + model grid for the
-// selected provider on the right.
+// in / local / available) on the left, and an authentication panel + model grid
+// for the selected provider on the right. Local providers carry a reachability
+// dot and their model grid is the live-discovered server list.
 func renderModelsView(width, height int, s Styles,
-	loggedIn, available []string,
+	loggedIn, local, available []string,
 	status map[string]config.ProviderAuthStatus,
+	localUI map[string]LocalProviderUI,
 	providerSel int, focus modelsFocusArea,
 	authRow, authBtn, modelSel, modelScroll int,
 	modelFilter, activeModel, loginStatus string) string {
@@ -753,12 +759,21 @@ func renderModelsView(width, height int, s Styles,
 		rightWidth = 10
 	}
 
-	flat := append(append([]string{}, loggedIn...), available...)
+	flat := append(append(append([]string{}, loggedIn...), local...), available...)
 	provider := ""
 	if providerSel >= 0 && providerSel < len(flat) {
 		provider = flat[providerSel]
 	}
 	activeProvider := ProviderOf(activeModel)
+	_, providerIsLocal := localUI[provider]
+	if !providerIsLocal {
+		for _, name := range local {
+			if name == provider {
+				providerIsLocal = true
+				break
+			}
+		}
+	}
 
 	// ---- left: provider column ----
 	var leftLines []string
@@ -767,7 +782,7 @@ func renderModelsView(width, height int, s Styles,
 		dimStyle.Width(colWidth).Render(strings.Repeat("─", colWidth)),
 	)
 	flatIdx := 0
-	renderGroup := func(header string, names []string) {
+	renderGroup := func(header string, names []string, dots bool) {
 		leftLines = append(leftLines, "", dimStyle.Bold(true).Underline(true).Width(colWidth).Render(header))
 		if len(names) == 0 {
 			leftLines = append(leftLines, dimStyle.Italic(true).Width(colWidth).Render("  —"))
@@ -781,6 +796,13 @@ func renderModelsView(width, height int, s Styles,
 				prefix = "▸ "
 			}
 			label := prefix + DisplayNameForProvider(name)
+			if dots {
+				dot := "○ " // unreachable, or probe not answered yet
+				if localUI[name].Reachable {
+					dot = "● "
+				}
+				label = prefix + dot + DisplayNameForProvider(name)
+			}
 			if name == activeProvider {
 				label += " ★"
 			}
@@ -795,8 +817,9 @@ func renderModelsView(width, height int, s Styles,
 			flatIdx++
 		}
 	}
-	renderGroup("Logged in:", loggedIn)
-	renderGroup("Available:", available)
+	renderGroup("Logged in:", loggedIn, false)
+	renderGroup("Local:", local, true)
+	renderGroup("Available:", available, false)
 
 	// ---- right: authentication + models ----
 	st := status[provider]
@@ -856,6 +879,22 @@ func renderModelsView(width, height int, s Styles,
 		rightLines = append(rightLines, secondaryStyle.Render(loginStatus))
 	}
 
+	// Server status line for local providers: reachability dot + endpoint.
+	// The API key above is optional (proxied servers only) — say so.
+	if providerIsLocal {
+		ui := localUI[provider]
+		var serverLine string
+		switch {
+		case !ui.Fetched:
+			serverLine = dimStyle.Render("Server: probing…")
+		case ui.Reachable:
+			serverLine = "Server: " + secondaryStyle.Render("●") + " " + ui.BaseURL + dimStyle.Render(" — running · no API key required")
+		default:
+			serverLine = "Server: " + dimStyle.Render("○ "+ui.BaseURL+" — not reachable")
+		}
+		rightLines = append(rightLines, serverLine)
+	}
+
 	// Models section.
 	modelsTitle := lipgloss.NewStyle().Bold(true)
 	if focus == modelsFocusModels {
@@ -865,10 +904,13 @@ func renderModelsView(width, height int, s Styles,
 	}
 
 	allModels := DisplayModelsForProvider(provider)
+	if providerIsLocal {
+		allModels = localUI[provider].Models
+	}
 	filtered := FilterModels(allModels, modelFilter)
 
 	// Window the filtered list to the rows that fit, keeping the cursor visible.
-	gridRows := modelsGridRows(height, st, loginStatus)
+	gridRows := modelsGridRows(height, st, loginStatus, providerIsLocal)
 	maxVisible := gridRows * modelGridCols
 	totalRows := (len(filtered) + modelGridCols - 1) / modelGridCols
 	maxScrollRow := totalRows - gridRows
@@ -921,6 +963,25 @@ func renderModelsView(width, height int, s Styles,
 	}
 	grid := renderModelGrid(window, rightWidth, focus == modelsFocusModels, selInWindow, activeModel)
 	rightLines = append(rightLines, grid...)
+
+	// Empty-state hints for local providers (rendered in the grid's space).
+	if providerIsLocal && len(filtered) == 0 && modelFilter == "" {
+		ui := localUI[provider]
+		hint := ""
+		switch {
+		case ui.Fetched && !ui.Reachable && provider == "ollama":
+			hint = "  server not reachable — start it with: ollama serve"
+		case ui.Fetched && !ui.Reachable:
+			hint = "  server not reachable — start it with: llama-server -m <model.gguf>"
+		case ui.Fetched && provider == "ollama":
+			hint = "  no models installed — try: ollama pull qwen3"
+		case ui.Fetched:
+			hint = "  no models reported by the server"
+		}
+		if hint != "" {
+			rightLines = append(rightLines, dimStyle.Italic(true).Width(rightWidth).Render(hint))
+		}
+	}
 
 	// Footer for an active model that isn't in the provider's catalogue at all
 	// (e.g. a custom OpenRouter route set via agent frontmatter).

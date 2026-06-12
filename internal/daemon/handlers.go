@@ -11,6 +11,7 @@ import (
 // RegisterBuiltinHandlers registers ping, init, and force_init handlers.
 func RegisterBuiltinHandlers(s *Server) {
 	RegisterCredentialHandlers(s)
+	RegisterLocalProviderHandlers(s)
 
 	s.RegisterHandler("ping", func(data map[string]any) (map[string]any, error) {
 		return map[string]any{"status": "ok", "message": "pong", "version": s.version}, nil

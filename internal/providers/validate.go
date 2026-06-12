@@ -25,7 +25,7 @@ var allowedAuthHosts = map[string]bool{
 var (
 	validWireFormats  = map[WireFormat]bool{WireMessages: true, WireResponses: true, WireChatCompletions: true}
 	validAuthSchemes  = map[string]bool{AuthSchemeBearer: true, AuthSchemeXAPIKey: true}
-	validCredKinds    = map[string]bool{CredAPIKey: true, CredOAuthMintKey: true, CredOAuthToken: true}
+	validCredKinds    = map[string]bool{CredAPIKey: true, CredOAuthMintKey: true, CredOAuthToken: true, CredNone: true}
 	validFlows        = map[string]bool{FlowOAuthPKCEToken: true, FlowOAuthCodex: true, FlowOAuthPKCEMint: true}
 	validEffortStyles = map[string]bool{EffortStyleNone: true, EffortStyleReasoningEffort: true, EffortStyleReasoningSplit: true}
 	validEfforts      = map[string]bool{EffortAdaptive: true, EffortOpenAIReasoning: true, "": true}
@@ -109,7 +109,9 @@ func validateProvider(p ProviderSpec) error {
 	if p.Inference.BaseURL == "" {
 		return fmt.Errorf("provider %q: empty inference.base_url", p.ID)
 	}
-	if err := checkURL(interpolate(p.Inference.BaseURL), false); err != nil {
+	// Local providers (Ollama, llama.cpp) may use a plain-HTTP loopback base
+	// URL; everything else requires HTTPS.
+	if err := checkURL(interpolate(p.Inference.BaseURL), p.Local); err != nil {
 		return fmt.Errorf("provider %q base_url: %w", p.ID, err)
 	}
 	if len(p.Credential) == 0 {
@@ -140,6 +142,10 @@ func validateProvider(p ProviderSpec) error {
 		case CredOAuthMintKey, CredOAuthToken:
 			if m.LoginID == "" {
 				return fmt.Errorf("provider %q credential[%d]: %s needs login_id", p.ID, i, m.Kind)
+			}
+		case CredNone:
+			if m.EnvVar != "" || m.Keyring != "" || m.LoginID != "" {
+				return fmt.Errorf("provider %q credential[%d]: none must not set env_var, keyring or login_id", p.ID, i)
 			}
 		}
 		if m.RequiresBaseURL && m.Keyring == "" {
