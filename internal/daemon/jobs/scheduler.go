@@ -67,7 +67,10 @@ type Scheduler struct {
 
 // NewScheduler builds a scheduler over the store. runner executes runs;
 // notify (optional) broadcasts lifecycle events; maxConcurrent <= 0 uses the
-// default.
+// default. Runtime state is seeded from the store's persisted state file so
+// restarts don't forget completed one-shots, auto-disabled jobs, or pending
+// next-run times; reconcile drops entries whose spec vanished and resets
+// those whose spec changed (SpecHash).
 func NewScheduler(store *Store, runner Runner, notify func(string, any), maxConcurrent int) *Scheduler {
 	if maxConcurrent <= 0 {
 		maxConcurrent = DefaultMaxConcurrentRuns
@@ -81,7 +84,7 @@ func NewScheduler(store *Store, runner Runner, notify func(string, any), maxConc
 			return prompt.GetLoader().Resolve(spec.Prompt, nil, spec.CWD, nil)
 		},
 		specs:    make(map[string]Spec),
-		state:    make(map[string]*State),
+		state:    store.LoadState(),
 		running:  make(map[string]bool),
 		reloadCh: make(chan struct{}, 1),
 		sem:      make(chan struct{}, maxConcurrent),

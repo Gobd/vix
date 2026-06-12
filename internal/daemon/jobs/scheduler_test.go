@@ -243,6 +243,44 @@ func TestSchedulerFiresDueJob(t *testing.T) {
 	}
 }
 
+// TestSchedulerRestartDoesNotRerunCompletedOneShot: a daemon restart must not
+// forget that a one-shot already fired — the scheduler seeds its state from
+// the persisted state file, so the completed job stays completed instead of
+// being treated as a newly-created overdue one-shot and re-run.
+func TestSchedulerRestartDoesNotRerunCompletedOneShot(t *testing.T) {
+	dir := t.TempDir()
+	s := validSpec("once")
+	s.Trigger = Trigger{Type: "at", Time: time.Now().Add(-time.Minute).Format(time.RFC3339)}
+	writeSpec(t, dir, s)
+
+	runner := newTestRunner(nil)
+	sched := newTestScheduler(t, dir, runner)
+	now := time.Now()
+	sched.reconcile(now)
+	sched.tick(context.Background(), now)
+	waitFor(t, "one-shot to run", func() bool { return runner.count("once") == 1 })
+	waitFor(t, "completion to persist", func() bool {
+		st := sched.store.LoadState()["once"]
+		return st != nil && st.Completed
+	})
+
+	// Simulate a daemon restart: a fresh scheduler over the same store.
+	restarted := newTestScheduler(t, dir, runner)
+	now = time.Now()
+	restarted.reconcile(now)
+	restarted.tick(context.Background(), now)
+	time.Sleep(50 * time.Millisecond)
+	if got := runner.count("once"); got != 1 {
+		t.Fatalf("completed one-shot ran %d times after restart, want 1", got)
+	}
+	restarted.mu.Lock()
+	st := restarted.state["once"]
+	restarted.mu.Unlock()
+	if st == nil || !st.Completed {
+		t.Fatalf("restarted state = %+v, want completed", st)
+	}
+}
+
 func TestSchedulerCronComputesNext(t *testing.T) {
 	dir := t.TempDir()
 	writeSpec(t, dir, validSpec("rec"))
@@ -286,7 +324,6 @@ func TestSchedulerCatchupCap(t *testing.T) {
 	runner := newTestRunner(nil)
 	sched := NewScheduler(store, runner.fn, nil, 2)
 	sched.resolvePrompt = func(spec Spec) string { return spec.Prompt }
-	sched.state = store.LoadState()
 
 	now := time.Now()
 	sched.reconcile(now)
