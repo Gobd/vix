@@ -52,10 +52,12 @@ var sessionsSpinnerStyle = lipgloss.NewStyle().Foreground(colorPrimary)
 // renderSessionsView renders the sessions list overview. spinnerFrame is the
 // current loading-spinner glyph (empty when the spinner is inactive); it is
 // shown in a busy session's leading-indicator slot in place of the unread dot.
-// vixSessions are the persisted vix-initiated records (job runs, alerts),
-// rendered as their own group below the live sessions; the selection index
-// space covers live rows first, then vix rows.
-func renderSessionsView(sessions []*SessionState, vixSessions []protocol.SessionSummary, width, height int, s Styles, selectedRow int, spinnerFrame string) string {
+// userSessions are the live user-initiated sessions (the top group). vixLive
+// are live sessions attached from vix-initiated records; they render inside
+// the Vix-initiated group together with vixSessions, the persisted
+// not-attached records (job runs, alerts). The selection index space covers
+// user rows first, then live vix rows, then persisted vix rows.
+func renderSessionsView(userSessions, vixLive []*SessionState, vixSessions []protocol.SessionSummary, width, height int, s Styles, selectedRow int, spinnerFrame string) string {
 	const colSession = 10
 	const colRunning = 10
 
@@ -79,7 +81,7 @@ func renderSessionsView(sessions []*SessionState, vixSessions []protocol.Session
 
 	rowIdx := 0
 
-	for _, sess := range sessions {
+	for _, sess := range userSessions {
 		sessionCol := "connecting…"
 		runningCol := "—"
 		if sess.client != nil {
@@ -161,11 +163,15 @@ func renderSessionsView(sessions []*SessionState, vixSessions []protocol.Session
 		rowIdx++
 	}
 
-	// Vix-initiated group: persisted job runs and alerts, openable (enter) or
+	// Vix-initiated group: live sessions opened from this group (still attached
+	// as chat tabs), then persisted job runs and alerts, openable (enter) or
 	// dismissable (x) without being live sessions.
-	if len(vixSessions) > 0 {
+	if len(vixLive)+len(vixSessions) > 0 {
 		rows = append(rows, "", s.TabActiveStyle.Render("  Vix-initiated"))
-		for _, sum := range vixSessions {
+
+		// vixCols formats the three shared columns of a vix-initiated row from
+		// its record summary (id, "<job> · <status>  <first message>", ran ago).
+		vixCols := func(sum protocol.SessionSummary) string {
 			idCol := sum.ID
 			if dash := strings.Index(idCol, "-"); dash >= 0 {
 				idCol = idCol[:dash]
@@ -193,8 +199,41 @@ func renderSessionsView(sessions []*SessionState, vixSessions []protocol.Session
 			if t, err := time.Parse(time.RFC3339, sum.StartedAt); err == nil {
 				ranCol = formatRunningTime(time.Since(t)) + " ago"
 			}
+			return fmt.Sprintf("%-*s  %-*s  %-*s", colSession, idCol, colMessage, msgCol, colRunning, ranCol)
+		}
 
-			plainCols := fmt.Sprintf("%-*s  %-*s  %-*s", colSession, idCol, colMessage, msgCol, colRunning, ranCol) + strings.Repeat(" ", badgeVisible)
+		for _, sess := range vixLive {
+			busy := spinnerFrame != "" &&
+				(sess.agentState == StateStreaming ||
+					sess.agentState == StateToolExecuting ||
+					sess.agentState == StatePlanExecuting)
+			needsInput := sess.agentState == StateConfirmPending || sess.agentState == StateUserQuestion
+			badgeSlot := strings.Repeat(" ", badgeVisible)
+			if needsInput {
+				badgeSlot = "  " + waitingBadge
+			}
+			plainCols := vixCols(*sess.vixSummary) + badgeSlot
+			switch {
+			case rowIdx == selectedRow:
+				lead := " "
+				if busy {
+					lead = spinnerFrame
+				} else if sess.unreadCount > 0 {
+					lead = "●"
+				}
+				rows = append(rows, s.TabAlertStyle.Render(lead+" "+plainCols))
+			case busy:
+				rows = append(rows, sessionsSpinnerStyle.Render(spinnerFrame)+" "+plainCols)
+			case sess.unreadCount > 0:
+				rows = append(rows, unreadDotStyle.Render("●")+" "+plainCols)
+			default:
+				rows = append(rows, "  "+plainCols)
+			}
+			rowIdx++
+		}
+
+		for _, sum := range vixSessions {
+			plainCols := vixCols(sum) + strings.Repeat(" ", badgeVisible)
 			if rowIdx == selectedRow {
 				rows = append(rows, s.TabAlertStyle.Render("  "+plainCols))
 			} else if sum.Unread {

@@ -147,6 +147,12 @@ type SessionState struct {
 	// of the welcome screen, so a restored conversation doesn't flash the
 	// welcome view before its history arrives.
 	awaitingReplay bool
+
+	// vixSummary is set when this session was attached from a vix-initiated
+	// record (job run, alert). It carries the record's trigger/status metadata
+	// and keeps the session rendered inside the Sessions tab's "Vix-initiated"
+	// group rather than among the user-initiated sessions.
+	vixSummary *protocol.SessionSummary
 }
 
 // newSessionState initialises a fresh session state ready for a new agent session.

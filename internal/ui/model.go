@@ -1260,6 +1260,20 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.summary.Model != "" {
 			restored.setModel(msg.summary.Model)
 		}
+		// A vix-initiated record (job run, alert) keeps its provenance: the
+		// summary tag keeps it rendered in the Sessions tab's "Vix-initiated"
+		// group while attached. Drop it from the persisted-records group so it
+		// doesn't show twice (the daemon doesn't broadcast on attach).
+		if msg.summary.Origin == "vix" {
+			sum := msg.summary
+			restored.vixSummary = &sum
+			for i, vs := range m.vixSessions {
+				if vs.ID == sum.ID {
+					m.vixSessions = append(m.vixSessions[:i], m.vixSessions[i+1:]...)
+					break
+				}
+			}
+		}
 		// Seed the unread indicator from the persisted flag so activity that
 		// happened while vix was closed (job runs, alerts) survives restarts.
 		if msg.summary.Unread {
@@ -2679,7 +2693,17 @@ func (m Model) View() tea.View {
 		if m.sessionsSpinnerActive {
 			spinnerFrame = string(animFrames[m.sessionsSpinnerStep%len(animFrames)])
 		}
-		sv := renderSessionsView(m.sessions, m.vixSessions, m.width, sessionsHeight, m.styles, m.sessionsSelected, spinnerFrame)
+		// Split live sessions into the two display groups, preserving slice
+		// order — must match the row order of visibleSessionIndices.
+		var userSessions, vixLive []*SessionState
+		for _, sess := range m.sessions {
+			if sess.vixSummary != nil {
+				vixLive = append(vixLive, sess)
+			} else {
+				userSessions = append(userSessions, sess)
+			}
+		}
+		sv := renderSessionsView(userSessions, vixLive, m.vixSessions, m.width, sessionsHeight, m.styles, m.sessionsSelected, spinnerFrame)
 		uv.NewStyledString(sv).Draw(canvas, image.Rect(0, y, m.width, y+sessionsHeight))
 		y += sessionsHeight
 
@@ -3603,13 +3627,20 @@ func (m *Model) rerenderSessionMessages() {
 	sess.chatCache.invalidate()
 }
 
-// visibleSessionIndices returns the indices of all sessions.
+// visibleSessionIndices returns the indices of all live sessions in
+// Sessions-tab row order: user-initiated sessions first, then vix-initiated
+// ones (which render inside the "Vix-initiated" group, above the persisted,
+// not-attached records). The selection index space follows this order.
 func (m *Model) visibleSessionIndices() []int {
-	indices := make([]int, len(m.sessions))
-	for i := range m.sessions {
-		indices[i] = i
+	var user, vix []int
+	for i, s := range m.sessions {
+		if s.vixSummary != nil {
+			vix = append(vix, i)
+		} else {
+			user = append(user, i)
+		}
 	}
-	return indices
+	return append(user, vix...)
 }
 
 // sessionsVisibleCount returns the number of visible sessions (after filter).
