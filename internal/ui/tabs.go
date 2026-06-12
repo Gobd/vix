@@ -76,7 +76,7 @@ func renderSessionsView(userSessions, vixLive []*SessionState, vixSessions []pro
 		colMessage = 20
 	}
 
-	header := fmt.Sprintf("  %-*s  %-*s  %-*s%-*s", colSession, "Session", colMessage, "First message", colRunning, "Running", badgeVisible, "")
+	header := fmt.Sprintf("  %-*s  %-*s  %-*s%-*s", colSession, "Session", colMessage, "Title", colRunning, "Running", badgeVisible, "")
 	rows := []string{s.TabActiveStyle.Render(header)}
 
 	rowIdx := 0
@@ -108,10 +108,14 @@ func renderSessionsView(userSessions, vixLive []*SessionState, vixSessions []pro
 			}
 			prefix := "⎇ " + parentShort + "/" + fmt.Sprintf("%d", sess.forkTurnIdx+1) + "  "
 			rest := "—"
-			for _, msg := range sess.chatMessages {
-				if msg.Type == MsgUser {
-					rest = strings.SplitN(msg.Text, "\n", 2)[0]
-					break
+			if sess.title != "" {
+				rest = sess.title
+			} else {
+				for _, msg := range sess.chatMessages {
+					if msg.Type == MsgUser {
+						rest = strings.SplitN(msg.Text, "\n", 2)[0]
+						break
+					}
 				}
 			}
 			full := prefix + rest
@@ -119,6 +123,12 @@ func renderSessionsView(userSessions, vixLive []*SessionState, vixSessions []pro
 				full = full[:colMessage-1] + "…"
 			}
 			msgCol = full
+		} else if sess.title != "" {
+			line := sess.title
+			if len(line) > colMessage {
+				line = line[:colMessage-1] + "…"
+			}
+			msgCol = line
 		} else {
 			for _, msg := range sess.chatMessages {
 				if msg.Type == MsgUser {
@@ -188,7 +198,9 @@ func renderSessionsView(userSessions, vixLive []*SessionState, vixSessions []pro
 				status = "alert"
 			}
 			msgCol := badge + " · " + status
-			if sum.FirstMessage != "" {
+			if sum.Title != "" {
+				msgCol += "  " + sum.Title
+			} else if sum.FirstMessage != "" {
 				msgCol += "  " + sum.FirstMessage
 			}
 			if len(msgCol) > colMessage {

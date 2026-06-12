@@ -226,9 +226,13 @@ func TestFirstUserMessageAndSummary(t *testing.T) {
 	if got := rec.firstUserMessage(); got != "first question" {
 		t.Errorf("firstUserMessage = %q", got)
 	}
+	rec.Title = "A generated title"
 	s := rec.summary()
 	if s.ID != rec.ID || s.FirstMessage != "first question" || s.Model != rec.Model {
 		t.Errorf("summary mismatch: %+v", s)
+	}
+	if s.Title != "A generated title" {
+		t.Errorf("summary title = %q", s.Title)
 	}
 	if s.StartedAt == "" || s.LastRequestAt == "" {
 		t.Errorf("summary timestamps not set: %+v", s)

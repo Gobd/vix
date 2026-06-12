@@ -81,9 +81,13 @@ type TriggerInfo struct {
 // by the session.list RPC. It carries just enough to populate the Sessions
 // list without loading full conversation histories.
 type SessionSummary struct {
-	ID            string `json:"id"`
-	CWD           string `json:"cwd"`
-	Model         string `json:"model"`
+	ID    string `json:"id"`
+	CWD   string `json:"cwd"`
+	Model string `json:"model"`
+	// Title is the session's display title: set by an LLM summarization pass
+	// after a few turns (user sessions) or at creation time (job runs). When
+	// empty, clients fall back to FirstMessage.
+	Title         string `json:"title,omitempty"`
 	FirstMessage  string `json:"first_message,omitempty"`
 	StartedAt     string `json:"started_at,omitempty"`      // RFC3339
 	LastRequestAt string `json:"last_request_at,omitempty"` // RFC3339
@@ -358,11 +362,19 @@ type EventReplay struct {
 	Todos          []TodoItem      `json:"todos,omitempty"`
 	ActivePlan     *Plan           `json:"active_plan,omitempty"`
 	Model          string          `json:"model,omitempty"`
+	Title          string          `json:"title,omitempty"`
 	SessionMode    string          `json:"session_mode,omitempty"`
 	ActiveWorkflow string          `json:"active_workflow,omitempty"`
 	// Warnings are human-readable restore notices rendered into the viewport
 	// (e.g. "Saved with model X; switched to your current default Y.").
 	Warnings []string `json:"warnings,omitempty"`
+}
+
+// EventTitleUpdated is emitted on a session's stream when its display title
+// changes (LLM auto-titling after a few turns). The sessions list refresh for
+// other clients goes through event.sessions_changed.
+type EventTitleUpdated struct {
+	Title string `json:"title"`
 }
 
 // EventRetry notifies the UI about an API retry attempt.

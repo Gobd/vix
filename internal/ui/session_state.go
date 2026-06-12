@@ -153,6 +153,11 @@ type SessionState struct {
 	// and keeps the session rendered inside the Sessions tab's "Vix-initiated"
 	// group rather than among the user-initiated sessions.
 	vixSummary *protocol.SessionSummary
+
+	// title is the session's display title (LLM-generated after a few turns,
+	// or set at creation for job runs). Empty = the Sessions tab falls back to
+	// the first user message.
+	title string
 }
 
 // newSessionState initialises a fresh session state ready for a new agent session.

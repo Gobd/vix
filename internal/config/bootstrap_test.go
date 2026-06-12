@@ -44,6 +44,7 @@ func TestBootstrap_FirstRunSeedsEverythingAndStampsMarker(t *testing.T) {
 		"config/languages.json",
 		"agents/general.md",
 		"prompts/goal/pursue.md",
+		"prompts/summarization.md",
 	} {
 		if !exists(filepath.Join(dir, rel)) {
 			t.Errorf("first run should seed %s", rel)

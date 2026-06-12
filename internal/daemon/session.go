@@ -172,6 +172,17 @@ type Session struct {
 	// session. Persisted in the record so the indicator survives restarts;
 	// absent on legacy records, which therefore read as seen.
 	unread bool
+
+	// title is the display title shown in the Sessions list. Empty until the
+	// auto-titling pass runs (after titleEndTurnThreshold end_turn stops) or,
+	// for job runs, set at creation time by the job runner. Guarded by s.mu
+	// because the generation goroutine writes it off the turn loop.
+	title string
+	// endTurnCount counts completed chat turns (StopReason == end_turn).
+	// Maintained by the turn loop, re-derived from history on attach.
+	endTurnCount int
+	// titleGenInFlight prevents overlapping title generation calls.
+	titleGenInFlight bool
 }
 
 // NewSession creates a new agent session.
@@ -1834,6 +1845,7 @@ func (s *Session) handleInput(text string, attachments []protocol.Attachment) {
 
 		if msg.StopReason == llm.StopEndTurn {
 			log.Printf("\033[34m[session] end of turn detected\033[0m")
+			s.endTurnCount++
 			if todoNudges < 3 && s.hasPendingTodos() {
 				todoNudges++
 				s.messages = append(s.messages, llm.NewUserMessage(
@@ -1872,6 +1884,7 @@ func (s *Session) handleInput(text string, attachments []protocol.Attachment) {
 	s.mu.Unlock()
 	s.unread = true // new content; cleared by session.mark_read when viewed
 	s.persist()
+	s.maybeGenerateTitle()
 	s.emit("event.agent_done", nil)
 }
 

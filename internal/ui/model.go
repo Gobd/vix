@@ -2300,6 +2300,15 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 			}
 		}
 
+	case "event.title_updated":
+		data := marshalData(event.Data)
+		var tu protocol.EventTitleUpdated
+		json.Unmarshal(data, &tu)
+		sess.title = tu.Title
+		if sess.vixSummary != nil {
+			sess.vixSummary.Title = tu.Title
+		}
+
 	case "event.init_state":
 		data := marshalData(event.Data)
 		var state protocol.EventInitState
@@ -3168,6 +3177,12 @@ func (m *Model) applyReplay(sess *SessionState, rep protocol.EventReplay) {
 	sess.activePlan = rep.ActivePlan
 	if rep.Model != "" {
 		sess.setModel(rep.Model)
+	}
+	if rep.Title != "" {
+		sess.title = rep.Title
+		if sess.vixSummary != nil {
+			sess.vixSummary.Title = rep.Title
+		}
 	}
 	sess.activeWorkflow = rep.ActiveWorkflow
 	for _, w := range rep.Warnings {

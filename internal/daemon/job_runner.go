@@ -28,6 +28,9 @@ func (s *Server) JobRunner() jobs.Runner {
 	return s.runJob
 }
 
+// jobTitleTimeFormat renders job-run timestamps in titles (en_US style).
+const jobTitleTimeFormat = "01/02/2006 3:04 PM"
+
 // runJob drives one scheduled job run to completion. ctx carries the per-run
 // timeout; cancelling it tears the session down.
 func (s *Server) runJob(ctx context.Context, spec jobs.Spec, resolvedPrompt string) jobs.RunResult {
@@ -36,6 +39,7 @@ func (s *Server) runJob(ctx context.Context, spec jobs.Spec, resolvedPrompt stri
 		spec.AutoWrite(), spec.AutoDirs(), true /*headless*/, ctx)
 	session.origin = "vix"
 	session.trigger = &protocol.TriggerInfo{Type: spec.Trigger.Type, Ref: spec.ID}
+	session.title = jobRunTitle(spec, time.Now())
 
 	// Register so the web UI and session.list see the run while it's live.
 	s.sessionMu.Lock()
@@ -157,6 +161,16 @@ consume:
 	return res
 }
 
+// jobRunTitle builds the display title of a job-run session, e.g.
+// "Heartbeat - 06/12/2026 9:30 AM".
+func jobRunTitle(spec jobs.Spec, t time.Time) string {
+	name := spec.Name
+	if name == "" {
+		name = spec.ID
+	}
+	return name + " - " + t.Format(jobTitleTimeFormat)
+}
+
 // pushCommand feeds a command to the session loop, giving up when either
 // context dies. Returns false when the command was not delivered.
 func (s *Session) pushCommand(ctx context.Context, cmd protocol.SessionCommand) bool {
@@ -204,6 +218,7 @@ func (s *Server) writeJobAlertSession(spec jobs.Spec, res jobs.RunResult) {
 	rec := sessionRecord{
 		ID:      generateSessionID(),
 		CWD:     spec.CWD,
+		Title:   jobRunTitle(spec, time.Now()),
 		Origin:  "vix",
 		Trigger: &protocol.TriggerInfo{Type: spec.Trigger.Type, Ref: spec.ID},
 		Unread:  true,
