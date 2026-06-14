@@ -7,6 +7,7 @@ import (
 	"image"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -1261,9 +1262,16 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Seed the unread indicator from the persisted flag so activity that
 		// happened while vix was closed (job runs, alerts) survives restarts.
+		// Only a background restore raises the Sessions-tab "unseen" latch: a
+		// user explicitly opening (or stepping onto) a record sets
+		// focusRestoredID to its ID and is marked read below, so re-tinting the
+		// tab title for it — or leaving it tinted because another record is still
+		// unread — would be wrong. The per-row ● dot still tracks unread.
 		if msg.summary.Unread {
 			restored.unreadCount = 1
-			m.sessionsTabUnseen = true
+			if m.focusRestoredID != msg.summary.ID {
+				m.sessionsTabUnseen = true
+			}
 		}
 		// Restored sessions are waiting for their replay; show the placeholder
 		// (with an animated spinner) until it arrives.
@@ -2752,19 +2760,29 @@ func (m Model) View() tea.View {
 		sessionsHeight := m.height - layout.TabBarHeight - layout.StatusBarHeight
 		spinnerFrame := ""
 		if m.sessionsSpinnerActive {
-			spinnerFrame = string(animFrames[m.sessionsSpinnerStep%len(animFrames)])
+			spinnerFrame = string(animFrames[frozenStep(m.sessionsSpinnerStep)%len(animFrames)])
 		}
-		// Split live sessions into the two display groups, preserving slice
-		// order — must match the row order of visibleSessionIndices.
-		var userSessions, vixLive []*SessionState
+		// User-initiated sessions render in slice (creation) order; the
+		// Vix-initiated group (live attached + persisted records) renders in one
+		// StartedAt-ordered list, derived from the same canonical row order as
+		// the selection index space (sessionRowTargets).
+		var userSessions []*SessionState
 		for _, sess := range m.sessions {
-			if sess.vixSummary != nil {
-				vixLive = append(vixLive, sess)
-			} else {
+			if sess.vixSummary == nil {
 				userSessions = append(userSessions, sess)
 			}
 		}
-		sv := renderSessionsView(userSessions, vixLive, m.vixSessions, m.width, sessionsHeight, m.styles, m.sessionsSelected, spinnerFrame)
+		var vixRows []vixDisplayRow
+		for _, r := range m.sessionRowTargets() {
+			switch {
+			case r.sum != nil:
+				vixRows = append(vixRows, vixDisplayRow{sum: *r.sum})
+			case m.sessions[r.liveIdx].vixSummary != nil:
+				live := m.sessions[r.liveIdx]
+				vixRows = append(vixRows, vixDisplayRow{live: live, sum: *live.vixSummary})
+			}
+		}
+		sv := renderSessionsView(userSessions, vixRows, m.width, sessionsHeight, m.styles, m.sessionsSelected, spinnerFrame)
 		uv.NewStyledString(sv).Draw(canvas, image.Rect(0, y, m.width, y+sessionsHeight))
 		y += sessionsHeight
 
@@ -3634,12 +3652,16 @@ func (m *Model) doCloseSession(sessionIdx int) (Model, tea.Cmd) {
 		reconnectCmd = attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, newSess.daemonSessionID)
 	}
 
-	if n := m.sessionsVisibleCount(); n > 0 && m.sessionsSelected >= n {
+	// Keep the Sessions-tab cursor on the same row index: the closed row was the
+	// highlighted one, so the next session slides into its place. Clamp against
+	// the full row count (live sessions + persisted vix records). Do NOT call
+	// syncSessionsSelected here — it would snap the highlight onto the active
+	// workspace session's row (usually a user-initiated one).
+	if n := m.sessionsVisibleCount() + len(m.vixSessions); n > 0 && m.sessionsSelected >= n {
 		m.sessionsSelected = n - 1
 	}
 
 	m.activeTab = TabKindSessions
-	m.syncSessionsSelected()
 	m.state = StateWaitingForInput
 	return *m, tea.Batch(reconnectCmd, m.maybeStartSessionsSpinner())
 }
@@ -3694,20 +3716,68 @@ func (m *Model) rerenderSessionMessages() {
 	sess.chatCache.invalidate()
 }
 
-// visibleSessionIndices returns the indices of all live sessions in
-// Sessions-tab row order: user-initiated sessions first, then vix-initiated
-// ones (which render inside the "Vix-initiated" group, above the persisted,
-// not-attached records). The selection index space follows this order.
-func (m *Model) visibleSessionIndices() []int {
-	var user, vix []int
-	for i, s := range m.sessions {
-		if s.vixSummary != nil {
-			vix = append(vix, i)
-		} else {
-			user = append(user, i)
+// rowTarget identifies what a single Sessions-tab row points at: a live session
+// (liveIdx is an index into m.sessions, sum == nil) or a persisted, not-attached
+// vix-initiated record (liveIdx == -1, sum != nil).
+type rowTarget struct {
+	liveIdx int
+	sum     *protocol.SessionSummary
+}
+
+// rowStartedAt returns the creation time used to order the Vix-initiated group.
+// A live vix session carries its origin record in vixSummary, so a record keeps
+// the same StartedAt — and therefore the same list position — when it
+// transitions from persisted to attached (on read).
+func (m *Model) rowStartedAt(r rowTarget) time.Time {
+	var raw string
+	switch {
+	case r.sum != nil:
+		raw = r.sum.StartedAt
+	case r.liveIdx >= 0 && r.liveIdx < len(m.sessions):
+		if vs := m.sessions[r.liveIdx].vixSummary; vs != nil {
+			raw = vs.StartedAt
 		}
 	}
-	return append(user, vix...)
+	t, _ := time.Parse(time.RFC3339, raw)
+	return t
+}
+
+// sessionRowTargets returns one entry per Sessions-tab row in display order:
+// user-initiated live sessions first (slice/creation order), then the
+// Vix-initiated group — live attached records and persisted not-attached
+// records merged into a single list ordered by StartedAt. Ordering the vix
+// group by StartedAt (rather than live-first) keeps a record in place when it
+// becomes attached on read. The slice index is the selection row index
+// (m.sessionsSelected).
+func (m *Model) sessionRowTargets() []rowTarget {
+	var rows, vix []rowTarget
+	for i, s := range m.sessions {
+		if s.vixSummary != nil {
+			vix = append(vix, rowTarget{liveIdx: i})
+		} else {
+			rows = append(rows, rowTarget{liveIdx: i})
+		}
+	}
+	for idx := range m.vixSessions {
+		vix = append(vix, rowTarget{liveIdx: -1, sum: &m.vixSessions[idx]})
+	}
+	sort.SliceStable(vix, func(a, b int) bool {
+		return m.rowStartedAt(vix[a]).Before(m.rowStartedAt(vix[b]))
+	})
+	return append(rows, vix...)
+}
+
+// visibleSessionIndices returns the indices of all live sessions in Sessions-tab
+// row order (user-initiated first, then attached vix-initiated ones in the same
+// order they render). Persisted, not-attached records are skipped.
+func (m *Model) visibleSessionIndices() []int {
+	var out []int
+	for _, r := range m.sessionRowTargets() {
+		if r.sum == nil {
+			out = append(out, r.liveIdx)
+		}
+	}
+	return out
 }
 
 // stepWorkspaceSession moves the workspace to the next (dir > 0) or previous
@@ -3765,32 +3835,40 @@ func (m *Model) sessionsVisibleCount() int {
 // syncSessionsSelected sets sessionsSelected to the visible row that corresponds
 // to the currently active workspace session (selectedSession).
 func (m *Model) syncSessionsSelected() {
-	for i, idx := range m.visibleSessionIndices() {
-		if idx == m.selectedSession {
+	for i, r := range m.sessionRowTargets() {
+		if r.sum == nil && r.liveIdx == m.selectedSession {
 			m.sessionsSelected = i
 			return
 		}
 	}
 }
 
-// sessionsSelectedIdx returns the session index for the highlighted row.
+// sessionsSelectedIdx returns the m.sessions index for the highlighted row, when
+// that row is a live session. Persisted vix-initiated rows report false (use
+// vixSelectedSummary for those).
 func (m *Model) sessionsSelectedIdx() (int, bool) {
-	indices := m.visibleSessionIndices()
-	if m.sessionsSelected < 0 || m.sessionsSelected >= len(indices) {
+	rows := m.sessionRowTargets()
+	if m.sessionsSelected < 0 || m.sessionsSelected >= len(rows) {
 		return 0, false
 	}
-	return indices[m.sessionsSelected], true
+	r := rows[m.sessionsSelected]
+	if r.sum != nil {
+		return 0, false
+	}
+	return r.liveIdx, true
 }
 
 // vixSelectedSummary returns the vix-initiated record for the highlighted row,
-// when the selection sits in the Vix-initiated group (the rows below the live
-// sessions).
+// when that row is a persisted, not-attached record.
 func (m *Model) vixSelectedSummary() (protocol.SessionSummary, bool) {
-	off := m.sessionsSelected - m.sessionsVisibleCount()
-	if off < 0 || off >= len(m.vixSessions) {
+	rows := m.sessionRowTargets()
+	if m.sessionsSelected < 0 || m.sessionsSelected >= len(rows) {
 		return protocol.SessionSummary{}, false
 	}
-	return m.vixSessions[off], true
+	if r := rows[m.sessionsSelected]; r.sum != nil {
+		return *r.sum, true
+	}
+	return protocol.SessionSummary{}, false
 }
 
 // hasAlertSessions reports whether any session is waiting for user input.
