@@ -622,6 +622,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.selectedSession = newIdx
 			m.activeTab = TabKindChat
 			cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, newSess.daemonSessionID))
+			cmds = append(cmds, armCursorBlink(newSess))
 			return m, tea.Batch(cmds...)
 
 		}
@@ -658,6 +659,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 						cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, selSess.daemonSessionID))
 					}
 					cmds = append(cmds, selSess.thinkingAnim.Resume())
+					cmds = append(cmds, armCursorBlink(selSess))
 					if !m.hasAlertSessions() {
 						m.stopTabAlertBlink()
 					}
@@ -673,6 +675,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selectedSession = newIdx
 				m.activeTab = TabKindChat
 				cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, newSess.daemonSessionID))
+				cmds = append(cmds, armCursorBlink(newSess))
 				return m, tea.Batch(cmds...)
 			case "d":
 				// Duplicate the selected session into a new one.
@@ -1295,15 +1298,17 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// A record the user explicitly opened from the Sessions tab gets
 		// focused immediately (launch restores stay in the background).
+		var focusCmd tea.Cmd
 		if m.focusRestoredID != "" && m.focusRestoredID == msg.summary.ID {
 			m.focusRestoredID = ""
 			m.selectedSession = idx
 			m.activeTab = TabKindChat
 			restored.input.SetWidth(m.width - 4)
 			m.markSessionRead(restored)
+			focusCmd = armCursorBlink(restored)
 		}
 		m.syncSessionsSelected()
-		return m, tea.Batch(startSessionEventLoop(msg.client), restored.thinkingAnim.Start())
+		return m, tea.Batch(startSessionEventLoop(msg.client), restored.thinkingAnim.Start(), focusCmd)
 
 	case sessionRestoreFailedMsg:
 		// Best-effort: a persisted session could not be reopened. Leave it on
@@ -3538,11 +3543,11 @@ func (m *Model) doFork(sep TurnSepInfo) (Model, tea.Cmd) {
 	m.sessions = append(m.sessions, newSess)
 	m.selectedSession = newIdx
 
-	return *m, connectFork(
+	return *m, tea.Batch(connectFork(
 		m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken,
 		m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess,
 		forkSessionID, sep.TurnIdx, newSess.daemonSessionID,
-	)
+	), armCursorBlink(newSess))
 }
 
 // doDuplicate creates a new session that is a full copy of srcSess, seeded with
@@ -3566,11 +3571,11 @@ func (m *Model) doDuplicate(srcSess *SessionState, sep TurnSepInfo) (Model, tea.
 	m.selectedSession = newIdx
 	m.syncSessionsSelected()
 
-	return *m, connectFork(
+	return *m, tea.Batch(connectFork(
 		m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken,
 		m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess,
 		forkSessionID, sep.TurnIdx, newSess.daemonSessionID,
-	)
+	), armCursorBlink(newSess))
 }
 
 // doTrim trims the current session's history to sep and tells the daemon to match.
@@ -3780,6 +3785,20 @@ func (m *Model) visibleSessionIndices() []int {
 	return out
 }
 
+// armCursorBlink re-focuses a session's input and returns the command that
+// restarts its cursor blink loop. The blink is a self-rescheduling BlinkMsg
+// chain keyed to one cursor's id; switching the active workspace session
+// orphans the previous session's chain (its BlinkMsgs are routed to the new
+// input and dropped on id mismatch) without starting one for the new cursor.
+// Every switch must re-arm the loop or the cursor freezes — sometimes in its
+// hidden phase, so it looks like it disappeared — until the user types.
+func armCursorBlink(sess *SessionState) tea.Cmd {
+	if sess == nil {
+		return nil
+	}
+	return sess.input.Focus()
+}
+
 // stepWorkspaceSession moves the workspace to the next (dir > 0) or previous
 // (dir < 0) session in Sessions-tab display order (user-initiated first, then
 // vix-initiated) — which can differ from m.sessions slice order, since
@@ -3821,6 +3840,7 @@ func (m *Model) stepWorkspaceSession(dir int) ([]tea.Cmd, bool) {
 		cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, selSess.daemonSessionID))
 	}
 	cmds = append(cmds, selSess.thinkingAnim.Resume())
+	cmds = append(cmds, armCursorBlink(selSess))
 	if !m.hasAlertSessions() {
 		m.stopTabAlertBlink()
 	}
