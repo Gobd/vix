@@ -91,6 +91,52 @@ func NewScheduler(store *Store, runner Runner, notify func(string, any), maxConc
 	}
 }
 
+// JobSnapshot is a read-only view of a job for external consumers (the web UI
+// jobs tab). It carries the spec fields the UI renders, with permissions
+// resolved to their effective booleans and the timeout defaulted.
+type JobSnapshot struct {
+	ID        string  `json:"id"`
+	Name      string  `json:"name"`
+	Enabled   bool    `json:"enabled"`
+	Trigger   Trigger `json:"trigger"`
+	Workflow  string  `json:"workflow"`
+	Prompt    string  `json:"prompt"`
+	CWD       string  `json:"cwd"`
+	AutoWrite bool    `json:"auto_write"`
+	AutoDirs  bool    `json:"auto_dirs"`
+	Timeout   string  `json:"timeout"`
+	CreatedBy string  `json:"created_by"`
+}
+
+// Snapshot returns the current set of job specs as read-only views, sorted by
+// id for stable rendering. Safe to call concurrently with the timer loop.
+func (s *Scheduler) Snapshot() []JobSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]JobSnapshot, 0, len(s.specs))
+	for id, spec := range s.specs {
+		timeout := spec.Timeout
+		if timeout == "" {
+			timeout = "10m" // documented default (DefaultTimeout)
+		}
+		out = append(out, JobSnapshot{
+			ID:        id,
+			Name:      spec.Name,
+			Enabled:   spec.Enabled,
+			Trigger:   spec.Trigger,
+			Workflow:  spec.Workflow,
+			Prompt:    spec.Prompt,
+			CWD:       spec.CWD,
+			AutoWrite: spec.AutoWrite(),
+			AutoDirs:  spec.AutoDirs(),
+			Timeout:   timeout,
+			CreatedBy: spec.CreatedBy,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
 // Reload asks the loop to re-read the spec directory (config watcher hook).
 // Non-blocking; coalesces bursts.
 func (s *Scheduler) Reload() {

@@ -898,6 +898,15 @@ func (s *Server) Sessions() []SessionInfo {
 	return infos
 }
 
+// Jobs returns a snapshot of the scheduled jobs for external consumers (the web
+// UI). Empty when the scheduler is disabled (no home directory / feature off).
+func (s *Server) Jobs() []jobs.JobSnapshot {
+	if s.jobScheduler == nil {
+		return []jobs.JobSnapshot{}
+	}
+	return s.jobScheduler.Snapshot()
+}
+
 // getSession returns the live session with the given ID, or nil if not found.
 func (s *Server) getSession(id string) *Session {
 	s.sessionMu.Lock()
