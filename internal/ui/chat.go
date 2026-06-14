@@ -72,7 +72,7 @@ type ChatMessage struct {
 // renderUserMessage creates a rendered user message.
 // width is the total terminal width used for wrapping long lines.
 func renderUserMessage(text string, width int) ChatMessage {
-	now := time.Now()
+	now := renderNow()
 	bar := userPromptIcon.Render("▎")
 	ts := userTimestampStyle.Render("Sent at " + now.Format("3:04 PM"))
 
@@ -1620,6 +1620,9 @@ func renderTurnInfo(model string, elapsed time.Duration, cost float64, turnNum i
 	dimStyle := lipgloss.NewStyle().Foreground(s.ColorDimGray)
 
 	secs := int(elapsed.Seconds())
+	if testRenderMode {
+		secs = 0
+	}
 	info := fmt.Sprintf("◇ %s · %ds · $%.2f ", formatModelName(model), secs, cost)
 	infoRendered := dimStyle.Render(info)
 
