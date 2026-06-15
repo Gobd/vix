@@ -153,10 +153,13 @@ test-e2e:
 	./e2e/build-e2e.sh $(E2E_ARCH)
 	docker build -t vix-e2e -f e2e/Dockerfile --build-arg TARGETARCH=$(E2E_ARCH) .
 	mkdir -p e2e/out
-	docker run --rm --network none \
+	@docker run --rm --network none \
 	  --security-opt seccomp=e2e/seccomp-landlock.json \
-	  -v "$(CURDIR)/e2e/out:/out" vix-e2e
-	@echo "==> Report: e2e/out/report/index.html  (zip: e2e/out/e2e-report.zip)"
+	  -v "$(CURDIR)/e2e/out:/out" vix-e2e; \
+	rc=$$?; \
+	echo "==> Report: e2e/out/report/index.html  (zip: e2e/out/e2e-report.zip)"; \
+	(open e2e/out/report/index.html || xdg-open e2e/out/report/index.html) >/dev/null 2>&1 || true; \
+	exit $$rc
 
 # Sharded e2e run: fan the suite across SHARDS isolated containers in parallel,
 # each writing to e2e/out/shard-<k>/report, then merge + render + zip once on the
