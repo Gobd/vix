@@ -308,9 +308,20 @@ func (s *Server) EnableHooks() {
 	if dir == "" {
 		return
 	}
+	// Seed the shipped default hooks the first time the directory is created
+	// (mirrors the heartbeat job: users may then edit/disable/delete freely and
+	// it never comes back). Skipped on an auth-enabled daemon, where the
+	// feedback hook's `vix session create` callback can't present the secret.
+	firstCreate := false
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		firstCreate = true
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		LogError("hooks: cannot create %s: %v", dir, err)
 		return
+	}
+	if firstCreate && s.authToken == "" {
+		seedDefaultFeedbackHook(dir)
 	}
 	s.hookRegistry = hooks.NewRegistry(hooks.NewStore(dir))
 }
