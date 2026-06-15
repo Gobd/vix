@@ -145,8 +145,11 @@ E2E_ARCH := $(shell uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 # vix TUI + vixd against a mock LLM inside Docker, exercises the Landlock
 # sandbox, and writes an HTML report (e2e/out/report/index.html) + zip.
 # Requires Docker. See e2e/README.md.
+# build.sh runs with --force: its default staleness check keys only on the git
+# commit, so uncommitted changes (the normal dev loop) would otherwise ship a
+# stale daemon into the image. The e2e gate must always test the current source.
 test-e2e:
-	./script/build.sh
+	./script/build.sh --force
 	./e2e/build-e2e.sh $(E2E_ARCH)
 	docker build -t vix-e2e -f e2e/Dockerfile --build-arg TARGETARCH=$(E2E_ARCH) .
 	mkdir -p e2e/out
@@ -160,7 +163,7 @@ test-e2e:
 # host. Usage: make test-e2e-sharded SHARDS=4
 SHARDS ?= 2
 test-e2e-sharded:
-	./script/build.sh
+	./script/build.sh --force
 	./e2e/build-e2e.sh $(E2E_ARCH)
 	docker build -t vix-e2e -f e2e/Dockerfile --build-arg TARGETARCH=$(E2E_ARCH) .
 	@rm -rf e2e/out/shard-* e2e/out/report e2e/out/e2e-report.zip
