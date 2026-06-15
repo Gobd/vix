@@ -1,6 +1,9 @@
 package daemon
 
-import "github.com/get-vix/vix/internal/daemon/jobs"
+import (
+	"github.com/get-vix/vix/internal/daemon/hooks"
+	"github.com/get-vix/vix/internal/daemon/jobs"
+)
 
 // ServerVitals holds a snapshot of host and daemon resource usage.
 type ServerVitals struct {
@@ -14,8 +17,9 @@ type ServerVitals struct {
 
 // wsMessage is the envelope sent over the WebSocket connection.
 type wsMessage struct {
-	Sessions []SessionInfo      `json:"sessions"`
-	Vitals   ServerVitals       `json:"vitals"`
-	Jobs     []jobs.JobSnapshot `json:"jobs"`
-	Version  string             `json:"version"`
+	Sessions []SessionInfo        `json:"sessions"`
+	Vitals   ServerVitals         `json:"vitals"`
+	Jobs     []jobs.JobSnapshot   `json:"jobs"`
+	Hooks    []hooks.HookSnapshot `json:"hooks"`
+	Version  string               `json:"version"`
 }
