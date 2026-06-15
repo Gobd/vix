@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +17,8 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"github.com/mattn/go-isatty"
 
 	"github.com/get-vix/vix/internal/config"
 	"github.com/get-vix/vix/internal/daemon"
@@ -36,6 +39,13 @@ func main() {
 	// manages the long-lived vixd process explicitly (vix never auto-spawns it).
 	if len(os.Args) >= 2 && os.Args[1] == "daemon" {
 		os.Exit(runDaemonCommand(os.Args[2:]))
+	}
+
+	// `vix session create` — create a Vix-initiated message session in the
+	// running daemon. A sibling verb group to `vix daemon`, dispatched before
+	// flag parsing.
+	if len(os.Args) >= 2 && os.Args[1] == "session" {
+		os.Exit(runSessionCommand(os.Args[2:]))
 	}
 
 	versionFlag := flag.Bool("version", false, "Print version and exit")
@@ -259,11 +269,8 @@ func main() {
 		client.SetAuthToken(authToken)
 		if !client.Ping() {
 			// vix never spawns the daemon: surface an actionable error instead.
-			if _, statErr := os.Stat(cfg.SocketPath); statErr == nil {
-				fmt.Fprintf(os.Stderr, "Error: vixd is not responding (stale socket at %s — a previous daemon may have exited uncleanly).\nStart it with: vix daemon start\n", cfg.SocketPath)
-			} else {
-				fmt.Fprintf(os.Stderr, "Error: vixd is not running.\nStart it with: vix daemon start\n")
-			}
+			_, statErr := os.Stat(cfg.SocketPath)
+			printDaemonError(statErr == nil, cfg.SocketPath)
 			os.Exit(1)
 		}
 
@@ -365,6 +372,73 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// printDaemonError writes a styled, informational message to stderr when vix
+// can't reach vixd. stale=true means a socket file exists but nothing answers
+// (a daemon that exited uncleanly); stale=false means no daemon at all. Colors
+// come from the TUI brand palette (internal/ui/styles.go) and degrade to plain
+// text when stderr isn't a terminal or NO_COLOR is set.
+func printDaemonError(stale bool, socketPath string) {
+	color := os.Getenv("NO_COLOR") == "" && isatty.IsTerminal(os.Stderr.Fd())
+
+	coral := lipgloss.NewStyle().Foreground(lipgloss.Color("#FC6F63")).Bold(true)
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	cmd := lipgloss.NewStyle().Foreground(lipgloss.Color("#63F0FC")).Bold(true)
+
+	paint := func(st lipgloss.Style, s string) string {
+		if !color {
+			return s
+		}
+		return st.Render(s)
+	}
+
+	var headline string
+	var body []string
+	var actions [][2]string // label, command
+
+	if stale {
+		headline = "⬣ vixd isn't responding"
+		body = []string{
+			fmt.Sprintf("Found a socket at %s, but nothing is listening — a", socketPath),
+			"previous daemon probably exited uncleanly.",
+		}
+		actions = [][2]string{
+			{"Restart it", "vix daemon stop && vix daemon start"},
+			{"Check it", "vix daemon status"},
+		}
+	} else {
+		headline = "⬣ vixd isn't running"
+		body = []string{
+			"vix is just the client — it talks to vixd, the background",
+			"daemon that runs your sessions, tools, and code analysis.",
+		}
+		actions = [][2]string{
+			{"Start it", "vix daemon start"},
+			{"Check it", "vix daemon status"},
+		}
+	}
+
+	labelWidth := 0
+	for _, a := range actions {
+		if len(a[0]) > labelWidth {
+			labelWidth = len(a[0])
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("\n  " + paint(coral, headline) + "\n\n")
+	for _, line := range body {
+		b.WriteString("  " + paint(dim, line) + "\n")
+	}
+	b.WriteString("\n")
+	for _, a := range actions {
+		label := fmt.Sprintf("%-*s", labelWidth, a[0])
+		b.WriteString("  " + paint(dim, "→  "+label+"  ") + paint(cmd, a[1]) + "\n")
+	}
+	b.WriteString("\n")
+
+	fmt.Fprint(os.Stderr, b.String())
 }
 
 // runDaemonCommand implements the `vix daemon start|stop|status` subcommand
@@ -513,6 +587,106 @@ func orUnknown(v string) string {
 		return "unknown"
 	}
 	return v
+}
+
+// runSessionCommand implements the `vix session create` subcommand: create a
+// Vix-initiated message session in the running daemon from a whole-JSON spec
+// (MessageSessionSpec) read from --json, --file, or stdin. Returns the exit
+// code. The created session lands in the Sessions tab under "Vix-initiated".
+func runSessionCommand(args []string) int {
+	usage := func() {
+		fmt.Fprintf(os.Stderr, `Usage: vix session create [flags]
+
+  create   Create a Vix-initiated message session in the running daemon.
+           The spec is a JSON object read from --json, --file, or stdin:
+             { "message": "…", "cwd": "/abs/project", "title": "…" }
+           message and cwd are required. Prints the new session id.
+
+Flags:
+  -json string             Inline JSON spec
+  -file string             Read the JSON spec from this file ("-" = stdin)
+  -socket-path string      Unix socket path (env VIX_SOCKET_PATH, default /tmp/vixd.sock)
+  -auth-token-path string  Shared-secret token file, must match the daemon's
+`)
+	}
+	if len(args) == 0 || args[0] != "create" {
+		usage()
+		return 1
+	}
+
+	fs := flag.NewFlagSet("vix session create", flag.ExitOnError)
+	jsonFlag := fs.String("json", "", "Inline JSON session spec.")
+	fileFlag := fs.String("file", "", `Read the JSON session spec from this file ("-" for stdin).`)
+	socketPath := fs.String("socket-path", "", "Unix socket path for the vix↔vixd connection. Env: VIX_SOCKET_PATH. Default: /tmp/vixd.sock.")
+	authTokenPath := fs.String("auth-token-path", "", "Path to a file holding the shared-secret token. Must match the daemon's -auth-token-path.")
+	fs.Parse(args[1:])
+
+	// Resolve the spec from exactly one source: --json, --file, else stdin.
+	var rawSpec []byte
+	switch {
+	case *jsonFlag != "":
+		rawSpec = []byte(*jsonFlag)
+	case *fileFlag != "" && *fileFlag != "-":
+		b, err := os.ReadFile(*fileFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: cannot read --file %q: %v\n", *fileFlag, err)
+			return 1
+		}
+		rawSpec = b
+	default:
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: cannot read spec from stdin: %v\n", err)
+			return 1
+		}
+		rawSpec = b
+	}
+
+	// Validate it's a JSON object locally so the user gets a clear error before
+	// a round-trip to the daemon.
+	var probe map[string]any
+	if err := json.Unmarshal(rawSpec, &probe); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: spec is not a valid JSON object: %v\n", err)
+		return 1
+	}
+
+	sock := *socketPath
+	if sock == "" {
+		if v := os.Getenv("VIX_SOCKET_PATH"); v != "" {
+			sock = v
+		} else {
+			sock = "/tmp/vixd.sock"
+		}
+	}
+
+	authToken := ""
+	if *authTokenPath != "" {
+		raw, err := os.ReadFile(*authTokenPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: cannot read --auth-token-path %q: %v\n", *authTokenPath, err)
+			return 1
+		}
+		authToken = strings.TrimSpace(string(raw))
+		if authToken == "" {
+			fmt.Fprintf(os.Stderr, "Error: --auth-token-path %q is empty after trimming whitespace\n", *authTokenPath)
+			return 1
+		}
+	}
+
+	client := daemon.NewClient(sock)
+	client.SetAuthToken(authToken)
+	if !client.Ping() {
+		fmt.Fprintf(os.Stderr, "Error: vixd is not running — start it with `vix daemon start`\n")
+		return 1
+	}
+
+	id, err := client.CreateMessageSession(json.RawMessage(rawSpec))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	fmt.Println(id)
+	return 0
 }
 
 // daemonServicePaths returns the login-service definition for this platform:

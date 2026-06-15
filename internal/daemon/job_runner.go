@@ -7,9 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/get-vix/vix/internal/config"
 	"github.com/get-vix/vix/internal/daemon/jobs"
-	"github.com/get-vix/vix/internal/daemon/llm"
 	"github.com/get-vix/vix/internal/protocol"
 )
 
@@ -215,22 +213,12 @@ func (s *Server) writeJobAlertSession(spec jobs.Spec, res jobs.RunResult) {
 	if res.SessionID != "" {
 		text += fmt.Sprintf("\n\nThe full run is in session %s.", res.SessionID)
 	}
-	rec := sessionRecord{
-		ID:      generateSessionID(),
+	if _, err := s.createMessageSession(MessageSessionSpec{
+		Message: text,
 		CWD:     spec.CWD,
 		Title:   jobRunTitle(spec, time.Now()),
-		Origin:  "vix",
 		Trigger: &protocol.TriggerInfo{Type: spec.Trigger.Type, Ref: spec.ID},
-		Unread:  true,
-		Messages: []llm.MessageParam{{
-			Role:    llm.RoleAssistant,
-			Content: []llm.ContentBlock{{Type: llm.BlockText, Text: text}},
-		}},
-		SessionMode: "chat",
-		StartedAt:   time.Now(),
-	}
-	paths := config.NewVixPaths("", s.homeVixDir, spec.CWD)
-	if err := saveSessionRecord(paths, rec); err != nil {
+	}); err != nil {
 		LogError("job alert session: %v", err)
 	}
 }

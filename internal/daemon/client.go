@@ -133,6 +133,25 @@ func (c *Client) StopDaemon() error {
 	return nil
 }
 
+// CreateMessageSession asks the daemon to create a Vix-initiated message
+// session from spec (a raw MessageSessionSpec JSON object). Returns the new
+// session id. Backs `vix session create`.
+func (c *Client) CreateMessageSession(spec json.RawMessage) (string, error) {
+	resp, err := c.sendRequest(map[string]any{
+		"action":  "message.create",
+		"session": spec,
+	})
+	if err != nil {
+		return "", err
+	}
+	if resp["status"] != "ok" {
+		msg, _ := resp["message"].(string)
+		return "", fmt.Errorf("message.create failed: %s", msg)
+	}
+	id, _ := resp["session_id"].(string)
+	return id, nil
+}
+
 // ListSessions returns the persisted open sessions for cwd, so the TUI can
 // reopen them on launch. Sessions are stored globally (~/.vix/sessions) and
 // filtered by cwd daemon-side.

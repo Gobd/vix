@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -105,5 +107,30 @@ func RegisterBuiltinHandlers(s *Server) {
 		}
 		s.broadcastSessionsChanged()
 		return map[string]any{"status": "ok"}, nil
+	})
+
+	// message.create materialises a Vix-initiated message session from a whole
+	// JSON spec (MessageSessionSpec) carried in the "session" field. It backs
+	// `vix session create`, letting external callers (notably command hooks)
+	// surface a one-message conversation under "Vix-initiated" without
+	// re-encoding the on-disk session record.
+	s.RegisterHandler("message.create", func(data map[string]any) (map[string]any, error) {
+		raw, ok := data["session"]
+		if !ok {
+			return map[string]any{"status": "error", "message": "missing 'session'"}, nil
+		}
+		b, err := json.Marshal(raw)
+		if err != nil {
+			return map[string]any{"status": "error", "message": "invalid session payload"}, nil
+		}
+		var spec MessageSessionSpec
+		if err := json.Unmarshal(b, &spec); err != nil {
+			return map[string]any{"status": "error", "message": fmt.Sprintf("invalid session payload: %v", err)}, nil
+		}
+		id, err := s.createMessageSession(spec)
+		if err != nil {
+			return map[string]any{"status": "error", "message": err.Error()}, nil
+		}
+		return map[string]any{"status": "ok", "session_id": id}, nil
 	})
 }
