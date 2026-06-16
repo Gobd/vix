@@ -123,7 +123,7 @@ func doBrainUpdateFiles(data map[string]any, cred config.Credential) (map[string
 		}
 
 		client, err := pool.GetClient(lang)
-		if err != nil {
+		if err != nil || client == nil {
 			updated++
 			continue
 		}

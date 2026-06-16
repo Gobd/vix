@@ -140,7 +140,7 @@ func startSessionEventLoop(client *daemon.SessionClient) tea.Cmd {
 // echoed back in the result message so the handler can match it to the right
 // session. Pass an empty string for a session that has never connected — the
 // handler will not retry on failure in that case.
-func attemptReconnect(socketPath, cwd, configDir, model, authToken string, forceInit, enableWrite, enableDir bool, targetDaemonSessionID string) tea.Cmd {
+func attemptReconnect(socketPath, cwd, configDir, model, authToken string, forceInit, enableWrite, enableDir, enableBash bool, targetDaemonSessionID string) tea.Cmd {
 	return func() tea.Msg {
 		client := daemon.NewClient(socketPath)
 		client.SetAuthToken(authToken)
@@ -155,9 +155,9 @@ func attemptReconnect(socketPath, cwd, configDir, model, authToken string, force
 		// brand-new session that has never connected — start it fresh.
 		var err error
 		if targetDaemonSessionID == "" {
-			err = session.Connect(cwd, configDir, model, forceInit, enableWrite, enableDir, false)
+			err = session.Connect(cwd, configDir, model, forceInit, enableWrite, enableDir, enableBash, false)
 		} else {
-			err = session.Attach(cwd, configDir, model, forceInit, enableWrite, enableDir, false, targetDaemonSessionID)
+			err = session.Attach(cwd, configDir, model, forceInit, enableWrite, enableDir, enableBash, false, targetDaemonSessionID)
 			if errors.Is(err, daemon.ErrSessionNotFound) {
 				// The daemon restarted and lost this session before it was
 				// flushed. It can't be continued; orphan it (offer /copy).
@@ -188,7 +188,7 @@ type sessionRestoreFailedMsg struct {
 // attachRestoreSession reopens a persisted session on launch by attaching to it
 // by ID. Used for the open sessions beyond the first (which main attaches as the
 // initial client).
-func attachRestoreSession(socketPath, cwd, configDir, model, authToken string, enableWrite, enableDir bool, summary protocol.SessionSummary) tea.Cmd {
+func attachRestoreSession(socketPath, cwd, configDir, model, authToken string, enableWrite, enableDir, enableBash bool, summary protocol.SessionSummary) tea.Cmd {
 	return func() tea.Msg {
 		client := daemon.NewClient(socketPath)
 		client.SetAuthToken(authToken)
@@ -197,7 +197,7 @@ func attachRestoreSession(socketPath, cwd, configDir, model, authToken string, e
 		}
 		sc := daemon.NewSessionClient(socketPath)
 		sc.SetAuthToken(authToken)
-		if err := sc.Attach(cwd, configDir, model, false, enableWrite, enableDir, false, summary.ID); err != nil {
+		if err := sc.Attach(cwd, configDir, model, false, enableWrite, enableDir, enableBash, false, summary.ID); err != nil {
 			return sessionRestoreFailedMsg{id: summary.ID}
 		}
 		return sessionRestoredMsg{summary: summary, client: sc}
@@ -205,7 +205,7 @@ func attachRestoreSession(socketPath, cwd, configDir, model, authToken string, e
 }
 
 // connectFork starts a new forked session seeded from forkSessionID at forkTurnIdx.
-func connectFork(socketPath, cwd, configDir, model, authToken string, enableWrite, enableDir bool, forkSessionID string, forkTurnIdx int, targetDaemonSessionID string) tea.Cmd {
+func connectFork(socketPath, cwd, configDir, model, authToken string, enableWrite, enableDir, enableBash bool, forkSessionID string, forkTurnIdx int, targetDaemonSessionID string) tea.Cmd {
 	return func() tea.Msg {
 		client := daemon.NewClient(socketPath)
 		client.SetAuthToken(authToken)
@@ -215,7 +215,7 @@ func connectFork(socketPath, cwd, configDir, model, authToken string, enableWrit
 		}
 		session := daemon.NewSessionClient(socketPath)
 		session.SetAuthToken(authToken)
-		if err := session.ConnectFork(cwd, configDir, model, false, enableWrite, enableDir, false, forkSessionID, forkTurnIdx); err != nil {
+		if err := session.ConnectFork(cwd, configDir, model, false, enableWrite, enableDir, enableBash, false, forkSessionID, forkTurnIdx); err != nil {
 			time.Sleep(2 * time.Second)
 			return reconnectFailedMsg{daemonSessionID: targetDaemonSessionID}
 		}
@@ -376,6 +376,7 @@ type Model struct {
 	forceInit                      bool
 	enableAutomaticWritePermission bool
 	enableAutomaticDirectoryAccess bool
+	enableAutomaticBashExecution   bool
 
 	// Global settings
 	hasDarkBG      bool
@@ -425,7 +426,7 @@ func (m *Model) currentSession() *SessionState {
 }
 
 // NewModel creates a new root Model.
-func NewModel(cfg *config.Config, client *daemon.SessionClient, testMode bool, authToken string, enableWrite, enableDir bool) Model {
+func NewModel(cfg *config.Config, client *daemon.SessionClient, testMode bool, authToken string, enableWrite, enableDir, enableBash bool) Model {
 	initialSession := newSessionState(cfg, client)
 
 	m := Model{
@@ -444,6 +445,7 @@ func NewModel(cfg *config.Config, client *daemon.SessionClient, testMode bool, a
 		authToken:                      authToken,
 		enableAutomaticWritePermission: enableWrite,
 		enableAutomaticDirectoryAccess: enableDir,
+		enableAutomaticBashExecution:   enableBash,
 		testMode:                       testMode,
 	}
 
@@ -471,7 +473,7 @@ func (m Model) Init() tea.Cmd {
 	}
 	// Reopen any persisted open sessions beyond the initial one.
 	for _, sum := range m.restoreSessions {
-		cmds = append(cmds, attachRestoreSession(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, sum))
+		cmds = append(cmds, attachRestoreSession(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, m.enableAutomaticBashExecution, sum))
 	}
 	// Populate the Vix-initiated group of the Sessions tab.
 	cmds = append(cmds, fetchVixSessions(m.socketPath, m.cwd, m.cfg.ConfigDir, m.authToken))
@@ -698,7 +700,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sessions = append(m.sessions, newSess)
 			m.selectedSession = newIdx
 			m.activeTab = TabKindChat
-			cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, newSess.daemonSessionID))
+			cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, m.enableAutomaticBashExecution, newSess.daemonSessionID))
 			cmds = append(cmds, armCursorBlink(newSess))
 			return m, tea.Batch(cmds...)
 
@@ -723,7 +725,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// session; the replay rebuilds the conversation and the
 					// matching sessionRestoredMsg focuses it.
 					m.focusRestoredID = sum.ID
-					return m, attachRestoreSession(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, sum)
+					return m, attachRestoreSession(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, m.enableAutomaticBashExecution, sum)
 				}
 				if idx, ok := m.sessionsSelectedIdx(); ok {
 					m.selectedSession = idx
@@ -733,7 +735,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 					selSess.input.SetWidth(m.width - 4)
 					if selSess.client == nil && !selSess.reconnecting {
 						selSess.reconnecting = true
-						cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, selSess.daemonSessionID))
+						cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, m.enableAutomaticBashExecution, selSess.daemonSessionID))
 					}
 					cmds = append(cmds, selSess.thinkingAnim.Resume())
 					cmds = append(cmds, armCursorBlink(selSess))
@@ -751,7 +753,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.sessions = append(m.sessions, newSess)
 				m.selectedSession = newIdx
 				m.activeTab = TabKindChat
-				cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, newSess.daemonSessionID))
+				cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, m.enableAutomaticBashExecution, newSess.daemonSessionID))
 				cmds = append(cmds, armCursorBlink(newSess))
 				return m, tea.Batch(cmds...)
 			case "d":
@@ -982,13 +984,41 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch result {
 			case QPSubmitted:
 				if sess.agentState == StateConfirmPending {
-					approved := answer == "Yes, allow" || answer == "Allow once" || answer == "Allow and remember"
+					if sess.autoApproveAll {
+						if sess.client != nil {
+							sess.client.SendConfirm(true, false, "", "", "")
+						}
+						sess.questionPanel.Close()
+						sess.agentState = StateToolExecuting
+						return m, sess.thinkingAnim.Start()
+					}
+					approved := answer == "Yes, allow" || answer == "Allow once" || strings.HasPrefix(answer, "Always allow")
 					persistDirs := answer == "Allow and remember"
+					persistWriteDir := ""
+					persistBashPattern := ""
+					persistURLPattern := ""
+					if strings.HasPrefix(answer, "Always allow:") {
+						pattern := strings.TrimPrefix(answer, "Always allow:")
+						pattern = strings.TrimSpace(pattern)
+						toolName := sess.questionPanel.CurrentConfirmToolName()
+						switch toolName {
+						case "web_fetch":
+							persistURLPattern = pattern
+						case "write_file", "write_minified_file", "edit_file", "edit_minified_file", "delete_file":
+							persistWriteDir = pattern
+						default:
+							persistBashPattern = pattern
+						}
+					}
 					question := sess.questionPanel.CurrentTab().Question
-					pairs := []QAPair{{Category: "Permission", Question: question, Answer: answer}}
+					displayAnswer := answer
+					if strings.HasPrefix(answer, "Always allow:") {
+						displayAnswer = "Always allow"
+					}
+					pairs := []QAPair{{Category: "Permission", Question: question, Answer: displayAnswer}}
 					sess.chatMessages = append(sess.chatMessages, renderQuestionAnswer(pairs, m.styles))
 					if sess.client != nil {
-						sess.client.SendConfirm(approved, persistDirs)
+						sess.client.SendConfirm(approved, persistDirs, persistWriteDir, persistBashPattern, persistURLPattern)
 					}
 					sess.questionPanel.Close()
 					sess.agentState = StateToolExecuting
@@ -1021,7 +1051,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 					pairs := []QAPair{{Category: "Permission", Question: sess.questionPanel.CurrentTab().Question, Answer: "Deny"}}
 					sess.chatMessages = append(sess.chatMessages, renderQuestionAnswer(pairs, m.styles))
 					if sess.client != nil {
-						sess.client.SendConfirm(false, false)
+						sess.client.SendConfirm(false, false, "", "", "")
 					}
 					sess.questionPanel.Close()
 					sess.agentState = StateToolExecuting
@@ -1065,6 +1095,16 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
+		case "ctrl+a":
+			if sess != nil {
+				sess.autoApproveAll = !sess.autoApproveAll
+				if sess.autoApproveAll {
+					return m, m.emitStatusMsg("Auto-approve ON — all tools will run without confirmation", StatusMsgInfo)
+				}
+				return m, m.emitStatusMsg("Auto-approve OFF", StatusMsgInfo)
+			}
+			return m, nil
+
 		case "shift+tab":
 			if sess.agentState == StateWaitingForInput && len(sess.workflows) > 0 {
 				sess.activeWorkflow = m.nextWorkflow(sess)
@@ -1075,7 +1115,15 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "enter":
-			return m.handleEnter(sess)
+			result, cmd := m.handleEnter(sess)
+			// Flush any deferred confirm now that input has been sent/cleared.
+			if sess != nil && sess.pendingConfirmEvent != nil && sess.input.Value() == "" {
+				cr := sess.pendingConfirmEvent
+				sess.pendingConfirmEvent = nil
+				sess.questionPanel.OpenConfirmWithPattern(cr.ToolName, cr.Params, cr.RequestedDirs, cr.SuggestedPattern, m.width, m.mdRenderer)
+				sess.focus = FocusEditor
+			}
+			return result, cmd
 
 		case "y", "Y":
 			if sess.agentState == StatePlanReview && sess.input.Value() == "" {
@@ -1253,7 +1301,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if sess.agentState != StatePlanReview {
 				sess.agentState = StateWaitingForInput
 			}
-			cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, m.forceInit, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, msg.daemonSessionID))
+			cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, m.forceInit, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, m.enableAutomaticBashExecution, msg.daemonSessionID))
 		}
 		return m, tea.Batch(cmds...)
 
@@ -1294,7 +1342,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		_, sess := m.findSessionByDaemonID(msg.daemonSessionID)
 		if sess != nil && sess.reconnecting {
-			return m, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, m.forceInit, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, msg.daemonSessionID)
+			return m, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, m.forceInit, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, m.enableAutomaticBashExecution, msg.daemonSessionID)
 		}
 		return m, nil
 
@@ -2236,9 +2284,17 @@ func (m Model) handleTrimKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 // handleEnter handles the Enter key in the Chat tab.
 func (m Model) handleEnter(sess *SessionState) (tea.Model, tea.Cmd) {
+	// A deferred confirm (panel suppressed while the user had queued input)
+	// must not auto-approve here. Clear the queued input and return so the
+	// caller flushes the confirm panel into view.
 	if sess.agentState == StateConfirmPending {
+		if sess.pendingConfirmEvent != nil {
+			sess.input.SetValue("")
+			sess.input.SetHeight(1)
+			return m, nil
+		}
 		if sess.client != nil {
-			sess.client.SendConfirm(true, false)
+			sess.client.SendConfirm(true, false, "", "", "")
 		}
 		sess.agentState = StateToolExecuting
 		return m, sess.thinkingAnim.Start()
@@ -2582,8 +2638,15 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 		}
 		sess.chatMessages = append(sess.chatMessages,
 			renderQuestionMessage("Permission", question, m.mdRenderer.width+4, m.mdRenderer))
-		sess.questionPanel.OpenConfirm(cr.ToolName, cr.Params, cr.RequestedDirs, m.width, m.mdRenderer)
-		sess.focus = FocusEditor
+		if sess.input.Value() != "" {
+			// Defer the panel until the input is cleared so an in-progress edit
+			// isn't clobbered by the confirm overlay.
+			sess.pendingConfirmEvent = &cr
+		} else {
+			sess.pendingConfirmEvent = nil
+			sess.questionPanel.OpenConfirmWithPattern(cr.ToolName, cr.Params, cr.RequestedDirs, cr.SuggestedPattern, m.width, m.mdRenderer)
+			sess.focus = FocusEditor
+		}
 
 	case "event.user_question":
 		data := marshalData(event.Data)
@@ -3032,7 +3095,11 @@ func (m Model) View() tea.View {
 			}
 			inputSection = renderInputBox(modeName, sess != nil && sess.activeWorkflow != "", "", m.width, false, m.styles.ColorBlurBorder)
 		} else if sess != nil {
-			inputSection = renderInputBox(m.currentModeName(sess), sess.activeWorkflow != "", sess.input.View(), m.width, sess.focus == FocusEditor, m.styles.ColorBlurBorder)
+			modeName := m.currentModeName(sess)
+			if sess.pendingConfirmEvent != nil {
+				modeName = "[approval pending] " + modeName
+			}
+			inputSection = renderInputBox(modeName, sess.activeWorkflow != "", sess.input.View(), m.width, sess.focus == FocusEditor, m.styles.ColorBlurBorder)
 		} else {
 			inputSection = renderInputBox("Chat", false, "", m.width, false, m.styles.ColorBlurBorder)
 		}
@@ -3089,12 +3156,14 @@ func (m Model) View() tea.View {
 	}
 	statusFocus := FocusEditor
 	var statusInputTokens, statusContextWindow int64
+	var statusAutoApprove bool
 	if sess != nil {
 		statusFocus = sess.focus
 		statusInputTokens = sess.lastInputTokens
 		statusContextWindow = sess.contextWindow
+		statusAutoApprove = sess.autoApproveAll
 	}
-	statusBar := renderStatusBar(m.width, connected, reconnecting, m.statusMsg, m.styles, m.activeTab, statusFocus, statusInputTokens, statusContextWindow)
+	statusBar := renderStatusBar(m.width, connected, reconnecting, m.statusMsg, m.styles, m.activeTab, statusFocus, statusInputTokens, statusContextWindow, statusAutoApprove)
 	uv.NewStyledString(statusBar).Draw(canvas, image.Rect(0, y, m.width, m.height))
 
 	// Command palette overlay
@@ -3664,7 +3733,7 @@ func (m *Model) doFork(sep TurnSepInfo) (Model, tea.Cmd) {
 
 	return *m, tea.Batch(connectFork(
 		m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken,
-		m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess,
+		m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, m.enableAutomaticBashExecution,
 		forkSessionID, sep.TurnIdx, newSess.daemonSessionID,
 	), armCursorBlink(newSess))
 }
@@ -3692,7 +3761,7 @@ func (m *Model) doDuplicate(srcSess *SessionState, sep TurnSepInfo) (Model, tea.
 
 	return *m, tea.Batch(connectFork(
 		m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken,
-		m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess,
+		m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, m.enableAutomaticBashExecution,
 		forkSessionID, sep.TurnIdx, newSess.daemonSessionID,
 	), armCursorBlink(newSess))
 }
@@ -3773,7 +3842,7 @@ func (m *Model) doCloseSession(sessionIdx int) (Model, tea.Cmd) {
 		newSess.reconnecting = true
 		m.sessions = append(m.sessions, newSess)
 		m.selectedSession = 0
-		reconnectCmd = attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, newSess.daemonSessionID)
+		reconnectCmd = attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, m.enableAutomaticBashExecution, newSess.daemonSessionID)
 	}
 
 	// Keep the Sessions-tab cursor on the same row index: the closed row was the
@@ -3944,7 +4013,7 @@ func (m *Model) stepWorkspaceSession(dir int) ([]tea.Cmd, bool) {
 		if len(m.vixSessions) > 0 {
 			sum := m.vixSessions[0]
 			m.focusRestoredID = sum.ID
-			return []tea.Cmd{attachRestoreSession(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, sum)}, true
+			return []tea.Cmd{attachRestoreSession(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, m.enableAutomaticBashExecution, sum)}, true
 		}
 		return nil, false
 	}
@@ -3956,7 +4025,7 @@ func (m *Model) stepWorkspaceSession(dir int) ([]tea.Cmd, bool) {
 	selSess.input.SetWidth(m.width - 4)
 	if selSess.client == nil && !selSess.reconnecting {
 		selSess.reconnecting = true
-		cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, selSess.daemonSessionID))
+		cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, m.enableAutomaticBashExecution, selSess.daemonSessionID))
 	}
 	cmds = append(cmds, selSess.thinkingAnim.Resume())
 	cmds = append(cmds, armCursorBlink(selSess))

@@ -215,7 +215,7 @@ func (s *Server) runHookSession(ctx context.Context, spec hooks.Spec, text, cwd 
 		runID = generateSessionID()
 	}
 	session := NewSession(runID, s, nil, s.model, cwd, "", false,
-		spec.AutoWrite(), spec.AutoDirs(), true /*headless*/, ctx)
+		spec.AutoWrite(), spec.AutoDirs(), true /*enableAutomaticBashExecution*/, true /*headless*/, ctx)
 	session.origin = "vix"
 	session.trigger = &protocol.TriggerInfo{Type: "hook", Ref: spec.ID}
 	session.title = "Hook: " + hookName(spec)

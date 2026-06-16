@@ -141,7 +141,7 @@ func Run(session *daemon.SessionClient, prompt string, format OutputFormat, work
 
 		case "event.confirm_request":
 			// Auto-approve in headless mode (never persist dirs)
-			session.SendConfirm(true, false)
+			session.SendConfirm(true, false, "", "", "")
 
 		case "event.user_question":
 			// Auto-select first option in headless mode

@@ -40,6 +40,9 @@ type Session struct {
 	forceInit                      bool
 	enableAutomaticWritePermission bool
 	enableAutomaticDirectoryAccess bool
+	enableAutomaticBashExecution   bool
+	approvedBashPrefixes           []string
+	approvedURLPrefixes            []string
 	headless                       bool
 	eventChan                      chan protocol.SessionEvent
 	commandChan                    chan protocol.SessionCommand
@@ -197,7 +200,7 @@ type Session struct {
 }
 
 // NewSession creates a new agent session.
-func NewSession(id string, server *Server, llmClient LLM, model, cwd, configDir string, forceInit bool, enableAutomaticWritePermission bool, enableAutomaticDirectoryAccess bool, headless bool, parentCtx context.Context) *Session {
+func NewSession(id string, server *Server, llmClient LLM, model, cwd, configDir string, forceInit bool, enableAutomaticWritePermission bool, enableAutomaticDirectoryAccess bool, enableAutomaticBashExecution bool, headless bool, parentCtx context.Context) *Session {
 	ctx, cancel := context.WithCancel(parentCtx)
 	return &Session{
 		id:                             id,
@@ -209,6 +212,7 @@ func NewSession(id string, server *Server, llmClient LLM, model, cwd, configDir 
 		forceInit:                      forceInit,
 		enableAutomaticWritePermission: enableAutomaticWritePermission,
 		enableAutomaticDirectoryAccess: enableAutomaticDirectoryAccess,
+		enableAutomaticBashExecution:   enableAutomaticBashExecution,
 		headless:                       headless,
 		eventChan:                      make(chan protocol.SessionEvent, 256),
 		commandChan:                    make(chan protocol.SessionCommand, 16),
@@ -324,6 +328,91 @@ func (s *Session) isWriteApproved(absPath string) bool {
 	s.approvedWriteFilesMu.RLock()
 	defer s.approvedWriteFilesMu.RUnlock()
 	return s.approvedWriteFiles[absPath]
+}
+
+func (s *Session) isCommandApproved(cmd string) bool {
+	for _, prefix := range s.approvedBashPrefixes {
+		if strings.HasPrefix(cmd, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Session) isURLApproved(url string) bool {
+	for _, prefix := range s.approvedURLPrefixes {
+		if strings.HasPrefix(url, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func suggestBashPattern(cmd string) string {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return ""
+	}
+	parts := strings.Fields(cmd)
+	if len(parts) == 0 {
+		return ""
+	}
+	binary := parts[0]
+	switch binary {
+	case "curl", "wget":
+		for _, p := range parts[1:] {
+			if !strings.HasPrefix(p, "-") {
+				if idx := strings.Index(p, "?"); idx >= 0 {
+					p = p[:idx]
+				}
+				return binary + " " + p
+			}
+		}
+		return binary
+	case "git":
+		if len(parts) >= 2 {
+			return "git " + parts[1]
+		}
+		return "git"
+	case "go":
+		if len(parts) >= 2 {
+			return "go " + parts[1]
+		}
+		return "go"
+	case "make":
+		if len(parts) >= 2 {
+			return "make " + parts[1]
+		}
+		return "make"
+	default:
+		return binary
+	}
+}
+
+func suggestURLPattern(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	if idx := strings.Index(rawURL, "?"); idx >= 0 {
+		rawURL = rawURL[:idx]
+	}
+	schemeEnd := strings.Index(rawURL, "://")
+	if schemeEnd < 0 {
+		return rawURL
+	}
+	rest := rawURL[schemeEnd+3:]
+	slashIdx := strings.Index(rest, "/")
+	if slashIdx < 0 {
+		return rawURL + "/"
+	}
+	hostAndPath := rest[slashIdx:]
+	segments := strings.SplitN(strings.TrimPrefix(hostAndPath, "/"), "/", 3)
+	scheme := rawURL[:schemeEnd+3]
+	host := rest[:slashIdx]
+	if len(segments) <= 1 {
+		return scheme + host + "/"
+	}
+	return scheme + host + "/" + segments[0] + "/"
 }
 
 // persistAllowedDirs saves directories to the project settings.json.
@@ -772,6 +861,9 @@ func (s *Session) initBrain() {
 		s.denyURLs = append([]string(nil), projectConfig.DenyURLs...)
 		s.denyListMu.Unlock()
 	}
+
+	s.approvedBashPrefixes = append([]string(nil), projectConfig.ApprovedBashPrefixes...)
+	s.approvedURLPrefixes = append([]string(nil), projectConfig.ApprovedURLPrefixes...)
 
 	// Apply tool filtering AND model selection. Resolution order for the
 	// session's model: the chat agent's frontmatter `model:` (explicit pin,
@@ -1319,15 +1411,65 @@ func (s *Session) executeToolDirect(ctx context.Context, name string, params map
 	if !s.enableAutomaticWritePermission && writeClassTools[name] {
 		confirmed, _ := params["confirmed"].(bool)
 		autoApproved := false
+		var resolvedPath string
 		if !confirmed {
 			if pathStr, ok := params["path"].(string); ok {
 				if resolved, err := resolvePathInAllowed(s.cwd, s.toolAllowedDirs(), pathStr); err == nil {
+					resolvedPath = resolved
 					autoApproved = s.isWriteApproved(resolved)
 				}
 			}
 		}
 		if !confirmed && !autoApproved {
-			return &ToolResult{NeedsConfirmation: true, ToolName: name, Params: params}
+			suggestedDir := s.cwd
+			if resolvedPath != "" {
+				suggestedDir = filepath.Dir(resolvedPath)
+			}
+			return &ToolResult{NeedsConfirmation: true, ToolName: name, Params: params, SuggestedPattern: suggestedDir}
+		}
+	}
+
+	// Gate bash execution when automatic bash execution is disabled.
+	// Interactive sessions request confirmation; headless sessions hard-fail
+	// on any command not already on the allowlist (no human to ask).
+	if !s.enableAutomaticBashExecution && name == "bash" {
+		command, _ := params["command"].(string)
+		confirmed, _ := params["confirmed"].(bool)
+		if !confirmed && !s.isCommandApproved(command) {
+			if s.headless {
+				return &ToolResult{
+					IsError: true,
+					Output:  "Permission denied: bash execution requires an approved prefix pattern. Add the command to approved_bash_prefixes in .vix/settings.json.",
+				}
+			}
+			return &ToolResult{
+				NeedsConfirmation: true,
+				ToolName:          name,
+				Params:            params,
+				SuggestedPattern:  suggestBashPattern(command),
+			}
+		}
+	}
+
+	// Gate web_fetch when automatic bash execution is disabled.
+	// Interactive sessions request confirmation; headless sessions hard-fail
+	// on any URL not already on the allowlist (no human to ask).
+	if !s.enableAutomaticBashExecution && name == "web_fetch" {
+		url, _ := params["url"].(string)
+		confirmed, _ := params["confirmed"].(bool)
+		if !confirmed && !s.isURLApproved(url) {
+			if s.headless {
+				return &ToolResult{
+					IsError: true,
+					Output:  "Permission denied: web_fetch requires an approved URL prefix pattern. Add the URL to approved_url_prefixes in .vix/settings.json.",
+				}
+			}
+			return &ToolResult{
+				NeedsConfirmation: true,
+				ToolName:          name,
+				Params:            params,
+				SuggestedPattern:  suggestURLPattern(url),
+			}
 		}
 	}
 
@@ -2544,6 +2686,11 @@ func resolveConfirmation(ctx context.Context, t *toolTask, opts dispatchOptions)
 			return &ToolResult{Output: "Permission denied by hook: " + reason, IsError: true}
 		}
 	}
+	// Inject the suggested pattern from the tool result into the input map so
+	// confirmFn (which only receives the input map) can forward it to the UI.
+	if t.result != nil && t.result.SuggestedPattern != "" {
+		t.input["_suggested_pattern"] = t.result.SuggestedPattern
+	}
 	approved, cancelled := opts.confirmFn(ctx, t.toolUse.Name, t.input)
 	if cancelled {
 		return &ToolResult{Output: "Cancelled", IsError: true}
@@ -2608,11 +2755,14 @@ func (s *Session) sessionDispatchToolCalls(ctx context.Context, msg *llm.Message
 			if rd, ok := input["_requested_dirs"].([]string); ok {
 				requestedDirs = rd
 			}
+			// Extract suggested pattern for bash/URL confirmations.
+			suggestedPattern, _ := input["_suggested_pattern"].(string)
 			s.emit("event.confirm_request", protocol.EventConfirmRequest{
-				ToolName:      name,
-				Params:        snapshotInput(input),
-				RequestedDirs: requestedDirs,
-				Detail:        buildConfirmDetail(s.cwd, name, input),
+				ToolName:         name,
+				Params:           snapshotInput(input),
+				RequestedDirs:    requestedDirs,
+				Detail:           buildConfirmDetail(s.cwd, name, input),
+				SuggestedPattern: suggestedPattern,
 			})
 			cmd, ok := s.waitForCommand(s.ctx, "session.confirm")
 			if !ok {
@@ -2637,6 +2787,26 @@ func (s *Session) sessionDispatchToolCalls(ctx context.Context, msg *llm.Message
 					if resolved, err := resolvePathInAllowed(s.cwd, s.toolAllowedDirs(), pathStr); err == nil {
 						s.addApprovedWriteFile(resolved)
 					}
+				}
+			}
+			// If the user chose "Always allow" on a write tool, persist the directory.
+			if confirmData.PersistWriteDir != "" {
+				dir := confirmData.PersistWriteDir
+				s.addAllowedDir(dir)
+				s.persistAllowedDirs([]string{dir})
+			}
+			if confirmData.PersistBashPattern != "" {
+				if err := PersistApprovedBashPrefix(s.paths.ProjectSettingsWrite(), confirmData.PersistBashPattern); err != nil {
+					log.Printf("[session] failed to persist bash prefix: %v", err)
+				} else {
+					s.approvedBashPrefixes = append(s.approvedBashPrefixes, confirmData.PersistBashPattern)
+				}
+			}
+			if confirmData.PersistURLPattern != "" {
+				if err := PersistApprovedURLPrefix(s.paths.ProjectSettingsWrite(), confirmData.PersistURLPattern); err != nil {
+					log.Printf("[session] failed to persist url prefix: %v", err)
+				} else {
+					s.approvedURLPrefixes = append(s.approvedURLPrefixes, confirmData.PersistURLPattern)
 				}
 			}
 			return confirmData.Approved, false

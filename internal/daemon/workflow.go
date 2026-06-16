@@ -332,15 +332,17 @@ type Compaction struct {
 // settings.json may still carry "workflows"/"languages" keys, but they are
 // ignored.
 type configFile struct {
-	Version            int                   `json:"version,omitempty"`
-	Agent              string                `json:"agent,omitempty"`
-	AllowedDirectories []string              `json:"allowed_directories,omitempty"`
-	DenyList           denyListField         `json:"deny_list,omitempty"`
-	Features           map[string]bool       `json:"features,omitempty"`
-	ToolTimeouts       *toolTimeoutsFile     `json:"tool_timeouts,omitempty"`
-	BashStepTimeouts   *bashStepTimeoutsFile `json:"bash_step_timeouts,omitempty"`
-	Compaction         *compactionFile       `json:"compaction,omitempty"`
-	MCPServers         []mcp.ServerConfig    `json:"mcp_servers,omitempty"`
+	Version              int                   `json:"version,omitempty"`
+	Agent                string                `json:"agent,omitempty"`
+	AllowedDirectories   []string              `json:"allowed_directories,omitempty"`
+	DenyList             denyListField         `json:"deny_list,omitempty"`
+	ApprovedBashPrefixes []string              `json:"approved_bash_prefixes,omitempty"`
+	ApprovedURLPrefixes  []string              `json:"approved_url_prefixes,omitempty"`
+	Features             map[string]bool       `json:"features,omitempty"`
+	ToolTimeouts         *toolTimeoutsFile     `json:"tool_timeouts,omitempty"`
+	BashStepTimeouts     *bashStepTimeoutsFile `json:"bash_step_timeouts,omitempty"`
+	Compaction           *compactionFile       `json:"compaction,omitempty"`
+	MCPServers           []mcp.ServerConfig    `json:"mcp_servers,omitempty"`
 }
 
 // denyListField accepts either the structured form
@@ -373,15 +375,17 @@ func (d *denyListField) UnmarshalJSON(data []byte) error {
 
 // ProjectConfig holds parsed values from settings.json.
 type ProjectConfig struct {
-	Agent              string
-	AllowedDirectories []string
-	DenyPaths          []string
-	DenyURLs           []string
-	Features           map[string]bool
-	ToolTimeouts       ToolTimeouts
-	BashStepTimeouts   BashStepTimeouts
-	Compaction         Compaction
-	MCPServers         []mcp.ServerConfig
+	Agent                string
+	AllowedDirectories   []string
+	DenyPaths            []string
+	DenyURLs             []string
+	ApprovedBashPrefixes []string
+	ApprovedURLPrefixes  []string
+	Features             map[string]bool
+	ToolTimeouts         ToolTimeouts
+	BashStepTimeouts     BashStepTimeouts
+	Compaction           Compaction
+	MCPServers           []mcp.ServerConfig
 }
 
 // HasFeature returns whether the named feature flag is enabled.
@@ -506,6 +510,32 @@ func LoadProjectConfig(configPaths ...string) ProjectConfig {
 			}
 			if !found {
 				result.DenyURLs = append(result.DenyURLs, u)
+			}
+		}
+		// Merge approved bash prefixes (union, dedup).
+		for _, p := range cfg.ApprovedBashPrefixes {
+			found := false
+			for _, existing := range result.ApprovedBashPrefixes {
+				if existing == p {
+					found = true
+					break
+				}
+			}
+			if !found {
+				result.ApprovedBashPrefixes = append(result.ApprovedBashPrefixes, p)
+			}
+		}
+		// Merge approved URL prefixes (union, dedup).
+		for _, p := range cfg.ApprovedURLPrefixes {
+			found := false
+			for _, existing := range result.ApprovedURLPrefixes {
+				if existing == p {
+					found = true
+					break
+				}
+			}
+			if !found {
+				result.ApprovedURLPrefixes = append(result.ApprovedURLPrefixes, p)
 			}
 		}
 		if len(cfg.Features) > 0 {
@@ -680,6 +710,72 @@ func PersistAllowedDirectory(configPath string, dirs []string) error {
 		return err
 	}
 	return os.Rename(tmp.Name(), configPath)
+}
+
+// PersistApprovedBashPrefix appends a bash command prefix to the
+// approved_bash_prefixes list in a settings.json file.
+func PersistApprovedBashPrefix(configPath, prefix string) error {
+	return persistStringSlice(configPath, "approved_bash_prefixes", prefix)
+}
+
+// PersistApprovedURLPrefix appends a URL prefix to the
+// approved_url_prefixes list in a settings.json file.
+func PersistApprovedURLPrefix(configPath, prefix string) error {
+	return persistStringSlice(configPath, "approved_url_prefixes", prefix)
+}
+
+// persistStringSlice appends a value to a named string-array field in a
+// settings.json file, deduplicating and writing atomically.
+func persistStringSlice(configPath, field, value string) error {
+	var raw map[string]any
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		raw = map[string]any{"version": float64(CurrentConfigVersion)}
+	} else {
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return fmt.Errorf("failed to parse %s: %w", configPath, err)
+		}
+	}
+
+	existing := make(map[string]bool)
+	if arr, ok := raw[field].([]any); ok {
+		for _, v := range arr {
+			if s, ok := v.(string); ok {
+				existing[s] = true
+			}
+		}
+	}
+	existing[value] = true
+
+	sorted := make([]string, 0, len(existing))
+	for s := range existing {
+		sorted = append(sorted, s)
+	}
+	sort.Strings(sorted)
+	raw[field] = sorted
+
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(configPath), ".settings-*.json")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(out); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, configPath)
 }
 
 // envVars returns template variables describing the runtime environment.

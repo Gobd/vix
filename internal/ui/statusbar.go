@@ -37,6 +37,7 @@ func renderStatusBar(
 	focus FocusState,
 	lastInputTokens int64,
 	contextWindow int64,
+	autoApproveAll bool,
 ) string {
 	// ── Line 1: shortcuts + connection status ───────────────────────────────
 	badgeStyle := lipgloss.NewStyle().Background(colorSecondary).Foreground(lipgloss.Color("0")).Bold(true)
@@ -87,6 +88,7 @@ func renderStatusBar(
 			defs = []shortcut{
 				{"Tab", "Switch focus"},
 				{"Shift+Tab", "Workflows"},
+				{"Ctrl+A", "Auto-approve"},
 				{"Ctrl+T", "New session"},
 				{"Ctrl+P", "Previous session"},
 				{"Ctrl+N", "Next session"},
@@ -127,14 +129,26 @@ func renderStatusBar(
 		indicatorLen += 3
 	}
 
-	totalContent := shortcutsLen + connLen + indicatorLen
+	// Auto-approve badge — shown on the right when the session is in auto-approve mode.
+	var autoApproveBadge string
+	if autoApproveAll {
+		autoApproveBadge = lipgloss.NewStyle().
+			Background(colorWarning).
+			Foreground(lipgloss.Color("0")).
+			Bold(true).
+			Render(" AUTO ")
+		autoApproveBadge = "   " + autoApproveBadge
+	}
+	autoApproveBadgeLen := lipgloss.Width(autoApproveBadge)
+
+	totalContent := shortcutsLen + connLen + indicatorLen + autoApproveBadgeLen
 	remaining := width - totalContent - 2
 	if remaining < 2 {
 		remaining = 2
 	}
 	leftPad := remaining / 2
 	rightPad := remaining - leftPad
-	line1 := strings.Repeat(" ", leftPad) + shortcuts + strings.Repeat(" ", rightPad) + indicator + connStatus
+	line1 := strings.Repeat(" ", leftPad) + shortcuts + strings.Repeat(" ", rightPad) + indicator + autoApproveBadge + connStatus
 
 	// ── Line 2: transient message ───────────────────────────────────────────
 	var line2 string

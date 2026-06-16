@@ -1435,3 +1435,59 @@ func TestRunBashWithContextTimeout(t *testing.T) {
 	}
 	_ = out
 }
+
+func TestLoadProjectConfig_ApprovedPrefixes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	os.WriteFile(path, []byte(`{
+		"version": 1,
+		"approved_bash_prefixes": ["go test", "git stash"],
+		"approved_url_prefixes": ["https://api.github.com/"]
+	}`), 0o644)
+	cfg := LoadProjectConfig(path)
+	if len(cfg.ApprovedBashPrefixes) != 2 {
+		t.Fatalf("want 2 bash prefixes, got %d", len(cfg.ApprovedBashPrefixes))
+	}
+	if cfg.ApprovedBashPrefixes[0] != "go test" {
+		t.Fatalf("want 'go test' (first in JSON array), got %q", cfg.ApprovedBashPrefixes[0])
+	}
+	if len(cfg.ApprovedURLPrefixes) != 1 || cfg.ApprovedURLPrefixes[0] != "https://api.github.com/" {
+		t.Fatalf("unexpected url prefixes: %v", cfg.ApprovedURLPrefixes)
+	}
+}
+
+func TestPersistApprovedBashPrefix(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	os.WriteFile(path, []byte(`{"version":1}`), 0o644)
+
+	if err := PersistApprovedBashPrefix(path, "go test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := PersistApprovedBashPrefix(path, "git stash"); err != nil {
+		t.Fatal(err)
+	}
+	// Idempotent — adding same prefix again should not duplicate.
+	if err := PersistApprovedBashPrefix(path, "go test"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := LoadProjectConfig(path)
+	if len(cfg.ApprovedBashPrefixes) != 2 {
+		t.Fatalf("want 2, got %d: %v", len(cfg.ApprovedBashPrefixes), cfg.ApprovedBashPrefixes)
+	}
+}
+
+func TestPersistApprovedURLPrefix(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	os.WriteFile(path, []byte(`{"version":1}`), 0o644)
+
+	if err := PersistApprovedURLPrefix(path, "https://api.github.com/"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := LoadProjectConfig(path)
+	if len(cfg.ApprovedURLPrefixes) != 1 || cfg.ApprovedURLPrefixes[0] != "https://api.github.com/" {
+		t.Fatalf("unexpected: %v", cfg.ApprovedURLPrefixes)
+	}
+}

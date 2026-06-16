@@ -50,6 +50,7 @@ type SessionStartData struct {
 	ForceInit                      bool   `json:"force_init"`
 	EnableAutomaticWritePermission bool   `json:"enable_automatic_write_permission"`
 	EnableAutomaticDirectoryAccess bool   `json:"enable_automatic_directory_access"`
+	EnableAutomaticBashExecution   bool   `json:"enable_automatic_bash_execution"`
 	Headless                       bool   `json:"headless"`
 	// ClientVersion is the vix binary version opening this session. The daemon
 	// refuses the session (event.error, code "version_mismatch") when it does
@@ -140,8 +141,11 @@ func ValidateAttachment(att Attachment) error {
 
 // SessionConfirmData carries tool approval/denial.
 type SessionConfirmData struct {
-	Approved    bool `json:"approved"`
-	PersistDirs bool `json:"persist_dirs,omitempty"` // save approved directories to settings.json
+	Approved           bool   `json:"approved"`
+	PersistDirs        bool   `json:"persist_dirs,omitempty"`
+	PersistWriteDir    string `json:"persist_write_dir,omitempty"`  // dir to add to approved write dirs
+	PersistBashPattern string `json:"persist_bash_pattern,omitempty"`
+	PersistURLPattern  string `json:"persist_url_pattern,omitempty"`
 }
 
 // SessionPlanActionData carries plan review decisions.
@@ -270,7 +274,8 @@ type EventConfirmRequest struct {
 	ToolName      string         `json:"tool_name"`
 	Params        map[string]any `json:"params"`
 	RequestedDirs []string       `json:"requested_dirs,omitempty"` // directories outside cwd that require approval
-	Detail        string         `json:"detail,omitempty"`         // same format as EventToolResult.Detail — fenced code block or structured diff
+	Detail           string         `json:"detail,omitempty"`          // same format as EventToolResult.Detail — fenced code block or structured diff
+	SuggestedPattern string         `json:"suggested_pattern,omitempty"`
 }
 
 // EventPlanProposed carries a plan for user review.

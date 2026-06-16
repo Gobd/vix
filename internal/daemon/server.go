@@ -641,7 +641,7 @@ func (s *Server) handleSession(conn net.Conn, scanner *bufio.Scanner, startCmd p
 	if attachRec != nil {
 		sessionID = attachRec.ID
 	}
-	session := NewSession(sessionID, s, llmClient, model, cwd, startData.ConfigDir, startData.ForceInit, startData.EnableAutomaticWritePermission, startData.EnableAutomaticDirectoryAccess, startData.Headless, s.serverCtx)
+	session := NewSession(sessionID, s, llmClient, model, cwd, startData.ConfigDir, startData.ForceInit, startData.EnableAutomaticWritePermission, startData.EnableAutomaticDirectoryAccess, startData.EnableAutomaticBashExecution, startData.Headless, s.serverCtx)
 
 	if attachRec != nil {
 		session.seedFromRecord(attachRec)

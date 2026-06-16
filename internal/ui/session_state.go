@@ -89,6 +89,14 @@ type SessionState struct {
 	confirmToolName    string
 	confirmDetailShown bool
 
+	// pendingConfirmEvent holds a confirm request that arrived while the user
+	// had unsent text in the input; the panel is deferred until the input is
+	// cleared (e.g. on the next Enter) to avoid clobbering an in-progress edit.
+	pendingConfirmEvent *protocol.EventConfirmRequest
+	// autoApproveAll, toggled with ctrl+a, approves every tool confirmation in
+	// this session without prompting.
+	autoApproveAll bool
+
 	// Pending messages
 	pendingInput      *pendingMsg
 	pendingPlanAction *pendingPlanAction

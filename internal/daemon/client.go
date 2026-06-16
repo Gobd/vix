@@ -21,6 +21,7 @@ type ToolResult struct {
 	ToolName          string
 	Params            map[string]any
 	LineOffset        int
+	SuggestedPattern  string // pre-filled pattern suggestion for the confirm prompt
 }
 
 // Client communicates with the vix daemon over a Unix socket.
@@ -353,7 +354,7 @@ func (sc *SessionClient) SessionID() string {
 func (sc *SessionClient) StartedAt() time.Time { return sc.startedAt }
 
 // Connect establishes a persistent connection and starts an agent session.
-func (sc *SessionClient) Connect(cwd, configDir, model string, forceInit bool, enableAutomaticWritePermission bool, enableAutomaticDirectoryAccess bool, headless bool) error {
+func (sc *SessionClient) Connect(cwd, configDir, model string, forceInit bool, enableAutomaticWritePermission bool, enableAutomaticDirectoryAccess bool, enableAutomaticBashExecution bool, headless bool) error {
 	return sc.connectWith(protocol.SessionStartData{
 		CWD:                            cwd,
 		ConfigDir:                      configDir,
@@ -361,6 +362,7 @@ func (sc *SessionClient) Connect(cwd, configDir, model string, forceInit bool, e
 		ForceInit:                      forceInit,
 		EnableAutomaticWritePermission: enableAutomaticWritePermission,
 		EnableAutomaticDirectoryAccess: enableAutomaticDirectoryAccess,
+		EnableAutomaticBashExecution:   enableAutomaticBashExecution,
 		Headless:                       headless,
 	})
 }
@@ -368,7 +370,7 @@ func (sc *SessionClient) Connect(cwd, configDir, model string, forceInit bool, e
 // ConnectFork establishes a persistent connection and starts a new agent
 // session pre-seeded with the conversation history from forkSessionID up to
 // and including the turn at forkTurnIdx (0-based).
-func (sc *SessionClient) ConnectFork(cwd, configDir, model string, forceInit bool, enableAutomaticWritePermission bool, enableAutomaticDirectoryAccess bool, headless bool, forkSessionID string, forkTurnIdx int) error {
+func (sc *SessionClient) ConnectFork(cwd, configDir, model string, forceInit bool, enableAutomaticWritePermission bool, enableAutomaticDirectoryAccess bool, enableAutomaticBashExecution bool, headless bool, forkSessionID string, forkTurnIdx int) error {
 	return sc.connectWith(protocol.SessionStartData{
 		CWD:                            cwd,
 		ConfigDir:                      configDir,
@@ -376,6 +378,7 @@ func (sc *SessionClient) ConnectFork(cwd, configDir, model string, forceInit boo
 		ForceInit:                      forceInit,
 		EnableAutomaticWritePermission: enableAutomaticWritePermission,
 		EnableAutomaticDirectoryAccess: enableAutomaticDirectoryAccess,
+		EnableAutomaticBashExecution:   enableAutomaticBashExecution,
 		Headless:                       headless,
 		ForkSessionID:                  forkSessionID,
 		ForkTurnIdx:                    forkTurnIdx,
@@ -400,7 +403,7 @@ var ErrVersionMismatch = errors.New("version mismatch")
 // Attach establishes a persistent connection and resumes the persisted session
 // with the given ID. On success the daemon replays the conversation via
 // event.replay. Returns ErrSessionNotFound when no record exists on disk.
-func (sc *SessionClient) Attach(cwd, configDir, model string, forceInit bool, enableAutomaticWritePermission bool, enableAutomaticDirectoryAccess bool, headless bool, attachSessionID string) error {
+func (sc *SessionClient) Attach(cwd, configDir, model string, forceInit bool, enableAutomaticWritePermission bool, enableAutomaticDirectoryAccess bool, enableAutomaticBashExecution bool, headless bool, attachSessionID string) error {
 	return sc.connectWith(protocol.SessionStartData{
 		CWD:                            cwd,
 		ConfigDir:                      configDir,
@@ -408,6 +411,7 @@ func (sc *SessionClient) Attach(cwd, configDir, model string, forceInit bool, en
 		ForceInit:                      forceInit,
 		EnableAutomaticWritePermission: enableAutomaticWritePermission,
 		EnableAutomaticDirectoryAccess: enableAutomaticDirectoryAccess,
+		EnableAutomaticBashExecution:   enableAutomaticBashExecution,
 		Headless:                       headless,
 		AttachSessionID:                attachSessionID,
 	})
@@ -501,8 +505,14 @@ func (sc *SessionClient) SendWorkflowMessage(text string) error {
 }
 
 // SendConfirm sends tool approval/denial.
-func (sc *SessionClient) SendConfirm(approved bool, persistDirs bool) error {
-	data, _ := json.Marshal(protocol.SessionConfirmData{Approved: approved, PersistDirs: persistDirs})
+func (sc *SessionClient) SendConfirm(approved bool, persistDirs bool, persistWriteDir string, persistBashPattern string, persistURLPattern string) error {
+	data, _ := json.Marshal(protocol.SessionConfirmData{
+		Approved:           approved,
+		PersistDirs:        persistDirs,
+		PersistWriteDir:    persistWriteDir,
+		PersistBashPattern: persistBashPattern,
+		PersistURLPattern:  persistURLPattern,
+	})
 	return sc.sendCommand(protocol.SessionCommand{
 		Type: "session.confirm",
 		Data: data,

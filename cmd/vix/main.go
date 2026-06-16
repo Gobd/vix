@@ -68,8 +68,9 @@ func main() {
 	outputFormat := flag.String("output-format", "text", "Output format for headless mode: text, json, stream-json")
 	workdir := flag.String("workdir", "", "Set the working directory for this session")
 	configDir := flag.String("config-dir", "", "Use this directory as the sole .vix config root (ignores ~/.vix and ./.vix)")
-	disableWritePermission := flag.Bool("disable-automatic-write-permission", false, "Require user confirmation for write_file, edit_file, and delete_file calls (by default, writes execute without confirmation)")
-	disableDirAccess := flag.Bool("disable-automatic-directory-access", false, "Restrict tool calls to paths within the working directory (by default, all paths are accessible)")
+	disableWritePermission := flag.Bool("disable-automatic-write-permission", true, "Require user confirmation for write_file, edit_file, and delete_file calls")
+	disableDirAccess := flag.Bool("disable-automatic-directory-access", true, "Restrict tool calls to paths within the working directory")
+	disableBashExecution := flag.Bool("disable-automatic-bash-execution", true, "Require user confirmation for bash and web_fetch calls")
 	vfsFlag := flag.Bool("vfs", false, "Run a VFS command (e.g. vix --vfs read_file <path>)")
 	socketPath := flag.String("socket-path", "", "Unix socket path for the vix↔vixd connection. Defaults to /tmp/vixd.sock. Must match the running vixd.")
 	authTokenPath := flag.String("auth-token-path", "", "Path to a file holding the shared-secret token to authenticate every socket message. Must match the daemon's -auth-token-path. Empty disables auth on this client; the daemon must also be unauthenticated for that to work.")
@@ -333,7 +334,7 @@ func main() {
 					}
 				}
 				if len(claimable) > 0 {
-					if err := session.Attach(cfg.CWD, cfg.ConfigDir, cfg.Model, cfg.ForceInit, !*disableWritePermission, !*disableDirAccess, false, claimable[0].ID); err == nil {
+					if err := session.Attach(cfg.CWD, cfg.ConfigDir, cfg.Model, cfg.ForceInit, !*disableWritePermission, !*disableDirAccess, !*disableBashExecution, false, claimable[0].ID); err == nil {
 						restoreSessions = claimable[1:]
 						attached = true
 						initialAttached = true
@@ -342,7 +343,7 @@ func main() {
 			}
 		}
 		if !attached {
-			if err := session.Connect(cfg.CWD, cfg.ConfigDir, cfg.Model, cfg.ForceInit, !*disableWritePermission, !*disableDirAccess, *prompt != ""); err != nil {
+			if err := session.Connect(cfg.CWD, cfg.ConfigDir, cfg.Model, cfg.ForceInit, !*disableWritePermission, !*disableDirAccess, !*disableBashExecution, *prompt != ""); err != nil {
 				fmt.Fprintf(os.Stderr, "Error connecting to daemon: %v\n", err)
 				os.Exit(1)
 			}
@@ -373,7 +374,7 @@ func main() {
 
 	ui.ApplyTheme(config.LoadThemeConfig(cfg.Paths))
 
-	model := ui.NewModel(cfg, session, *testMode, authToken, !*disableWritePermission, !*disableDirAccess)
+	model := ui.NewModel(cfg, session, *testMode, authToken, !*disableWritePermission, !*disableDirAccess, !*disableBashExecution)
 	model.SetRestoreSessions(restoreSessions)
 	model.SetInitialAwaitingReplay(initialAttached)
 

@@ -40,7 +40,7 @@ func (s *Server) runJob(ctx context.Context, spec jobs.Spec, resolvedPrompt stri
 		runID = generateSessionID()
 	}
 	session := NewSession(runID, s, nil, s.model, spec.CWD, "", false,
-		spec.AutoWrite(), spec.AutoDirs(), true /*headless*/, ctx)
+		spec.AutoWrite(), spec.AutoDirs(), true /*enableAutomaticBashExecution*/, true /*headless*/, ctx)
 	session.origin = "vix"
 	session.trigger = &protocol.TriggerInfo{Type: spec.Trigger.Type, Ref: spec.ID}
 	session.title = jobRunTitle(spec, time.Now())
