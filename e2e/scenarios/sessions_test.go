@@ -519,7 +519,7 @@ const jobSpec = `{
 }`
 
 // TestSessionsVixInitiated verifies that a scheduled job run lands in the
-// Sessions tab's Vix-initiated group, labelled with its trigger ref and status.
+// Sessions tab's Vix-initiated group, labelled with its run title.
 func TestSessionsVixInitiated(t *testing.T) {
 	h := harness.Start(t, sessionsMeta("a scheduled job run appears in the Vix-initiated group"),
 		harness.WithEnv("VIX_DISABLE_JOBS", "0"),
@@ -531,14 +531,13 @@ func TestSessionsVixInitiated(t *testing.T) {
 
 	h.UI.WaitStable(500 * time.Millisecond)
 	h.UI.Key("f1")
+	// The Vix-initiated row is labelled with the job's run title ("<name> -
+	// <timestamp>"), derived from the job's name "E2E Demo".
 	if !pollUntil(20*time.Second, func() bool {
 		s := h.UI.Snapshot()
-		return strings.Contains(s, "Vix-initiated") && strings.Contains(s, "e2e-demo")
+		return strings.Contains(s, "Vix-initiated") && strings.Contains(s, "E2E Demo")
 	}) {
 		t.Fatalf("Vix-initiated job run not listed; screen:\n%s", h.UI.Snapshot())
-	}
-	if !h.UI.Contains("ok") {
-		t.Fatalf("job run status not shown; screen:\n%s", h.UI.Snapshot())
 	}
 	h.UI.Shot("vix-initiated")
 }
@@ -578,14 +577,13 @@ func TestSessionsVixInitiatedInlineWorkflow(t *testing.T) {
 
 	h.UI.WaitStable(500 * time.Millisecond)
 	h.UI.Key("f1")
+	// The Vix-initiated row is labelled with the job's run title ("<name> -
+	// <timestamp>"), derived from the job's name "E2E Inline".
 	if !pollUntil(20*time.Second, func() bool {
 		s := h.UI.Snapshot()
-		return strings.Contains(s, "Vix-initiated") && strings.Contains(s, "e2e-inline")
+		return strings.Contains(s, "Vix-initiated") && strings.Contains(s, "E2E Inline")
 	}) {
 		t.Fatalf("Vix-initiated inline-workflow run not listed; screen:\n%s", h.UI.Snapshot())
-	}
-	if !h.UI.Contains("ok") {
-		t.Fatalf("inline-workflow job run status not shown; screen:\n%s", h.UI.Snapshot())
 	}
 	h.UI.Shot("vix-initiated-inline")
 }
