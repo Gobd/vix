@@ -194,7 +194,7 @@
         { "spec": "openrouter/deepseek/deepseek-chat-v3.1", "display_name": "Deepseek Deepseek Chat v3.1", "context_window": 163840 },
         { "spec": "openrouter/deepseek/deepseek-r1", "display_name": "Deepseek Deepseek R1", "context_window": 163840 },
         { "spec": "openrouter/deepseek/deepseek-r1-0528", "display_name": "Deepseek Deepseek R1 0528", "context_window": 163840 },
-        { "spec": "openrouter/deepseek/deepseek-r1-distill-llama-70b", "display_name": "Deepseek Deepseek R1 Distill Llama 70b", "context_window": 131072 },
+        { "spec": "openrouter/deepseek/deepseek-r1-distill-llama-70b", "display_name": "Deepseek Deepseek R1 Distill Llama 70b", "context_window": 128000 },
         { "spec": "openrouter/deepseek/deepseek-r1-distill-qwen-32b", "display_name": "Deepseek Deepseek R1 Distill Qwen 32b", "context_window": 128000 },
         { "spec": "openrouter/deepseek/deepseek-v3.1-terminus", "display_name": "Deepseek Deepseek v3.1 Terminus", "context_window": 163840 },
         { "spec": "openrouter/deepseek/deepseek-v3.2", "display_name": "Deepseek Deepseek v3.2", "context_window": 131072 },
@@ -254,7 +254,6 @@
         { "spec": "openrouter/meta-llama/llama-3.3-70b-instruct:free", "display_name": "Meta Llama Llama 3.3 70b Instruct:free", "context_window": 131072 },
         { "spec": "openrouter/meta-llama/llama-4-maverick", "display_name": "Meta Llama Llama 4 Maverick", "context_window": 1048576 },
         { "spec": "openrouter/meta-llama/llama-4-scout", "display_name": "Meta Llama Llama 4 Scout", "context_window": 10000000 },
-        { "spec": "openrouter/meta-llama/llama-guard-3-8b", "display_name": "Meta Llama Llama Guard 3 8b", "context_window": 131072 },
         { "spec": "openrouter/meta-llama/llama-guard-4-12b", "display_name": "Meta Llama Llama Guard 4 12b", "context_window": 163840 },
         { "spec": "openrouter/microsoft/phi-4", "display_name": "Microsoft Phi 4", "context_window": 16384 },
         { "spec": "openrouter/microsoft/phi-4-mini-instruct", "display_name": "Microsoft Phi 4 Mini Instruct", "context_window": 131072 },
@@ -291,7 +290,7 @@
         { "spec": "openrouter/moonshotai/kimi-k2-thinking", "display_name": "Moonshotai Kimi K2 Thinking", "context_window": 262144 },
         { "spec": "openrouter/moonshotai/kimi-k2.5", "display_name": "Moonshotai Kimi K2.5", "context_window": 262144 },
         { "spec": "openrouter/moonshotai/kimi-k2.6", "display_name": "Moonshotai Kimi K2.6", "context_window": 262144 },
-        { "spec": "openrouter/moonshotai/kimi-k2.6:free", "display_name": "Moonshotai Kimi K2.6:free", "context_window": 262144 },
+        { "spec": "openrouter/moonshotai/kimi-k2.7-code", "display_name": "Moonshotai Kimi K2.7 Code", "context_window": 262144 },
         { "spec": "openrouter/morph/morph-v3-fast", "display_name": "Morph Morph v3 Fast", "context_window": 81920 },
         { "spec": "openrouter/morph/morph-v3-large", "display_name": "Morph Morph v3 Large", "context_window": 262144 },
         { "spec": "openrouter/nex-agi/nex-n2-pro:free", "display_name": "Nex Agi Nex N2 Pro:free", "context_window": 262144 },
@@ -310,7 +309,6 @@
         { "spec": "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free", "display_name": "Nvidia Nemotron 3 Ultra 550b A55b:free", "context_window": 1000000 },
         { "spec": "openrouter/nvidia/nemotron-3.5-content-safety:free", "display_name": "Nvidia Nemotron 3.5 Content Safety:free", "context_window": 128000 },
         { "spec": "openrouter/nvidia/nemotron-nano-12b-v2-vl:free", "display_name": "Nvidia Nemotron Nano 12b v2 Vl:free", "context_window": 128000 },
-        { "spec": "openrouter/nvidia/nemotron-nano-9b-v2", "display_name": "Nvidia Nemotron Nano 9b v2", "context_window": 131072 },
         { "spec": "openrouter/nvidia/nemotron-nano-9b-v2:free", "display_name": "Nvidia Nemotron Nano 9b V2:free", "context_window": 128000 },
         { "spec": "openrouter/openai/gpt-3.5-turbo", "display_name": "Openai GPT 3.5 Turbo", "context_window": 16385 },
         { "spec": "openrouter/openai/gpt-3.5-turbo-0613", "display_name": "Openai GPT 3.5 Turbo 0613", "context_window": 4095 },
@@ -465,19 +463,16 @@
         { "spec": "openrouter/xiaomi/mimo-v2-flash", "display_name": "Xiaomi Mimo v2 Flash", "context_window": 262144 },
         { "spec": "openrouter/xiaomi/mimo-v2.5", "display_name": "Xiaomi Mimo v2.5", "context_window": 1048576 },
         { "spec": "openrouter/xiaomi/mimo-v2.5-pro", "display_name": "Xiaomi Mimo v2.5 Pro", "context_window": 1048576 },
-        { "spec": "openrouter/z-ai/glm-4-32b", "display_name": "Z AI Glm 4 32b", "context_window": 128000 },
         { "spec": "openrouter/z-ai/glm-4.5", "display_name": "Z AI Glm 4.5", "context_window": 131072 },
         { "spec": "openrouter/z-ai/glm-4.5-air", "display_name": "Z AI Glm 4.5 Air", "context_window": 131072 },
-        { "spec": "openrouter/z-ai/glm-4.5-air:free", "display_name": "Z AI Glm 4.5 Air:free", "context_window": 131072 },
         { "spec": "openrouter/z-ai/glm-4.5v", "display_name": "Z AI Glm 4.5v", "context_window": 65536 },
         { "spec": "openrouter/z-ai/glm-4.6", "display_name": "Z AI Glm 4.6", "context_window": 202752 },
         { "spec": "openrouter/z-ai/glm-4.6v", "display_name": "Z AI Glm 4.6v", "context_window": 131072 },
         { "spec": "openrouter/z-ai/glm-4.7", "display_name": "Z AI Glm 4.7", "context_window": 202752 },
         { "spec": "openrouter/z-ai/glm-4.7-flash", "display_name": "Z AI Glm 4.7 Flash", "context_window": 202752 },
         { "spec": "openrouter/z-ai/glm-5", "display_name": "Z AI Glm 5", "context_window": 202752 },
-        { "spec": "openrouter/z-ai/glm-5-turbo", "display_name": "Z AI Glm 5 Turbo", "context_window": 202752 },
+        { "spec": "openrouter/z-ai/glm-5-turbo", "display_name": "Z AI Glm 5 Turbo", "context_window": 262144 },
         { "spec": "openrouter/z-ai/glm-5.1", "display_name": "Z AI Glm 5.1", "context_window": 202752 },
-        { "spec": "openrouter/z-ai/glm-5v-turbo", "display_name": "Z AI Glm 5v Turbo", "context_window": 202752 },
         { "spec": "openrouter/~anthropic/claude-fable-latest", "display_name": "~anthropic Claude Fable Latest", "context_window": 1000000 },
         { "spec": "openrouter/~anthropic/claude-haiku-latest", "display_name": "~anthropic Claude Haiku Latest", "context_window": 200000 },
         { "spec": "openrouter/~anthropic/claude-opus-latest", "display_name": "~anthropic Claude Opus Latest", "context_window": 1000000 },
@@ -646,6 +641,38 @@
         { "spec": "bedrock/zai.glm-4.7-flash", "display_name": "Zai.glm 4.7 Flash" },
         { "spec": "bedrock/zai.glm-5", "display_name": "Zai.glm 5" }
       ]
+    },
+    {
+      "id": "ollama",
+      "display_name": "Ollama",
+      "model_prefix": "ollama",
+      "wire_format": "chat_completions",
+      "local": true,
+      "inference": {
+        "base_url": "${env:OLLAMA_BASE_URL:-http://localhost:11434/v1}",
+        "auth_scheme": "bearer"
+      },
+      "credential_methods": [
+        { "kind": "api_key", "env_var": "OLLAMA_API_KEY", "keyring": "ollama-api-key" },
+        { "kind": "none" }
+      ],
+      "models": []
+    },
+    {
+      "id": "llamacpp",
+      "display_name": "llama.cpp",
+      "model_prefix": "llamacpp",
+      "wire_format": "chat_completions",
+      "local": true,
+      "inference": {
+        "base_url": "${env:LLAMACPP_BASE_URL:-http://localhost:8080/v1}",
+        "auth_scheme": "bearer"
+      },
+      "credential_methods": [
+        { "kind": "api_key", "env_var": "LLAMACPP_API_KEY", "keyring": "llamacpp-api-key" },
+        { "kind": "none" }
+      ],
+      "models": []
     }
   ],
   "auth_logins": [

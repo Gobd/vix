@@ -3,7 +3,50 @@ package ui
 import (
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestRenderUserMessageAt_ShowsStoredTime(t *testing.T) {
+	strip := func(s string) string { return ansiRe.ReplaceAllString(s, "") }
+	ts := time.Date(2021, 1, 2, 15, 4, 0, 0, time.UTC) // 3:04 PM
+	msg := renderUserMessageAt("hello there", 80, ts)
+
+	if !msg.Timestamp.Equal(ts) {
+		t.Errorf("Timestamp = %v, want %v", msg.Timestamp, ts)
+	}
+	if !strings.Contains(strip(msg.Rendered), "Sent at 3:04 PM") {
+		t.Errorf("rendered message missing stored time; got:\n%s", strip(msg.Rendered))
+	}
+}
+
+func TestRenderUserMessageAt_OmitsWhenZero(t *testing.T) {
+	strip := func(s string) string { return ansiRe.ReplaceAllString(s, "") }
+	msg := renderUserMessageAt("legacy message", 80, time.Time{})
+
+	if !msg.Timestamp.IsZero() {
+		t.Errorf("Timestamp = %v, want zero", msg.Timestamp)
+	}
+	if strings.Contains(strip(msg.Rendered), "Sent at") {
+		t.Errorf("rendered message must omit the Sent at line for a zero timestamp; got:\n%s", strip(msg.Rendered))
+	}
+	if !strings.Contains(strip(msg.Rendered), "legacy message") {
+		t.Errorf("rendered message should still contain the body; got:\n%s", strip(msg.Rendered))
+	}
+}
+
+func TestRerenderUserMessagePreservesTimestamp(t *testing.T) {
+	strip := func(s string) string { return ansiRe.ReplaceAllString(s, "") }
+	ts := time.Date(2021, 1, 2, 9, 7, 0, 0, time.UTC) // 9:07 AM
+	orig := renderUserMessageAt("resize me", 120, ts)
+
+	got := orig.rerender(nil, NewStyles(true), 60)
+	if !got.Timestamp.Equal(ts) {
+		t.Errorf("rerender Timestamp = %v, want %v", got.Timestamp, ts)
+	}
+	if !strings.Contains(strip(got.Rendered), "Sent at 9:07 AM") {
+		t.Errorf("rerender must keep original send time, not now; got:\n%s", strip(got.Rendered))
+	}
+}
 
 func TestExtractFilePathFromSummary(t *testing.T) {
 	tests := []struct {

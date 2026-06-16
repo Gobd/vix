@@ -27,6 +27,8 @@ changelog.txt
 *.dylib
 *.test
 *.out
+# e2e report output (also covered by e2e/.gitignore)
+e2e/out/
 # vendor/
 go.work
 

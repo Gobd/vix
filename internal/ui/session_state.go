@@ -10,6 +10,10 @@ import (
 	"github.com/get-vix/vix/internal/providers"
 )
 
+// streamRenderInterval caps how often the accumulated streaming buffers are
+// re-rendered through glamour (see lastStreamRender/lastThinkingRender).
+const streamRenderInterval = 100 * time.Millisecond
+
 // SessionState holds all accumulated UI state for a single agent session.
 // Sessions are independent objects — the Chat tab renders whichever session
 // is currently selected. Messages accumulate continuously from daemon events
@@ -28,7 +32,13 @@ type SessionState struct {
 	// Daemon connection
 	client       *daemon.SessionClient
 	reconnecting bool
-	initState    protocol.InitState
+	// closing is set when the TUI itself initiated this session's close (the
+	// quit-time "close all sessions" flow). The daemon tears the connection
+	// down as part of handling session.close, so the subsequent disconnect is
+	// expected: the handler must not treat it as a lost connection and
+	// auto-reconnect, which would resurrect the just-closed session.
+	closing   bool
+	initState protocol.InitState
 
 	// Accumulated chat display — built from daemon events
 	chatMessages     []ChatMessage
@@ -100,6 +110,22 @@ type SessionState struct {
 	// Animation
 	thinkingAnim ThinkingAnim
 
+	// Cached transcript render (see chatcache.go)
+	chatCache chatCache
+
+	// Memo for the bordered chat box: skips lipgloss Wrap/applyBorder when
+	// the visible lines, focus, and dimensions are unchanged since the last
+	// frame. chatBoxKey is "<w>|<h>|<focused>|" + the joined visible lines.
+	chatBoxKey      string
+	chatBoxRendered string
+
+	// Streaming render throttle: glamour re-renders the whole accumulated
+	// buffer on each chunk, which is O(n²) over a long reply. Re-render at
+	// most every streamRenderInterval; event.stream_done always does a final
+	// full render.
+	lastStreamRender   time.Time
+	lastThinkingRender time.Time
+
 	// Input recall history (.vix/history.txt)
 	history *History
 
@@ -131,6 +157,17 @@ type SessionState struct {
 	// of the welcome screen, so a restored conversation doesn't flash the
 	// welcome view before its history arrives.
 	awaitingReplay bool
+
+	// vixSummary is set when this session was attached from a vix-initiated
+	// record (job run, alert). It carries the record's trigger/status metadata
+	// and keeps the session rendered inside the Sessions tab's "Vix-initiated"
+	// group rather than among the user-initiated sessions.
+	vixSummary *protocol.SessionSummary
+
+	// title is the session's display title (LLM-generated after a few turns,
+	// or set at creation for job runs). Empty = the Sessions tab falls back to
+	// the first user message.
+	title string
 }
 
 // newSessionState initialises a fresh session state ready for a new agent session.

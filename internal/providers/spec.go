@@ -71,6 +71,9 @@ const (
 	CredOAuthMintKey = "oauth_mint_key"
 	// CredOAuthToken is an OAuth login yielding a refreshable access token.
 	CredOAuthToken = "oauth_token"
+	// CredNone marks a provider that needs no credential (local servers such as
+	// Ollama or llama.cpp). Resolution yields a fixed placeholder value.
+	CredNone = "none"
 )
 
 // OAuth flow names: select the compiled auth.Provider implementation.
@@ -110,6 +113,11 @@ type ProviderSpec struct {
 	Inference    InferenceSpec      `json:"inference"`
 	Credential   []CredentialMethod `json:"credential_methods"`
 	Models       []ModelSpec        `json:"models"`
+	// Local marks a provider backed by a user-run local server (Ollama,
+	// llama.cpp). Local providers may use a loopback http:// base URL, are
+	// grouped separately in the TUI, and their model list is discovered live
+	// from the server rather than from the static catalogue.
+	Local bool `json:"local,omitempty"`
 }
 
 // Prefix returns the model-spec prefix including the trailing slash.
@@ -130,7 +138,7 @@ type InferenceSpec struct {
 
 // CredentialMethod is one ordered way to obtain a credential for a provider.
 type CredentialMethod struct {
-	Kind                 string `json:"kind"` // api_key | oauth_mint_key | oauth_token
+	Kind                 string `json:"kind"` // api_key | oauth_mint_key | oauth_token | none
 	EnvVar               string `json:"env_var"`
 	Keyring              string `json:"keyring"`
 	LoginID              string `json:"login_id"`               // oauth_*: internal/auth login id

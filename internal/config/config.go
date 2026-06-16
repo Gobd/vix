@@ -100,12 +100,14 @@ type ToolBackendConfig struct {
 	Backend string `json:"backend"`
 }
 
-// LoadDaemonConfig loads daemon configuration with defaults.
-func LoadDaemonConfig() (*DaemonConfig, error) {
+// LoadDaemonConfig loads daemon configuration with defaults. version is the
+// running binary's build version, used to refresh managed defaults in ~/.vix
+// when it changes between runs.
+func LoadDaemonConfig(version string) (*DaemonConfig, error) {
 	homeDir := HomeVixDir()
 	if homeDir != "" {
 		os.MkdirAll(homeDir, 0o755)
-		if err := BootstrapHomeVixDir(homeDir); err != nil {
+		if err := BootstrapHomeVixDir(homeDir, version); err != nil {
 			log.Printf("[config] bootstrap failed: %v", err)
 		}
 	}
@@ -189,6 +191,14 @@ func ShowThinking() bool { return feature("show_thinking", false) }
 // SetShowThinking writes the show_thinking feature flag to ~/.vix/settings.json.
 func SetShowThinking(v bool) error { return setFeature("show_thinking", v) }
 
+// CloseAllSessionsOnQuit reads the close_all_sessions_on_quit feature flag.
+// Defaults to false: quitting vix leaves all session records open so they are
+// restored on next launch. When true, quitting explicitly closes every session.
+func CloseAllSessionsOnQuit() bool { return feature("close_all_sessions_on_quit", false) }
+
+// SetCloseAllSessionsOnQuit writes the close_all_sessions_on_quit feature flag.
+func SetCloseAllSessionsOnQuit(v bool) error { return setFeature("close_all_sessions_on_quit", v) }
+
 // ReadAgentsMD reads the read_agents_md feature flag. Defaults to false.
 func ReadAgentsMD() bool { return feature("read_agents_md", false) }
 
@@ -206,6 +216,78 @@ func ToolOrchestrator() bool { return feature("tool_orchestrator", false) }
 
 // SetToolOrchestrator writes the tool_orchestrator feature flag.
 func SetToolOrchestrator(v bool) error { return setFeature("tool_orchestrator", v) }
+
+// JobsEnabled reads the jobs feature flag (the scheduled-jobs engine in vixd).
+// Defaults to true; the VIX_DISABLE_JOBS environment variable overrides
+// everything as an emergency kill switch.
+func JobsEnabled() bool {
+	if v := os.Getenv("VIX_DISABLE_JOBS"); v == "1" || v == "true" {
+		return false
+	}
+	return feature("jobs", true)
+}
+
+// HooksEnabled reads the hooks feature flag (the lifecycle-hooks engine in
+// vixd). Defaults to true; the VIX_DISABLE_HOOKS environment variable overrides
+// everything as an emergency kill switch.
+func HooksEnabled() bool {
+	if v := os.Getenv("VIX_DISABLE_HOOKS"); v == "1" || v == "true" {
+		return false
+	}
+	return feature("hooks", true)
+}
+
+// JobsMaxConcurrentRuns reads jobs.max_concurrent_runs from
+// ~/.vix/settings.json. Returns 0 when absent/invalid, letting the scheduler
+// apply its default.
+func JobsMaxConcurrentRuns() int {
+	p := filepath.Join(HomeVixDir(), "settings.json")
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return 0
+	}
+	var cfg struct {
+		Jobs struct {
+			MaxConcurrentRuns int `json:"max_concurrent_runs"`
+		} `json:"jobs"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return 0
+	}
+	if cfg.Jobs.MaxConcurrentRuns < 0 {
+		return 0
+	}
+	return cfg.Jobs.MaxConcurrentRuns
+}
+
+// DefaultLogRetentionDays is how long job/hook run logs are kept when
+// logs.retention_days is absent or invalid in settings.json.
+const DefaultLogRetentionDays = 10
+
+// LogRetentionDays reads logs.retention_days from ~/.vix/settings.json: how many
+// days of job/hook run logs (~/.vix/logs/{jobs,hooks}/<date>.jsonl) the daemon
+// keeps before sweeping older daily files. Returns DefaultLogRetentionDays when
+// the key is absent or the file is missing/unparsable. A value of 0 (or
+// negative) disables the sweep entirely — logs are kept forever.
+func LogRetentionDays() int {
+	p := filepath.Join(HomeVixDir(), "settings.json")
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return DefaultLogRetentionDays
+	}
+	var cfg struct {
+		Logs struct {
+			RetentionDays *int `json:"retention_days"`
+		} `json:"logs"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return DefaultLogRetentionDays
+	}
+	if cfg.Logs.RetentionDays == nil {
+		return DefaultLogRetentionDays
+	}
+	return *cfg.Logs.RetentionDays
+}
 
 // Compaction defaults mirror the daemon-side defaults in internal/daemon.
 const (
@@ -288,10 +370,71 @@ func SetCompactionAuto(v bool) error { return setCompactionField("auto", v) }
 // SetCompactionThreshold writes compaction.threshold to ~/.vix/settings.json.
 func SetCompactionThreshold(v float64) error { return setCompactionField("threshold", v) }
 
+// DefaultClosedSessionRetentionMinutes is the default retention for closed
+// session records: one week.
+const DefaultClosedSessionRetentionMinutes = 7 * 24 * 60
+
+// ClosedSessionRetentionMinutes reads sessions.closed_retention_minutes from
+// ~/.vix/settings.json. Closed session records older than this are deleted by
+// the daemon on startup. Defaults to one week when absent. 0 means never trim
+// (settable only by editing settings.json — the TUI does not offer it).
+func ClosedSessionRetentionMinutes() int {
+	p := filepath.Join(HomeVixDir(), "settings.json")
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return DefaultClosedSessionRetentionMinutes
+	}
+	var cfg struct {
+		Sessions struct {
+			ClosedRetentionMinutes *int `json:"closed_retention_minutes"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil || cfg.Sessions.ClosedRetentionMinutes == nil {
+		return DefaultClosedSessionRetentionMinutes
+	}
+	if *cfg.Sessions.ClosedRetentionMinutes < 0 {
+		return DefaultClosedSessionRetentionMinutes
+	}
+	return *cfg.Sessions.ClosedRetentionMinutes
+}
+
+// SetClosedSessionRetentionMinutes writes sessions.closed_retention_minutes to
+// ~/.vix/settings.json, preserving other keys.
+func SetClosedSessionRetentionMinutes(v int) error {
+	home := HomeVixDir()
+	if home == "" {
+		return fmt.Errorf("no home directory")
+	}
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		return err
+	}
+	p := filepath.Join(home, "settings.json")
+
+	raw := map[string]any{}
+	if data, err := os.ReadFile(p); err == nil {
+		_ = json.Unmarshal(data, &raw)
+	}
+
+	sessions, _ := raw["sessions"].(map[string]any)
+	if sessions == nil {
+		sessions = map[string]any{}
+	}
+	sessions["closed_retention_minutes"] = v
+	raw["sessions"] = sessions
+
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, out, 0o644)
+}
+
 // ThemeConfig holds user-configurable brand colors.
 type ThemeConfig struct {
-	Primary   string `json:"primary"`   // hex color like "#BC63FC"
-	Secondary string `json:"secondary"` // hex color like "#A3FC63"
+	Primary    string `json:"primary"`    // hex color like "#BC63FC"
+	Secondary  string `json:"secondary"`  // hex color like "#A3FC63"
+	Tertiary   string `json:"tertiary"`   // hex color like "#FC6F63"
+	Quaternary string `json:"quaternary"` // hex color like "#63F0FC"
 }
 
 // ElevenLabsAgentID reads the elevenlabs.agent_id from the layered settings
@@ -368,6 +511,12 @@ func LoadThemeConfig(paths VixPaths) ThemeConfig {
 		}
 		if wrapper.Theme.Secondary != "" {
 			tc.Secondary = wrapper.Theme.Secondary
+		}
+		if wrapper.Theme.Tertiary != "" {
+			tc.Tertiary = wrapper.Theme.Tertiary
+		}
+		if wrapper.Theme.Quaternary != "" {
+			tc.Quaternary = wrapper.Theme.Quaternary
 		}
 	}
 

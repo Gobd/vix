@@ -3,6 +3,8 @@
 // MiMo.
 package llm
 
+import "time"
+
 // ProviderID identifies one of the supported upstream providers.
 type ProviderID string
 
@@ -89,6 +91,13 @@ type SystemBlock struct {
 type MessageParam struct {
 	Role    Role           `json:"role"`
 	Content []ContentBlock `json:"content"`
+	// Timestamp is when this turn was created. It is persisted with the
+	// session and projected into replay so a restored conversation shows
+	// original send times instead of the relaunch time. Stamped by the
+	// daemon when the message is appended to history; never sent to
+	// providers (request bodies are built from Role/Content only). Zero for
+	// legacy records persisted before this field existed.
+	Timestamp time.Time `json:"timestamp,omitempty"`
 }
 
 // ToolParam describes one tool exposed to the model.

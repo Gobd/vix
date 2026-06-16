@@ -19,16 +19,20 @@ func lighten(hex string, factor float64) color.Color {
 }
 
 var (
-	primaryHex   = "#BC63FC"
-	secondaryHex = "#A3FC63"
+	primaryHex    = "#BC63FC"
+	secondaryHex  = "#A3FC63"
+	tertiaryHex   = "#FC6F63"
+	quaternaryHex = "#63F0FC"
 )
 
 var (
 	// Brand colors (true color hex for consistent identity)
-	colorPrimary    = lipgloss.Color(primaryHex)   // Coral
-	colorSecondary  = lipgloss.Color(secondaryHex) // Sky blue
-	colorAccentWarm = lighten(primaryHex, 0.3)     // Light coral (derived)
-	colorAccentCool = lighten(secondaryHex, 0.3)   // Light sky blue (derived)
+	colorPrimary    = lipgloss.Color(primaryHex)    // Coral
+	colorSecondary  = lipgloss.Color(secondaryHex)  // Sky blue
+	colorTertiary   = lipgloss.Color(tertiaryHex)   // Warm coral
+	colorQuaternary = lipgloss.Color(quaternaryHex) // Cyan
+	colorAccentWarm = lighten(primaryHex, 0.3)      // Light coral (derived)
+	colorAccentCool = lighten(secondaryHex, 0.3)    // Light sky blue (derived)
 
 	// Semantic colors (ANSI for terminal compatibility)
 	colorError   = lipgloss.Color("1") // Red
@@ -307,10 +311,18 @@ func ApplyTheme(tc config.ThemeConfig) {
 	if tc.Secondary != "" {
 		secondaryHex = tc.Secondary
 	}
+	if tc.Tertiary != "" {
+		tertiaryHex = tc.Tertiary
+	}
+	if tc.Quaternary != "" {
+		quaternaryHex = tc.Quaternary
+	}
 
 	// Rebuild all brand-derived colors
 	colorPrimary = lipgloss.Color(primaryHex)
 	colorSecondary = lipgloss.Color(secondaryHex)
+	colorTertiary = lipgloss.Color(tertiaryHex)
+	colorQuaternary = lipgloss.Color(quaternaryHex)
 	colorAccentWarm = lighten(primaryHex, 0.3)
 	colorAccentCool = lighten(secondaryHex, 0.3)
 

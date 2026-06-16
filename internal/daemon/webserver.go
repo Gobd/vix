@@ -66,6 +66,9 @@ func StartWebServer(ctx context.Context, s *Server, port int) {
 		w.Write(data)
 	})
 
+	// Create a scheduled job from the web UI (local origins only).
+	mux.HandleFunc("/api/jobs", handleCreateJob(s))
+
 	// New per-session API routes
 	mux.HandleFunc("/api/session/{id}/interview-data", handleInterviewData(s))
 	mux.HandleFunc("/api/session/{id}/signed-url", handleSignedURL(s))
@@ -90,18 +93,18 @@ func StartWebServer(ctx context.Context, s *Server, port int) {
 			}
 		}()
 
-		if err := sendUpdate(conn, s.Sessions(), collectVitals()); err != nil {
+		if err := sendUpdate(conn, s); err != nil {
 			return
 		}
 
 		for {
 			select {
 			case <-ch:
-				if err := sendUpdate(conn, s.Sessions(), collectVitals()); err != nil {
+				if err := sendUpdate(conn, s); err != nil {
 					return
 				}
 			case <-ticker.C:
-				if err := sendUpdate(conn, s.Sessions(), collectVitals()); err != nil {
+				if err := sendUpdate(conn, s); err != nil {
 					return
 				}
 			case <-readDone:
@@ -288,8 +291,15 @@ func handleCallAgent(s *Server) http.HandlerFunc {
 	}
 }
 
-func sendUpdate(conn *websocket.Conn, sessions []SessionInfo, vitals ServerVitals) error {
-	data, err := json.Marshal(wsMessage{Sessions: sessions, Vitals: vitals})
+func sendUpdate(conn *websocket.Conn, s *Server) error {
+	data, err := json.Marshal(wsMessage{
+		Sessions:   s.Sessions(),
+		Vitals:     collectVitals(),
+		Jobs:       s.Jobs(),
+		Hooks:      s.Hooks(),
+		DefaultCWD: s.DefaultCWD(),
+		Version:    s.Version(),
+	})
 	if err != nil {
 		return err
 	}

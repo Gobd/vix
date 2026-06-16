@@ -1,0 +1,105 @@
+package scenarios
+
+import (
+	"testing"
+	"time"
+
+	"github.com/get-vix/vix/e2e/harness"
+)
+
+// navigateModelsToText is a best-effort driver: open the F3 Models tab and press
+// "down" until want appears on screen (bounded). The Models tab probes a local
+// provider when the cursor lands on it, and renders the model grid for the
+// focused provider — so this surfaces either a local model or a provider's
+// models. Returns true if want appeared.
+func navigateModelsToText(h *harness.Harness, want string, maxSteps int) bool {
+	h.UI.Key("f3")
+	h.UI.WaitStable(300 * time.Millisecond)
+	if h.UI.Contains(want) {
+		return true
+	}
+	for range maxSteps {
+		h.UI.Key("down")
+		h.UI.WaitStable(250 * time.Millisecond)
+		if h.UI.Contains(want) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestLocalProviderDetectedFromEnv is a staged acceptance spec for issue #35
+// (LLAMACPP_BASE_URL ignored). The mock now serves the llama.cpp discovery
+// endpoints, and WithEnv expands {{MOCK_URL}}, so the harness side is ready. It
+// is skipped because (a) #35 is open and (b) the F3 keystroke navigation below
+// is unvalidated — enable and refine the navigation after the first gate run.
+//
+// When enabled it proves: with LLAMACPP_BASE_URL pointing at a reachable server,
+// the discovered local model appears in the F3 model picker. T1.5 · asserts
+// screen (the local model id renders in the picker).
+func TestLocalProviderDetectedFromEnv(t *testing.T) {
+	meta := harness.Meta{
+		Category:    "providers",
+		Subcategory: "providers.local_detection",
+		Description: "a llama.cpp model surfaces in the picker when LLAMACPP_BASE_URL is set (#35)",
+		Wire:        harness.WireMessages,
+	}
+	harness.SkipScenario(t, meta, "acceptance spec for #35 (open) + unvalidated F3 navigation; enable when fixed/validated")
+
+	h := harness.Start(t, meta, harness.WithEnv("LLAMACPP_BASE_URL", "{{MOCK_URL}}/v1"))
+
+	h.Mock.SetLocalModel("my-local-model", 4096)
+	h.UI.WaitStable(400 * time.Millisecond)
+
+	if !navigateModelsToText(h, "my-local-model", 15) {
+		t.Fatalf("local model not shown in the F3 picker; screen:\n%s", h.UI.Snapshot())
+	}
+	h.UI.Shot("local-model-listed")
+}
+
+// TestModelSwitchWithValidCredential is a staged acceptance spec for issue #26
+// (a valid credential is wrongly reported missing on switch). The harness
+// injects OpenAI creds (key + base URL → mock) by default, so a switch to an
+// OpenAI model should succeed. Skipped because #26 is open and the F3 picker
+// keystroke choreography is stateful and unvalidated here.
+//
+// When enabled it proves: switching to a model whose credential is present does
+// not raise "no credential", and a subsequent turn runs on the new model.
+// T1.6 · asserts screen (no error) + wire (a turn reaches the mock after switch).
+func TestModelSwitchWithValidCredential(t *testing.T) {
+	meta := harness.Meta{
+		Category:    "models",
+		Subcategory: "models.switch_credential",
+		Description: "switching to a model with a valid credential succeeds (#26)",
+		Wire:        harness.WireMessages,
+	}
+	harness.SkipScenario(t, meta, "acceptance spec for #26 (open) + unvalidated F3 picker navigation; enable when fixed/validated")
+
+	h := harness.Start(t, meta)
+
+	h.UI.WaitStable(400 * time.Millisecond)
+
+	// Best-effort: open the picker, move into the model grid, filter for the
+	// OpenAI model, and confirm. (The exact focus transitions are stateful; this
+	// is the part to refine once runnable.)
+	h.UI.Key("f3")
+	h.UI.WaitStable(300 * time.Millisecond)
+	h.UI.Key("tab") // providers -> auth
+	h.UI.Key("tab") // auth -> model grid
+	h.UI.Type("gpt-4o")
+	h.UI.WaitStable(250 * time.Millisecond)
+	h.UI.Key("enter")
+	h.UI.WaitStable(400 * time.Millisecond)
+
+	if h.UI.Contains("no credential") || h.UI.Contains("Cannot switch") {
+		t.Fatalf("model switch wrongly reported a missing credential; screen:\n%s", h.UI.Snapshot())
+	}
+
+	// Back to chat; a turn should run on the newly selected model.
+	h.UI.Key("f2")
+	h.UI.WaitStable(300 * time.Millisecond)
+	h.Mock.Enqueue(harness.Text("Running on the switched model."))
+	h.UI.Type("hello on the new model")
+	h.UI.Enter()
+	h.UI.WaitFor("Running on the switched model.")
+}

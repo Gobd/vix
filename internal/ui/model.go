@@ -7,6 +7,7 @@ import (
 	"image"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -287,17 +288,34 @@ type Model struct {
 	// Normal operation = StateWaitingForInput (no overlay).
 	state                AppState
 	quitSelected         int
+	quitCloseAll         bool // quit-dialog checkbox: close all sessions on quit
 	sessionCloseIdx      int
 	sessionCloseSelected int
+	// vixDismissID, when non-empty, marks that the close dialog targets a
+	// persisted vix-initiated record (dismissed, not closed) with that ID.
+	vixDismissID string
 
 	// Sessions tab UI
 	sessionsSelected int
+	// vixSessions are the persisted vix-initiated records (job runs, alerts)
+	// for this cwd, rendered as their own group below the live sessions.
+	// Refreshed on Init, on entering the tab, and on event.sessions_changed.
+	vixSessions []protocol.SessionSummary
+	// focusRestoredID, when set, names a session the user just opened from
+	// the Sessions tab (enter on a vix-initiated row): the matching
+	// sessionRestoredMsg focuses it instead of restoring in the background.
+	focusRestoredID string
+	// vixSeeded guards the one-shot launch seeding of sessionsTabUnseen from
+	// persisted unread vix records (first vixSessionsMsg only).
+	vixSeeded bool
 
 	// Models tab UI
 	modelsLoggedIn         []string                             // providers with a stored credential
 	modelsAvailable        []string                             // providers without one
+	modelsLocal            []string                             // local providers (Ollama, llama.cpp), own group
+	modelsLocalUI          map[string]LocalProviderUI           // live probe state per local provider
 	modelsStatus           map[string]config.ProviderAuthStatus // per-provider auth status (refreshed on change)
-	modelsProviderSel      int                                  // index into modelsLoggedIn ++ modelsAvailable
+	modelsProviderSel      int                                  // index into modelsLoggedIn ++ modelsAvailable ++ modelsLocal
 	modelsFocus            modelsFocusArea                      // which Models-tab area has the cursor
 	modelsAuthRow          int                                  // credential-method row index (focus == auth)
 	modelsAuthBtn          int                                  // button index within the focused auth row
@@ -455,6 +473,8 @@ func (m Model) Init() tea.Cmd {
 	for _, sum := range m.restoreSessions {
 		cmds = append(cmds, attachRestoreSession(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, sum))
 	}
+	// Populate the Vix-initiated group of the Sessions tab.
+	cmds = append(cmds, fetchVixSessions(m.socketPath, m.cwd, m.cfg.ConfigDir, m.authToken))
 	cmds = append(cmds, waitForResume, tea.RequestBackgroundColor)
 	return tea.Batch(cmds...)
 }
@@ -570,15 +590,12 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// --- Global quit confirm overlay ---
 		if msg.String() == "ctrl+c" || msg.String() == "ctrl+d" {
 			if m.state == StateQuitConfirm {
-				sess := m.currentSession()
-				if sess != nil && sess.client != nil {
-					sess.client.SendCancel()
-					sess.client.SendClose()
-				}
+				m.closeSessionsForQuit(m.quitCloseAll)
 				return m, tea.Quit
 			}
 			m.state = StateQuitConfirm
 			m.quitSelected = 0
+			m.quitCloseAll = config.CloseAllSessionsOnQuit()
 			return m, nil
 		}
 
@@ -658,40 +675,16 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// --- Global workspace shortcuts ---
 		switch msg.String() {
 		case "ctrl+n":
-			if m.selectedSession < len(m.sessions)-1 {
-				m.selectedSession++
-				m.activeTab = TabKindChat
-				selSess := m.sessions[m.selectedSession]
-				m.markSessionRead(selSess)
-				selSess.input.SetWidth(m.width - 4)
-				if selSess.client == nil && !selSess.reconnecting {
-					selSess.reconnecting = true
-					cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, selSess.daemonSessionID))
-				}
-				cmds = append(cmds, selSess.thinkingAnim.Resume())
-				if !m.hasAlertSessions() {
-					m.stopTabAlertBlink()
-				}
+			if stepCmds, ok := m.stepWorkspaceSession(1); ok {
+				cmds = append(cmds, stepCmds...)
 			} else if curSess := m.currentSession(); curSess != nil {
 				return m, m.emitStatusMsg("No next session", StatusMsgWarning)
 			}
 			return m, tea.Batch(cmds...)
 
 		case "ctrl+p":
-			if m.selectedSession > 0 {
-				m.selectedSession--
-				m.activeTab = TabKindChat
-				selSess := m.sessions[m.selectedSession]
-				m.markSessionRead(selSess)
-				selSess.input.SetWidth(m.width - 4)
-				if selSess.client == nil && !selSess.reconnecting {
-					selSess.reconnecting = true
-					cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, selSess.daemonSessionID))
-				}
-				cmds = append(cmds, selSess.thinkingAnim.Resume())
-				if !m.hasAlertSessions() {
-					m.stopTabAlertBlink()
-				}
+			if stepCmds, ok := m.stepWorkspaceSession(-1); ok {
+				cmds = append(cmds, stepCmds...)
 			} else if curSess := m.currentSession(); curSess != nil {
 				return m, m.emitStatusMsg("No previous session", StatusMsgWarning)
 			}
@@ -706,6 +699,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.selectedSession = newIdx
 			m.activeTab = TabKindChat
 			cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, newSess.daemonSessionID))
+			cmds = append(cmds, armCursorBlink(newSess))
 			return m, tea.Batch(cmds...)
 
 		}
@@ -719,11 +713,18 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			case "down":
-				if n := m.sessionsVisibleCount(); m.sessionsSelected < n-1 {
+				if n := m.sessionsVisibleCount() + len(m.vixSessions); m.sessionsSelected < n-1 {
 					m.sessionsSelected++
 				}
 				return m, nil
 			case "enter":
+				if sum, ok := m.vixSelectedSummary(); ok {
+					// Open a vix-initiated record: attach it like a restored
+					// session; the replay rebuilds the conversation and the
+					// matching sessionRestoredMsg focuses it.
+					m.focusRestoredID = sum.ID
+					return m, attachRestoreSession(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, sum)
+				}
 				if idx, ok := m.sessionsSelectedIdx(); ok {
 					m.selectedSession = idx
 					m.activeTab = TabKindChat
@@ -735,6 +736,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 						cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, selSess.daemonSessionID))
 					}
 					cmds = append(cmds, selSess.thinkingAnim.Resume())
+					cmds = append(cmds, armCursorBlink(selSess))
 					if !m.hasAlertSessions() {
 						m.stopTabAlertBlink()
 					}
@@ -750,9 +752,13 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selectedSession = newIdx
 				m.activeTab = TabKindChat
 				cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, newSess.daemonSessionID))
+				cmds = append(cmds, armCursorBlink(newSess))
 				return m, tea.Batch(cmds...)
 			case "d":
 				// Duplicate the selected session into a new one.
+				if _, ok := m.vixSelectedSummary(); ok {
+					return m, m.emitStatusMsg("Open the run first to duplicate it", StatusMsgWarning)
+				}
 				idx, ok := m.sessionsSelectedIdx()
 				if !ok {
 					return m, nil
@@ -769,6 +775,14 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				nm, c := m.doDuplicate(srcSess, lastSep)
 				return nm, c
 			case "x":
+				if sum, ok := m.vixSelectedSummary(); ok {
+					// Dismiss a vix-initiated record: same confirmation dialog
+					// as closing a live session.
+					m.vixDismissID = sum.ID
+					m.sessionCloseSelected = 1 // default No
+					m.state = StateSessionCloseConfirm
+					return m, nil
+				}
 				if idx, ok := m.sessionsSelectedIdx(); ok {
 					m.sessionCloseIdx = idx
 					m.sessionCloseSelected = 1 // default No
@@ -806,9 +820,15 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if settingsItem(m.settingsCursor) == settingCompactionThreshold {
 					m.adjustCompactionThreshold(-0.05)
 				}
+				if settingsItem(m.settingsCursor) == settingClosedRetention {
+					m.adjustClosedRetention(-1)
+				}
 			case "right", "l":
 				if settingsItem(m.settingsCursor) == settingCompactionThreshold {
 					m.adjustCompactionThreshold(0.05)
+				}
+				if settingsItem(m.settingsCursor) == settingClosedRetention {
+					m.adjustClosedRetention(1)
 				}
 			}
 			return m, tea.Batch(cmds...)
@@ -1217,6 +1237,12 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sessionDisconnectedMsg:
 		_, sess := m.findSessionByDaemonID(msg.daemonSessionID)
 		if sess != nil {
+			if sess.closing {
+				// Expected disconnect: the TUI sent session.close (quit flow).
+				// Don't reconnect — attaching again would resurrect the
+				// session the daemon just closed.
+				return m, nil
+			}
 			sess.reconnecting = true
 			sess.pendingInput = nil
 			// If the connection dropped before the replay arrived, abandon the
@@ -1289,7 +1315,8 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case sessionRestoredMsg:
-		// A persisted open session was re-attached on launch. Add it as a new
+		// A persisted open session was re-attached (launch restore, or a
+		// vix-initiated record opened from the Sessions tab). Add it as a new
 		// session; its viewport is rebuilt from the daemon's event.replay.
 		if _, existing := m.findSessionByDaemonID(msg.summary.ID); existing != nil {
 			msg.client.Close()
@@ -1299,15 +1326,110 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.summary.Model != "" {
 			restored.setModel(msg.summary.Model)
 		}
+		// A vix-initiated record (job run, alert) keeps its provenance: the
+		// summary tag keeps it rendered in the Sessions tab's "Vix-initiated"
+		// group while attached. Drop it from the persisted-records group so it
+		// doesn't show twice (the daemon doesn't broadcast on attach).
+		if msg.summary.Origin == "vix" {
+			sum := msg.summary
+			restored.vixSummary = &sum
+			for i, vs := range m.vixSessions {
+				if vs.ID == sum.ID {
+					m.vixSessions = append(m.vixSessions[:i], m.vixSessions[i+1:]...)
+					break
+				}
+			}
+		}
+		// Seed the unread indicator from the persisted flag so activity that
+		// happened while vix was closed (job runs, alerts) survives restarts.
+		// Only a background restore raises the Sessions-tab "unseen" latch: a
+		// user explicitly opening (or stepping onto) a record sets
+		// focusRestoredID to its ID and is marked read below, so re-tinting the
+		// tab title for it — or leaving it tinted because another record is still
+		// unread — would be wrong. The per-row ● dot still tracks unread.
+		if msg.summary.Unread {
+			restored.unreadCount = 1
+			if m.focusRestoredID != msg.summary.ID {
+				m.sessionsTabUnseen = true
+			}
+		}
 		// Restored sessions are waiting for their replay; show the placeholder
 		// (with an animated spinner) until it arrives.
 		restored.awaitingReplay = true
-		m.sessions = append(m.sessions, restored)
-		return m, tea.Batch(startSessionEventLoop(msg.client), restored.thinkingAnim.Start())
+		// Restore attaches run concurrently and complete in arbitrary order, so
+		// insert by creation time instead of appending: place the session before
+		// the first one that started later, keeping the list in the order the
+		// user started the conversations.
+		idx := len(m.sessions)
+		for i, s := range m.sessions {
+			if s.client != nil && s.client.StartedAt().After(msg.client.StartedAt()) {
+				idx = i
+				break
+			}
+		}
+		m.sessions = append(m.sessions, nil)
+		copy(m.sessions[idx+1:], m.sessions[idx:])
+		m.sessions[idx] = restored
+		if idx <= m.selectedSession {
+			m.selectedSession++
+		}
+		// A record the user explicitly opened from the Sessions tab gets
+		// focused immediately (launch restores stay in the background).
+		var focusCmd tea.Cmd
+		if m.focusRestoredID != "" && m.focusRestoredID == msg.summary.ID {
+			m.focusRestoredID = ""
+			m.selectedSession = idx
+			m.activeTab = TabKindChat
+			restored.input.SetWidth(m.width - 4)
+			m.markSessionRead(restored)
+			focusCmd = armCursorBlink(restored)
+		}
+		m.syncSessionsSelected()
+		return m, tea.Batch(startSessionEventLoop(msg.client), restored.thinkingAnim.Start(), focusCmd)
 
 	case sessionRestoreFailedMsg:
 		// Best-effort: a persisted session could not be reopened. Leave it on
 		// disk; it will be offered again on the next launch.
+		return m, nil
+
+	case localProvidersMsg:
+		if m.modelsLocalUI == nil {
+			m.modelsLocalUI = map[string]LocalProviderUI{}
+		}
+		for id, st := range msg.states {
+			m.modelsLocalUI[id] = localProviderUIFromState(st)
+		}
+		// Re-anchor the model cursor: the grid for a local provider may have
+		// just gone from empty to populated.
+		if m.activeTab == TabKindModels {
+			prov := m.modelsSelectedProvider()
+			if IsLocalProvider(prov) && m.modelsFocus != modelsFocusModels {
+				m.modelsModelSel = m.modelIndexForActive(prov, m.activeModelSpec())
+				m.clampModelsScroll()
+			}
+		}
+		return m, nil
+
+	case vixSessionsMsg:
+		m.vixSessions = msg.sums
+		// One-shot launch seeding: unread job runs/alerts that accumulated
+		// while vix was closed tint the Sessions tab. Live arrivals re-latch
+		// via event.job_done; refreshes after the first don't, so a visited
+		// tab stays calm.
+		if !m.vixSeeded {
+			m.vixSeeded = true
+			if m.activeTab != TabKindSessions {
+				for _, sum := range msg.sums {
+					if sum.Unread {
+						m.sessionsTabUnseen = true
+						break
+					}
+				}
+			}
+		}
+		if n := m.sessionsVisibleCount() + len(m.vixSessions); m.sessionsSelected >= n && n > 0 {
+			m.sessionsSelected = n - 1
+		}
 		return m, nil
 
 	case tea.PasteMsg:
@@ -1420,10 +1542,17 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// hasUnreadSessions reports whether any session still has unread agent activity.
+// hasUnreadSessions reports whether any unread conversation remains: a live
+// session with unread agent activity, or a persisted vix-initiated record
+// still flagged unread.
 func (m *Model) hasUnreadSessions() bool {
 	for _, s := range m.sessions {
 		if s.unreadCount > 0 {
+			return true
+		}
+	}
+	for _, sum := range m.vixSessions {
+		if sum.Unread {
 			return true
 		}
 	}
@@ -1433,8 +1562,13 @@ func (m *Model) hasUnreadSessions() bool {
 // markSessionRead clears a session's unread counter and, once no session has
 // unread activity left, lowers the Sessions-tab highlight latch. This lets the
 // highlight clear when the last unread conversation is opened directly, without
-// having to visit the Sessions tab.
+// having to visit the Sessions tab. When something was actually cleared, the
+// daemon is told too (session.mark_read) so the persisted unread flag — the
+// one that survives restarts — drops with it.
 func (m *Model) markSessionRead(sess *SessionState) {
+	if sess.unreadCount > 0 && sess.client != nil {
+		sess.client.SendMarkRead()
+	}
 	sess.unreadCount = 0
 	if !m.hasUnreadSessions() {
 		m.sessionsTabUnseen = false
@@ -1453,7 +1587,10 @@ func (m *Model) switchTab(k TabKind) tea.Cmd {
 	case TabKindSessions:
 		m.sessionsTabUnseen = false
 		m.syncSessionsSelected()
-		return m.maybeStartSessionsSpinner()
+		return tea.Batch(
+			m.maybeStartSessionsSpinner(),
+			fetchVixSessions(m.socketPath, m.cwd, m.cfg.ConfigDir, m.authToken),
+		)
 	case TabKindChat:
 		if sess := m.currentSession(); sess != nil {
 			m.markSessionRead(sess)
@@ -1461,6 +1598,7 @@ func (m *Model) switchTab(k TabKind) tea.Cmd {
 		}
 	case TabKindModels:
 		m.enterModelsTab()
+		return fetchLocalProviders(m.socketPath, m.authToken)
 	}
 	return nil
 }
@@ -1481,7 +1619,7 @@ func (m *Model) enterModelsTab() {
 	active := m.activeModelSpec()
 	prov := ProviderOf(active)
 	m.modelsProviderSel = m.providerFlatIndex(prov)
-	m.modelsModelSel = modelIndexForActive(prov, active)
+	m.modelsModelSel = m.modelIndexForActive(prov, active)
 	m.clampModelsScroll()
 }
 
@@ -1522,6 +1660,7 @@ func (m *Model) refreshModelsProviders() {
 
 	m.modelsLoggedIn = m.modelsLoggedIn[:0]
 	m.modelsAvailable = m.modelsAvailable[:0]
+	m.modelsLocal = m.modelsLocal[:0]
 	if m.modelsStatus == nil {
 		m.modelsStatus = map[string]config.ProviderAuthStatus{}
 	}
@@ -1529,6 +1668,10 @@ func (m *Model) refreshModelsProviders() {
 		m.modelsStatus = cs.Providers
 	}
 	for _, p := range AvailableProviders() {
+		if p.Local {
+			m.modelsLocal = append(m.modelsLocal, p.Name)
+			continue
+		}
 		st := m.modelsStatus[p.Name]
 		if st.HasCredential() {
 			m.modelsLoggedIn = append(m.modelsLoggedIn, p.Name)
@@ -1539,7 +1682,7 @@ func (m *Model) refreshModelsProviders() {
 	if prevProvider != "" {
 		m.modelsProviderSel = m.providerFlatIndex(prevProvider)
 	}
-	total := len(m.modelsLoggedIn) + len(m.modelsAvailable)
+	total := len(m.modelsLoggedIn) + len(m.modelsLocal) + len(m.modelsAvailable)
 	if m.modelsProviderSel >= total {
 		m.modelsProviderSel = total - 1
 	}
@@ -1549,9 +1692,12 @@ func (m *Model) refreshModelsProviders() {
 }
 
 // modelsFlat returns the provider names in display order (logged in, then
-// available) — the order the provider cursor navigates.
+// available, then local last) — the order the provider cursor navigates.
+// Must stay in lockstep with renderModelsView's flat/group order.
 func (m *Model) modelsFlat() []string {
-	return append(append([]string{}, m.modelsLoggedIn...), m.modelsAvailable...)
+	out := append([]string{}, m.modelsLoggedIn...)
+	out = append(out, m.modelsAvailable...)
+	return append(out, m.modelsLocal...)
 }
 
 // modelsSelectedProvider returns the provider name under the provider cursor.
@@ -1574,10 +1720,20 @@ func (m *Model) providerFlatIndex(provider string) int {
 	return 0
 }
 
+// displayModelsForProvider returns the models shown in the grid for a
+// provider: the live-discovered list for local providers (empty until the
+// daemon probe answers), the static catalogue otherwise.
+func (m *Model) displayModelsForProvider(provider string) []ModelInfo {
+	if IsLocalProvider(provider) {
+		return m.modelsLocalUI[provider].Models
+	}
+	return DisplayModelsForProvider(provider)
+}
+
 // modelIndexForActive returns the grid index of spec within a provider's models,
 // or 0 when absent.
-func modelIndexForActive(provider, spec string) int {
-	for i, mod := range DisplayModelsForProvider(provider) {
+func (m *Model) modelIndexForActive(provider, spec string) int {
+	for i, mod := range m.displayModelsForProvider(provider) {
 		if mod.Spec == spec {
 			return i
 		}
@@ -1743,6 +1899,9 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.modelsAuthRow = 0
 				m.modelsAuthBtn = 0
 				m.modelsLoginStatus = ""
+				if IsLocalProvider(m.modelsSelectedProvider()) {
+					cmds = append(cmds, fetchLocalProviders(m.socketPath, m.authToken))
+				}
 			}
 		case "down", "j":
 			if m.modelsProviderSel < len(m.modelsFlat())-1 {
@@ -1753,6 +1912,9 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.modelsAuthRow = 0
 				m.modelsAuthBtn = 0
 				m.modelsLoginStatus = ""
+				if IsLocalProvider(m.modelsSelectedProvider()) {
+					cmds = append(cmds, fetchLocalProviders(m.socketPath, m.authToken))
+				}
 			}
 		case "right", "l", "enter", "tab":
 			m.modelsFocus = modelsFocusAuth
@@ -1794,7 +1956,7 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m.activateAuthButton()
 		}
 	case modelsFocusModels:
-		models := FilterModels(DisplayModelsForProvider(m.modelsSelectedProvider()), m.modelsFilter)
+		models := FilterModels(m.displayModelsForProvider(m.modelsSelectedProvider()), m.modelsFilter)
 		switch msg.String() {
 		case "up":
 			if m.modelsModelSel >= modelGridCols {
@@ -1851,8 +2013,9 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // stays within the visible window. It mirrors the renderer's row math via the
 // shared modelsGridRows helper.
 func (m *Model) clampModelsScroll() {
-	st := m.modelsStatus[m.modelsSelectedProvider()]
-	gridRows := modelsGridRows(m.modelsViewportHeight(), st, m.modelsLoginStatus)
+	provider := m.modelsSelectedProvider()
+	st := m.modelsStatus[provider]
+	gridRows := modelsGridRows(m.modelsViewportHeight(), st, m.modelsLoginStatus, IsLocalProvider(provider))
 	selRow := m.modelsModelSel / modelGridCols
 	if selRow < m.modelsModelScroll {
 		m.modelsModelScroll = selRow
@@ -1878,9 +2041,10 @@ func (m Model) modelsViewportHeight() int {
 
 // selectModel applies the chosen model when its provider has a resolvable
 // credential, otherwise opens the key popup (for the provider's default method)
-// and remembers the pending model.
+// and remembers the pending model. Local providers are always selectable: they
+// resolve a keyless placeholder credential.
 func (m Model) selectModel(mod ModelInfo) (tea.Model, tea.Cmd) {
-	if m.providerHasCredential(mod.Provider) {
+	if IsLocalProvider(mod.Provider) || m.providerHasCredential(mod.Provider) {
 		m.applyModelSelection(mod.Spec)
 		return m, nil
 	}
@@ -2000,36 +2164,48 @@ func (m Model) handleDialogKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if m.state == StateQuitConfirm {
 			if m.quitSelected == 0 {
-				sess := m.currentSession()
-				if sess != nil && sess.client != nil {
-					sess.client.SendCancel()
-					sess.client.SendClose()
-				}
+				m.closeSessionsForQuit(m.quitCloseAll)
 				return m, tea.Quit
 			}
 			m.state = StateWaitingForInput
 		} else {
 			if m.sessionCloseSelected == 0 {
-				return m.doCloseSession(m.sessionCloseIdx)
+				return m.confirmSessionClose()
 			}
+			m.vixDismissID = ""
 			m.state = StateWaitingForInput
+		}
+	case "space", " ":
+		if m.state == StateQuitConfirm {
+			m.quitCloseAll = !m.quitCloseAll
+			_ = config.SetCloseAllSessionsOnQuit(m.quitCloseAll)
 		}
 	case "y", "Y":
 		if m.state == StateQuitConfirm {
-			sess := m.currentSession()
-			if sess != nil && sess.client != nil {
-				sess.client.SendCancel()
-				sess.client.SendClose()
-			}
+			m.closeSessionsForQuit(m.quitCloseAll)
 			return m, tea.Quit
 		}
 		if m.state == StateSessionCloseConfirm {
-			return m.doCloseSession(m.sessionCloseIdx)
+			return m.confirmSessionClose()
 		}
 	case "n", "N", "esc":
+		m.vixDismissID = ""
 		m.state = StateWaitingForInput
 	}
 	return m, nil
+}
+
+// confirmSessionClose runs the action behind the close-confirmation dialog:
+// dismissing a persisted vix-initiated record, or closing the live session at
+// sessionCloseIdx.
+func (m Model) confirmSessionClose() (tea.Model, tea.Cmd) {
+	if m.vixDismissID != "" {
+		id := m.vixDismissID
+		m.vixDismissID = ""
+		m.state = StateWaitingForInput
+		return m, dismissVixSession(m.socketPath, m.cwd, m.cfg.ConfigDir, m.authToken, id)
+	}
+	return m.doCloseSession(m.sessionCloseIdx)
 }
 
 // handleTrimKey handles keys for the per-session trim confirm dialog.
@@ -2206,6 +2382,28 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 		// its spinner.
 		sess.awaitingReplay = false
 		sess.thinkingAnim.Stop()
+		// Viewing the replay counts as reading: clear the persisted unread
+		// flag when this session is the one on screen. Sent unconditionally
+		// (not via markSessionRead) because the disk flag may be set even
+		// when the local counter is zero — e.g. a vix job run just opened.
+		if idx == m.selectedSession && m.activeTab == TabKindChat {
+			sess.unreadCount = 0
+			if !m.hasUnreadSessions() {
+				m.sessionsTabUnseen = false
+			}
+			if sess.client != nil {
+				sess.client.SendMarkRead()
+			}
+		}
+
+	case "event.title_updated":
+		data := marshalData(event.Data)
+		var tu protocol.EventTitleUpdated
+		json.Unmarshal(data, &tu)
+		sess.title = tu.Title
+		if sess.vixSummary != nil {
+			sess.vixSummary.Title = tu.Title
+		}
 
 	case "event.init_state":
 		data := marshalData(event.Data)
@@ -2249,20 +2447,56 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 		m.updateURL = ua.URL
 		m.updateMethod = ua.Method
 
+	case "event.sessions_changed":
+		// The persisted sessions list changed outside this client (a job run
+		// was persisted or swept): refresh the Vix-initiated group.
+		cmds = append(cmds, fetchVixSessions(m.socketPath, m.cwd, m.cfg.ConfigDir, m.authToken))
+
+	case "event.job_done":
+		data := marshalData(event.Data)
+		var jd protocol.EventJobDone
+		json.Unmarshal(data, &jd)
+		text, kind := jobDoneStatusText(jd)
+		m.sessionsTabUnseen = true
+		cmds = append(cmds,
+			m.emitStatusMsg(text, kind),
+			fetchVixSessions(m.socketPath, m.cwd, m.cfg.ConfigDir, m.authToken))
+
+	case "event.job_run":
+		data := marshalData(event.Data)
+		var jr protocol.EventJobRun
+		json.Unmarshal(data, &jr)
+		// Only failures-of-policy are worth a status line; routine starts are
+		// silent (the run will land in the sessions list anyway).
+		switch jr.Status {
+		case "invalid":
+			cmds = append(cmds, m.emitStatusMsg(fmt.Sprintf("Job %s has an invalid spec: %s", jr.JobID, jr.Error), StatusMsgWarning))
+		case "auto_disabled":
+			cmds = append(cmds, m.emitStatusMsg(fmt.Sprintf("Job %s disabled after repeated failures", jr.JobID), StatusMsgError))
+		}
+
+	case "event.job_nudge":
+		// One-time hint emitted when the first user-created job appears.
+		cmds = append(cmds, m.emitStatusMsg("Tip: `vix daemon install` starts vixd at login so scheduled jobs survive reboots", StatusMsgInfo))
+
 	case "event.stream_chunk":
 		data := marshalData(event.Data)
 		var chunk protocol.EventStreamChunk
 		json.Unmarshal(data, &chunk)
 		sess.assistantBuf += chunk.Text
-		sess.assistantRendered = m.mdRenderer.Render(sess.assistantBuf)
+		if time.Since(sess.lastStreamRender) >= streamRenderInterval {
+			sess.assistantRendered = m.mdRenderer.Render(sess.assistantBuf)
+			sess.lastStreamRender = time.Now()
+		}
 
 	case "event.thinking_chunk":
 		data := marshalData(event.Data)
 		var chunk protocol.EventThinkingChunk
 		json.Unmarshal(data, &chunk)
 		sess.thinkingBuf += chunk.Text
-		if sess.showThinking {
+		if sess.showThinking && time.Since(sess.lastThinkingRender) >= streamRenderInterval {
 			sess.thinkingRendered = renderThinkingText(sess.thinkingBuf, m.styles, m.mdRenderer.width+4)
+			sess.lastThinkingRender = time.Now()
 		}
 
 	case "event.stream_done":
@@ -2366,16 +2600,16 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 		var tu protocol.EventTodoListUpdated
 		json.Unmarshal(data, &tu)
 		sess.todos = tu.Todos
-		switch sess.rightPanel.mode {
-		case rpModeWorkflow:
+		switch {
+		case sess.rightPanel.IsVisible() && sess.rightPanel.mode == rpModeWorkflow:
 			// Todos render below workflow steps automatically.
-		case rpModeTodos:
+		case sess.rightPanel.IsVisible() && sess.rightPanel.mode == rpModeTodos:
 			if !hasPendingTodos(sess.todos) {
 				sess.rightPanel.Close()
 				m.updateChatWidth()
 			}
 		default:
-			if !sess.rightPanel.IsVisible() && hasPendingTodos(sess.todos) {
+			if hasPendingTodos(sess.todos) {
 				sess.rightPanel.OpenTodos(m.height)
 				m.updateChatWidth()
 			}
@@ -2453,6 +2687,16 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 			m.updateChatWidth()
 		}
 
+	case "event.workflow_status":
+		data := marshalData(event.Data)
+		var ws protocol.EventWorkflowStatus
+		json.Unmarshal(data, &ws)
+		// "running" transitions (resume) are visible via step events already;
+		// only surface the noteworthy stops.
+		if ws.Status != "running" {
+			sess.chatMessages = append(sess.chatMessages, renderWorkflowStatus(ws.WorkflowName, ws.Status, ws.StepID, ws.Iteration, ws.TokensUsed, ws.TokenBudget, ws.Note, m.styles))
+		}
+
 	case "event.agent_done":
 		sess.thinkingAnim.Stop()
 		m.flushSessionBuf(sess)
@@ -2461,6 +2705,10 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 			if m.activeTab != TabKindSessions {
 				m.sessionsTabUnseen = true
 			}
+		} else if sess.client != nil {
+			// The user watched this turn complete: clear the persisted unread
+			// flag the daemon just set at turn end.
+			sess.client.SendMarkRead()
 		}
 		turnInput := sess.inputTokens - sess.turnStartInputTokens
 		turnOutput := sess.outputTokens - sess.turnStartOutputTokens
@@ -2495,6 +2743,7 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 	case "event.clear":
 		m.flushSessionBuf(sess)
 		sess.chatMessages = nil
+		sess.chatCache.invalidate()
 		sess.pendingTools = nil
 		sess.inputTokens = 0
 		sess.outputTokens = 0
@@ -2535,6 +2784,9 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 		sess.chatMessages = append(sess.chatMessages, renderErrorMessage(fmt.Errorf("%s", errEvent.Message)))
 
 	case "event.quit":
+		// Daemon-driven quit-all (post-update restart). Intentionally no
+		// closeSessionsForQuit: the bare disconnect leaves every record in
+		// open/ so all sessions restore on relaunch.
 		cmds = append(cmds, tea.Quit)
 	}
 
@@ -2591,42 +2843,73 @@ func (m Model) View() tea.View {
 		sessionsHeight := m.height - layout.TabBarHeight - layout.StatusBarHeight
 		spinnerFrame := ""
 		if m.sessionsSpinnerActive {
-			spinnerFrame = string(animFrames[m.sessionsSpinnerStep%len(animFrames)])
+			spinnerFrame = string(animFrames[frozenStep(m.sessionsSpinnerStep)%len(animFrames)])
 		}
-		sv := renderSessionsView(m.sessions, m.width, sessionsHeight, m.styles, m.sessionsSelected, spinnerFrame)
+		// User-initiated sessions render in slice (creation) order; the
+		// Vix-initiated group (live attached + persisted records) renders in one
+		// StartedAt-ordered list, derived from the same canonical row order as
+		// the selection index space (sessionRowTargets).
+		var userSessions []*SessionState
+		for _, sess := range m.sessions {
+			if sess.vixSummary == nil {
+				userSessions = append(userSessions, sess)
+			}
+		}
+		var vixRows []vixDisplayRow
+		for _, r := range m.sessionRowTargets() {
+			switch {
+			case r.sum != nil:
+				vixRows = append(vixRows, vixDisplayRow{sum: *r.sum})
+			case m.sessions[r.liveIdx].vixSummary != nil:
+				live := m.sessions[r.liveIdx]
+				vixRows = append(vixRows, vixDisplayRow{live: live, sum: *live.vixSummary})
+			}
+		}
+		sv := renderSessionsView(userSessions, vixRows, m.width, sessionsHeight, m.styles, m.sessionsSelected, spinnerFrame)
 		uv.NewStyledString(sv).Draw(canvas, image.Rect(0, y, m.width, y+sessionsHeight))
 		y += sessionsHeight
 
 	case TabKindChat:
 		// Chat content
 		innerWidth := layout.ChatWidth - 4
-		var chatContent string
-		if sess != nil {
-			chatContent = buildRenderedChat(sess.chatMessages, m.styles, innerWidth)
+		contentHeight := layout.ChatHeight - 1
+
+		var allLines []string
+		var visualRowStart []int
+		switch {
+		case sess != nil && sess.awaitingReplay && !m.testMode:
+			// While waiting for the replay the spinner runs, which would
+			// otherwise make the content non-empty and bypass the placeholder.
+			placeholder := renderRestoringInline(innerWidth, contentHeight, m.styles, sess.thinkingAnim.View())
+			allLines = strings.Split(placeholder, "\n")
+			visualRowStart = visualRowPrefix(allLines, innerWidth)
+		case sess != nil:
+			tail := ""
 			if sess.showThinking && sess.thinkingRendered != "" {
-				chatContent += sess.thinkingRendered + "\n"
+				tail += sess.thinkingRendered + "\n"
 			}
 			if sess.assistantRendered != "" {
-				chatContent += sess.assistantRendered
+				tail += sess.assistantRendered
 			} else if animFrame := sess.thinkingAnim.View(); animFrame != "" {
-				chatContent += animFrame + "\n"
+				tail += animFrame + "\n"
 			}
-		}
-		if chatContent == "" && !m.testMode {
-			if sess != nil && sess.awaitingReplay {
-				chatContent = renderRestoringInline(innerWidth, layout.ChatHeight-1, m.styles, sess.thinkingAnim.View())
+			lines, rowStart := sess.cachedChatLines(m.styles, innerWidth)
+			if emptyChatLines(lines) && tail == "" && !m.testMode {
+				welcome := renderWelcomeInline(innerWidth, contentHeight, m.styles)
+				allLines = strings.Split(welcome, "\n")
+				visualRowStart = visualRowPrefix(allLines, innerWidth)
 			} else {
-				chatContent = renderWelcomeInline(innerWidth, layout.ChatHeight-1, m.styles)
+				allLines, visualRowStart = combineTail(lines, rowStart, tail, innerWidth)
 			}
+		case !m.testMode:
+			welcome := renderWelcomeInline(innerWidth, contentHeight, m.styles)
+			allLines = strings.Split(welcome, "\n")
+			visualRowStart = visualRowPrefix(allLines, innerWidth)
+		default:
+			allLines = []string{""}
+			visualRowStart = []int{0, 1}
 		}
 
-		contentHeight := layout.ChatHeight - 1
-		allLines := strings.Split(chatContent, "\n")
-
-		visualRowStart := make([]int, len(allLines)+1)
-		for i, line := range allLines {
-			visualRowStart[i+1] = visualRowStart[i] + visualRows(line, innerWidth)
-		}
 		totalVisualRows := visualRowStart[len(allLines)]
 
 		// Scroll lock: when the user has scrolled up (chatScrollOffset > 0),
@@ -2673,7 +2956,7 @@ func (m Model) View() tea.View {
 		accVisRows := 0
 		startLogical := endLogical
 		for startLogical > 0 {
-			rows := visualRows(allLines[startLogical-1], innerWidth)
+			rows := visualRowStart[startLogical] - visualRowStart[startLogical-1]
 			if accVisRows+rows > contentHeight {
 				break
 			}
@@ -2700,8 +2983,18 @@ func (m Model) View() tea.View {
 		} else {
 			chatBorderStyle = m.styles.ViewportBlurredStyle
 		}
-		chatBox := chatBorderStyle.Width(layout.ChatWidth).Height(layout.ChatHeight).
-			Render(strings.Join(chatLines, "\n"))
+		joined := strings.Join(chatLines, "\n")
+		var chatBox string
+		if sess != nil {
+			key := fmt.Sprintf("%d|%d|%t|", layout.ChatWidth, layout.ChatHeight, sess.focus == FocusChat) + joined
+			if key != sess.chatBoxKey {
+				sess.chatBoxKey = key
+				sess.chatBoxRendered = chatBorderStyle.Width(layout.ChatWidth).Height(layout.ChatHeight).Render(joined)
+			}
+			chatBox = sess.chatBoxRendered
+		} else {
+			chatBox = chatBorderStyle.Width(layout.ChatWidth).Height(layout.ChatHeight).Render(joined)
+		}
 		uv.NewStyledString(chatBox).Draw(canvas, image.Rect(0, y, layout.ChatWidth, y+layout.ChatHeight))
 
 		// Right panel
@@ -2749,7 +3042,7 @@ func (m Model) View() tea.View {
 	case TabKindModels:
 		modelsHeight := m.height - layout.TabBarHeight - layout.StatusBarHeight
 		mv := renderModelsView(m.width, modelsHeight, m.styles,
-			m.modelsLoggedIn, m.modelsAvailable, m.modelsStatus,
+			m.modelsLoggedIn, m.modelsLocal, m.modelsAvailable, m.modelsStatus, m.modelsLocalUI,
 			m.modelsProviderSel, m.modelsFocus,
 			m.modelsAuthRow, m.modelsAuthBtn, m.modelsModelSel, m.modelsModelScroll,
 			m.modelsFilter, m.activeModelSpec(), m.modelsLoginStatus)
@@ -2766,6 +3059,7 @@ func (m Model) View() tea.View {
 			telemetry:           config.TelemetryEnabled(),
 			compactionAuto:      config.CompactionAuto(),
 			compactionThreshold: config.CompactionThreshold(),
+			closedRetentionMins: config.ClosedSessionRetentionMinutes(),
 			updateCheck:         config.UpdateCheckEnabled(),
 			updateCurrent:       m.updateCurrent,
 			updateLatest:        m.updateLatest,
@@ -2813,7 +3107,7 @@ func (m Model) View() tea.View {
 
 	// Quit confirm overlay
 	if m.state == StateQuitConfirm {
-		overlay := renderQuitDialog(m.width, m.height, m.styles, m.quitSelected)
+		overlay := renderQuitDialog(m.width, m.height, m.styles, m.quitSelected, m.quitCloseAll)
 		w, h := lipgloss.Size(overlay)
 		center := centerRect(canvas.Bounds(), w, h)
 		uv.NewStyledString(overlay).Draw(canvas, center)
@@ -2829,8 +3123,8 @@ func (m Model) View() tea.View {
 
 	// Session close confirm overlay
 	if m.state == StateSessionCloseConfirm {
-		sessionID := ""
-		if m.sessionCloseIdx >= 0 && m.sessionCloseIdx < len(m.sessions) {
+		sessionID := m.vixDismissID
+		if sessionID == "" && m.sessionCloseIdx >= 0 && m.sessionCloseIdx < len(m.sessions) {
 			if s := m.sessions[m.sessionCloseIdx]; s.client != nil {
 				sessionID = s.client.SessionID()
 			}
@@ -2918,6 +3212,7 @@ func (m *Model) handleCommandAction(action string, sess *SessionState) []tea.Cmd
 		if sess != nil {
 			m.flushSessionBuf(sess)
 			sess.chatMessages = nil
+			sess.chatCache.invalidate()
 		}
 	case "copy_conversation":
 		if sess == nil || len(sess.chatMessages) == 0 {
@@ -2974,10 +3269,7 @@ func (m *Model) handleCommandAction(action string, sess *SessionState) []tea.Cmd
 			_ = config.SetShowThinking(sess.showThinking)
 		}
 	case "quit":
-		if sess != nil && sess.client != nil {
-			sess.client.SendCancel()
-			sess.client.SendClose()
-		}
+		m.closeSessionsForQuit(config.CloseAllSessionsOnQuit())
 		cmds = append(cmds, tea.Quit)
 	default:
 		if strings.HasPrefix(action, "switch_tab_") {
@@ -3018,10 +3310,21 @@ func (m *Model) flushSessionBuf(sess *SessionState) {
 // Restore-time warnings are appended as system messages.
 func (m *Model) applyReplay(sess *SessionState, rep protocol.EventReplay) {
 	sess.chatMessages = m.buildReplayChatMessages(rep)
+	sess.chatCache.invalidate()
 	sess.todos = rep.Todos
+	if !sess.rightPanel.IsVisible() && hasPendingTodos(sess.todos) {
+		sess.rightPanel.OpenTodos(m.height)
+		m.updateChatWidth()
+	}
 	sess.activePlan = rep.ActivePlan
 	if rep.Model != "" {
 		sess.setModel(rep.Model)
+	}
+	if rep.Title != "" {
+		sess.title = rep.Title
+		if sess.vixSummary != nil {
+			sess.vixSummary.Title = rep.Title
+		}
 	}
 	sess.activeWorkflow = rep.ActiveWorkflow
 	for _, w := range rep.Warnings {
@@ -3039,11 +3342,17 @@ func (m *Model) buildReplayChatMessages(rep protocol.EventReplay) []ChatMessage 
 	var out []ChatMessage
 	toolNames := map[string]string{}
 	for _, msg := range rep.Messages {
+		var ts time.Time
+		if msg.Timestamp != "" {
+			if parsed, err := time.Parse(time.RFC3339, msg.Timestamp); err == nil {
+				ts = parsed
+			}
+		}
 		for _, b := range msg.Blocks {
 			switch b.Kind {
 			case "text":
 				if msg.Role == "user" {
-					out = append(out, renderUserMessage(b.Text, m.width))
+					out = append(out, renderUserMessageAt(b.Text, m.width, ts))
 				} else {
 					out = append(out, renderAssistantMessage(b.Text, m.mdRenderer))
 				}
@@ -3108,28 +3417,22 @@ func (m *Model) visualLineCount() int {
 func (m *Model) sessionMaxScrollOffset(sess *SessionState) int {
 	layout := computeLayout(m.width, m.height, m.visualLineCount())
 	contentHeight := layout.ChatHeight - 1
-	chatWidth := layout.ChatWidth
-	if sess.rightPanel.IsVisible() {
-		chatWidth = m.width - sess.rightPanel.PanelWidth()
-		if chatWidth < 10 {
-			chatWidth = 10
-		}
-	}
-	innerWidth := chatWidth - 4
-	chatContent := buildRenderedChat(sess.chatMessages, m.styles, innerWidth)
+	innerWidth := m.effectiveChatWidth() - 4
+	tail := ""
 	if sess.showThinking && sess.thinkingRendered != "" {
-		chatContent += sess.thinkingRendered + "\n"
+		tail += sess.thinkingRendered + "\n"
 	}
 	if sess.assistantRendered != "" {
-		chatContent += sess.assistantRendered
+		tail += sess.assistantRendered
 	}
-	if chatContent == "" && !m.testMode {
-		chatContent = renderWelcomeInline(innerWidth, contentHeight, m.styles)
+	lines, rowStart := sess.cachedChatLines(m.styles, innerWidth)
+	if emptyChatLines(lines) && tail == "" {
+		// Empty transcript: the welcome screen is generated to fit the
+		// viewport, so there is nothing to scroll.
+		return 0
 	}
-	totalVisualRows := 0
-	for _, line := range strings.Split(chatContent, "\n") {
-		totalVisualRows += visualRows(line, innerWidth)
-	}
+	_, rowStart = combineTail(lines, rowStart, tail, innerWidth)
+	totalVisualRows := rowStart[len(rowStart)-1]
 	maxOff := totalVisualRows - contentHeight
 	if maxOff < 0 {
 		return 0
@@ -3317,20 +3620,17 @@ func (m *Model) gotoTurn(sess *SessionState, turnNum int) {
 	// Rebuild the rendered chat and a visual-row prefix sum, mirroring the
 	// renderer (and sessionMaxScrollOffset), to convert the logical line into a
 	// from-bottom scroll offset.
-	chatContent := buildRenderedChat(sess.chatMessages, m.styles, innerWidth)
+	tail := ""
 	if sess.showThinking && sess.thinkingRendered != "" {
-		chatContent += sess.thinkingRendered + "\n"
+		tail += sess.thinkingRendered + "\n"
 	}
 	if sess.assistantRendered != "" {
-		chatContent += sess.assistantRendered
+		tail += sess.assistantRendered
 	}
-	allLines := strings.Split(chatContent, "\n")
+	lines, rowStart := sess.cachedChatLines(m.styles, innerWidth)
+	allLines, visualRowStart := combineTail(lines, rowStart, tail, innerWidth)
 	if targetLine > len(allLines) {
 		targetLine = len(allLines)
-	}
-	visualRowStart := make([]int, len(allLines)+1)
-	for i, line := range allLines {
-		visualRowStart[i+1] = visualRowStart[i] + visualRows(line, innerWidth)
 	}
 	totalVisualRows := visualRowStart[len(allLines)]
 	startVisRow := visualRowStart[targetLine]
@@ -3362,11 +3662,11 @@ func (m *Model) doFork(sep TurnSepInfo) (Model, tea.Cmd) {
 	m.sessions = append(m.sessions, newSess)
 	m.selectedSession = newIdx
 
-	return *m, connectFork(
+	return *m, tea.Batch(connectFork(
 		m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken,
 		m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess,
 		forkSessionID, sep.TurnIdx, newSess.daemonSessionID,
-	)
+	), armCursorBlink(newSess))
 }
 
 // doDuplicate creates a new session that is a full copy of srcSess, seeded with
@@ -3390,11 +3690,11 @@ func (m *Model) doDuplicate(srcSess *SessionState, sep TurnSepInfo) (Model, tea.
 	m.selectedSession = newIdx
 	m.syncSessionsSelected()
 
-	return *m, connectFork(
+	return *m, tea.Batch(connectFork(
 		m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken,
 		m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess,
 		forkSessionID, sep.TurnIdx, newSess.daemonSessionID,
-	)
+	), armCursorBlink(newSess))
 }
 
 // doTrim trims the current session's history to sep and tells the daemon to match.
@@ -3403,6 +3703,7 @@ func (m *Model) doTrim(sep TurnSepInfo) (Model, tea.Cmd) {
 	trimmed := make([]ChatMessage, sep.MsgIdx+1)
 	copy(trimmed, sess.chatMessages[:sep.MsgIdx+1])
 	sess.chatMessages = trimmed
+	sess.chatCache.invalidate()
 	sess.chatScrollOffset = 0
 	m.clampScrollOffset(sess)
 	sess.agentState = sess.trimPrevState
@@ -3415,6 +3716,33 @@ func (m *Model) doTrim(sep TurnSepInfo) (Model, tea.Cmd) {
 		return nil
 	}
 	return *m, cmd
+}
+
+// closeSessionsForQuit runs right before the TUI exits. When closeAll is set
+// (the quit-dialog checkbox / persisted preference), every session is
+// explicitly closed: session.close moves each record open/ -> closed/ in the
+// daemon, so nothing is restored on next launch. When unset, it sends nothing —
+// the process exit bare-disconnects every connection; the daemon cancels any
+// running agent on EOF and leaves all records in open/ for next-run restore.
+//
+// Deliberately not called from the update quit-all flow (handleUpdateAction,
+// event.quit): an update quit is a restart, not an exit, so sessions must
+// survive it regardless of the preference.
+func (m *Model) closeSessionsForQuit(closeAll bool) {
+	if !closeAll {
+		return
+	}
+	for _, sess := range m.sessions {
+		if sess.client != nil {
+			// Mark the session so the disconnect that follows session.close is
+			// treated as expected rather than triggering a reconnect (which
+			// would race the daemon's open/ -> closed/ move and resurrect the
+			// record in open/).
+			sess.closing = true
+			sess.client.SendCancel()
+			sess.client.SendClose()
+		}
+	}
 }
 
 // doCloseSession closes the session at sessionIdx and returns to the Sessions tab.
@@ -3448,12 +3776,16 @@ func (m *Model) doCloseSession(sessionIdx int) (Model, tea.Cmd) {
 		reconnectCmd = attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, newSess.daemonSessionID)
 	}
 
-	if n := m.sessionsVisibleCount(); n > 0 && m.sessionsSelected >= n {
+	// Keep the Sessions-tab cursor on the same row index: the closed row was the
+	// highlighted one, so the next session slides into its place. Clamp against
+	// the full row count (live sessions + persisted vix records). Do NOT call
+	// syncSessionsSelected here — it would snap the highlight onto the active
+	// workspace session's row (usually a user-initiated one).
+	if n := m.sessionsVisibleCount() + len(m.vixSessions); n > 0 && m.sessionsSelected >= n {
 		m.sessionsSelected = n - 1
 	}
 
 	m.activeTab = TabKindSessions
-	m.syncSessionsSelected()
 	m.state = StateWaitingForInput
 	return *m, tea.Batch(reconnectCmd, m.maybeStartSessionsSpinner())
 }
@@ -3505,15 +3837,133 @@ func (m *Model) rerenderSessionMessages() {
 	for i, msg := range sess.chatMessages {
 		sess.chatMessages[i] = msg.rerender(m.mdRenderer, m.styles, width)
 	}
+	sess.chatCache.invalidate()
 }
 
-// visibleSessionIndices returns the indices of all sessions.
-func (m *Model) visibleSessionIndices() []int {
-	indices := make([]int, len(m.sessions))
-	for i := range m.sessions {
-		indices[i] = i
+// rowTarget identifies what a single Sessions-tab row points at: a live session
+// (liveIdx is an index into m.sessions, sum == nil) or a persisted, not-attached
+// vix-initiated record (liveIdx == -1, sum != nil).
+type rowTarget struct {
+	liveIdx int
+	sum     *protocol.SessionSummary
+}
+
+// rowStartedAt returns the creation time used to order the Vix-initiated group.
+// A live vix session carries its origin record in vixSummary, so a record keeps
+// the same StartedAt — and therefore the same list position — when it
+// transitions from persisted to attached (on read).
+func (m *Model) rowStartedAt(r rowTarget) time.Time {
+	var raw string
+	switch {
+	case r.sum != nil:
+		raw = r.sum.StartedAt
+	case r.liveIdx >= 0 && r.liveIdx < len(m.sessions):
+		if vs := m.sessions[r.liveIdx].vixSummary; vs != nil {
+			raw = vs.StartedAt
+		}
 	}
-	return indices
+	t, _ := time.Parse(time.RFC3339, raw)
+	return t
+}
+
+// sessionRowTargets returns one entry per Sessions-tab row in display order:
+// user-initiated live sessions first (slice/creation order), then the
+// Vix-initiated group — live attached records and persisted not-attached
+// records merged into a single list ordered by StartedAt. Ordering the vix
+// group by StartedAt (rather than live-first) keeps a record in place when it
+// becomes attached on read. The slice index is the selection row index
+// (m.sessionsSelected).
+func (m *Model) sessionRowTargets() []rowTarget {
+	var rows, vix []rowTarget
+	for i, s := range m.sessions {
+		if s.vixSummary != nil {
+			vix = append(vix, rowTarget{liveIdx: i})
+		} else {
+			rows = append(rows, rowTarget{liveIdx: i})
+		}
+	}
+	for idx := range m.vixSessions {
+		vix = append(vix, rowTarget{liveIdx: -1, sum: &m.vixSessions[idx]})
+	}
+	sort.SliceStable(vix, func(a, b int) bool {
+		return m.rowStartedAt(vix[a]).Before(m.rowStartedAt(vix[b]))
+	})
+	return append(rows, vix...)
+}
+
+// visibleSessionIndices returns the indices of all live sessions in Sessions-tab
+// row order (user-initiated first, then attached vix-initiated ones in the same
+// order they render). Persisted, not-attached records are skipped.
+func (m *Model) visibleSessionIndices() []int {
+	var out []int
+	for _, r := range m.sessionRowTargets() {
+		if r.sum == nil {
+			out = append(out, r.liveIdx)
+		}
+	}
+	return out
+}
+
+// armCursorBlink re-focuses a session's input and returns the command that
+// restarts its cursor blink loop. The blink is a self-rescheduling BlinkMsg
+// chain keyed to one cursor's id; switching the active workspace session
+// orphans the previous session's chain (its BlinkMsgs are routed to the new
+// input and dropped on id mismatch) without starting one for the new cursor.
+// Every switch must re-arm the loop or the cursor freezes — sometimes in its
+// hidden phase, so it looks like it disappeared — until the user types.
+func armCursorBlink(sess *SessionState) tea.Cmd {
+	if sess == nil {
+		return nil
+	}
+	return sess.input.Focus()
+}
+
+// stepWorkspaceSession moves the workspace to the next (dir > 0) or previous
+// (dir < 0) session in Sessions-tab display order (user-initiated first, then
+// vix-initiated) — which can differ from m.sessions slice order, since
+// attached sessions are inserted by creation time. Reports false when there is
+// no session in that direction.
+func (m *Model) stepWorkspaceSession(dir int) ([]tea.Cmd, bool) {
+	order := m.visibleSessionIndices()
+	pos := -1
+	for i, idx := range order {
+		if idx == m.selectedSession {
+			pos = i
+			break
+		}
+	}
+	next := pos + dir
+	if pos < 0 || next < 0 {
+		return nil, false
+	}
+	if next >= len(order) {
+		// Past the last live session: the rows below are the persisted,
+		// not-yet-attached vix-initiated records. Attach the first one — same
+		// as pressing enter on it in the Sessions tab; the replay's
+		// sessionRestoredMsg focuses it and marks it read.
+		if len(m.vixSessions) > 0 {
+			sum := m.vixSessions[0]
+			m.focusRestoredID = sum.ID
+			return []tea.Cmd{attachRestoreSession(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, sum)}, true
+		}
+		return nil, false
+	}
+	var cmds []tea.Cmd
+	m.selectedSession = order[next]
+	m.activeTab = TabKindChat
+	selSess := m.sessions[m.selectedSession]
+	m.markSessionRead(selSess)
+	selSess.input.SetWidth(m.width - 4)
+	if selSess.client == nil && !selSess.reconnecting {
+		selSess.reconnecting = true
+		cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, selSess.daemonSessionID))
+	}
+	cmds = append(cmds, selSess.thinkingAnim.Resume())
+	cmds = append(cmds, armCursorBlink(selSess))
+	if !m.hasAlertSessions() {
+		m.stopTabAlertBlink()
+	}
+	return cmds, true
 }
 
 // sessionsVisibleCount returns the number of visible sessions (after filter).
@@ -3524,21 +3974,40 @@ func (m *Model) sessionsVisibleCount() int {
 // syncSessionsSelected sets sessionsSelected to the visible row that corresponds
 // to the currently active workspace session (selectedSession).
 func (m *Model) syncSessionsSelected() {
-	for i, idx := range m.visibleSessionIndices() {
-		if idx == m.selectedSession {
+	for i, r := range m.sessionRowTargets() {
+		if r.sum == nil && r.liveIdx == m.selectedSession {
 			m.sessionsSelected = i
 			return
 		}
 	}
 }
 
-// sessionsSelectedIdx returns the session index for the highlighted row.
+// sessionsSelectedIdx returns the m.sessions index for the highlighted row, when
+// that row is a live session. Persisted vix-initiated rows report false (use
+// vixSelectedSummary for those).
 func (m *Model) sessionsSelectedIdx() (int, bool) {
-	indices := m.visibleSessionIndices()
-	if m.sessionsSelected < 0 || m.sessionsSelected >= len(indices) {
+	rows := m.sessionRowTargets()
+	if m.sessionsSelected < 0 || m.sessionsSelected >= len(rows) {
 		return 0, false
 	}
-	return indices[m.sessionsSelected], true
+	r := rows[m.sessionsSelected]
+	if r.sum != nil {
+		return 0, false
+	}
+	return r.liveIdx, true
+}
+
+// vixSelectedSummary returns the vix-initiated record for the highlighted row,
+// when that row is a persisted, not-attached record.
+func (m *Model) vixSelectedSummary() (protocol.SessionSummary, bool) {
+	rows := m.sessionRowTargets()
+	if m.sessionsSelected < 0 || m.sessionsSelected >= len(rows) {
+		return protocol.SessionSummary{}, false
+	}
+	if r := rows[m.sessionsSelected]; r.sum != nil {
+		return *r.sum, true
+	}
+	return protocol.SessionSummary{}, false
 }
 
 // hasAlertSessions reports whether any session is waiting for user input.

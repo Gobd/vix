@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/get-vix/vix/internal/config"
@@ -22,74 +23,43 @@ import (
 	"github.com/get-vix/vix/internal/daemon/mcp"
 	promptloader "github.com/get-vix/vix/internal/daemon/prompt"
 	"github.com/get-vix/vix/internal/protocol"
+	wf "github.com/get-vix/vix/internal/workflow"
 )
 
 // ErrMaxTokens is returned when the LLM response was truncated due to the output token limit.
 var ErrMaxTokens = errors.New("max_tokens")
 
-// InputDef declares an expected input parameter.
-type InputDef struct {
-	Description string `json:"description"`
-}
+// The workflow data model (definitions, steps, budget) and its loader/validator
+// live in the standalone internal/workflow package so the daemon, jobs, and
+// hooks packages can all share one definition without import cycles. These
+// aliases re-expose the moved types under their historical daemon names so the
+// large execution engine below compiles unchanged. WorkflowBudget is aliased
+// here too (its struct moved out of workflow_state.go).
+type (
+	InputDef        = wf.InputDef
+	StepRef         = wf.StepRef
+	WorkflowDef     = wf.Def
+	StepOption      = wf.StepOption
+	WorkflowStepDef = wf.StepDef
+	WorkflowBudget  = wf.Budget
+	workflowsFile   = wf.File
+)
 
-// StepRef is a structured reference to a workflow step with optional parameter mappings.
-type StepRef struct {
-	ID        string            `json:"id"`
-	Params    map[string]string `json:"params,omitempty"`
-	ExecuteIf string            `json:"execute_if,omitempty"`
-}
+// LoadWorkflowsFile reads a config/workflow.json file and returns its validated
+// workflow list. Thin wrapper over workflow.Load kept under the historical name
+// used across the daemon and its tests.
+func LoadWorkflowsFile(path string) []*WorkflowDef { return wf.Load(path) }
 
-// WorkflowDef is the parsed config for a workflow.
-type WorkflowDef struct {
-	Name       string                     `json:"name"`
-	EntryPoint StepRef                    `json:"entry_point"`
-	Steps      map[string]WorkflowStepDef `json:"steps"`
-	Summary    string                     `json:"summary,omitempty"`
-}
-
-// StepOption is a structured option for tool steps using ask_question_to_user.
-type StepOption struct {
-	Title        string    `json:"title"`
-	Description  string    `json:"description"`
-	Steps        []StepRef `json:"steps,omitempty"`
-	HasUserInput bool      `json:"has_user_input,omitempty"`
-}
-
-// WorkflowStepDef defines one step in the workflow.
-type WorkflowStepDef struct {
-	Type        string              `json:"type"`                   // "agent", "tool", or "bash" (required)
-	Effort      string              `json:"effort,omitempty"`       // "adaptive", "low", "medium", "high", "max"
-	NextSteps   []StepRef           `json:"next_steps,omitempty"`   // next steps to execute (empty = end workflow)
-	InputParams map[string]InputDef `json:"input_params,omitempty"` // declared input parameters for this step
-	Tool        string              `json:"tool,omitempty"`         // tool name for type="tool"
-	Agent       string              `json:"agent,omitempty"`        // agent name (loaded from .vix/agents/)
-	ForkFrom    string              `json:"fork_from,omitempty"`    // fork from a prior step's agent
-	Prompt      string              `json:"prompt,omitempty"`       // template, supports $() syntax
-	Command     string              `json:"command,omitempty"`      // bash command for type="bash"
-	Input       string              `json:"input,omitempty"`        // piped to stdin (supports $() expansion)
-	Output      string              `json:"output,omitempty"`       // file path to write step text output
-	DenyTools   []string            `json:"deny_tools,omitempty"`   // tools blocked from executing
-	Stream      *bool               `json:"stream,omitempty"`       // nil defaults to true
-	Silent      bool                `json:"silent,omitempty"`       // suppress all TUI events + vixd dispatch logs for this step
-	JSONOutput  bool                `json:"json_output,omitempty"`  // parse LLM output as JSON for variable expansion
-	DisplayKey  string              `json:"display_key,omitempty"`  // JSON key to extract as per-step display text
-	Explanation string              `json:"explanation,omitempty"`  // user-facing explanation shown at step start
-	Question    string              `json:"question,omitempty"`     // question text for tool steps
-	Options     []StepOption        `json:"options,omitempty"`      // structured options for ask_question_to_user
-	Category    string              `json:"category,omitempty"`     // tab/category label for ask_question_to_user
-	TimeoutSec  *int                `json:"timeout_sec,omitempty"`  // per-step timeout (type="bash" only); pointer distinguishes absent from 0
-}
-
-// IsStreamVisible returns whether streaming output should be shown for this step.
-func (s *WorkflowStepDef) IsStreamVisible() bool {
-	return s.Stream == nil || *s.Stream
-}
+// validateWorkflow checks that a workflow definition is consistent. Thin
+// wrapper over workflow.Validate kept under the historical name used across the
+// daemon and its tests.
+func validateWorkflow(pf *WorkflowDef) error { return wf.Validate(pf) }
 
 // StepResult holds output from a completed workflow step.
 type StepResult struct {
-	Output string
-	Parsed map[string]any    // nil if json_output was false or parse failed
-	Params map[string]string // input params received by this step
+	Output string            `json:"output"`
+	Parsed map[string]any    `json:"parsed,omitempty"` // nil if json_output was false or parse failed
+	Params map[string]string `json:"params,omitempty"` // input params received by this step
 }
 
 // AgentRunner is a persistent agent with maintained history.
@@ -107,6 +77,16 @@ type AgentRunner struct {
 	// fall back to package defaults in the dispatcher.
 	ToolTimeouts ToolTimeouts
 
+	// plugins is the daemon's plugin source, kept so Clone rebuilds its client
+	// with the same request overrides as the original runner.
+	plugins PluginSource
+
+	// contextInjected guards the one-time injection (by
+	// Session.ensureWorkflowAgentContext) of the session's project-context
+	// system blocks (CLAUDE.md/AGENTS.md + skills metadata) and the `skill`
+	// tool, so a step that calls Send more than once doesn't duplicate them.
+	contextInjected bool
+
 	// Per-Send() accumulated usage (reset at start of each Send call)
 	LastInputTokens         int64
 	LastOutputTokens        int64
@@ -120,6 +100,138 @@ type WorkflowRun struct {
 	Def         *WorkflowDef
 	StepAgents  map[string]*AgentRunner // step_id -> runner used
 	StepResults map[string]*StepResult  // step_id -> result
+	State       *WorkflowRunState       // live persisted position/accounting for this run
+
+	// transcript accumulates the user-visible output of agent steps in
+	// execution order so it can be mirrored into the session's chat transcript
+	// (s.messages) when the run finalizes — letting a finished run replay and a
+	// follow-up chat turn pick up with real context. Guarded by transcriptMu
+	// because parallel steps append concurrently.
+	transcriptMu sync.Mutex
+	transcript   []workflowTranscriptEntry
+}
+
+// workflowTranscriptEntry is one visible agent step's output captured for the
+// chat transcript.
+type workflowTranscriptEntry struct {
+	StepID      string
+	Explanation string
+	Output      string
+}
+
+// recordTranscriptEntry captures a visible agent step's output for later mirror
+// into the session transcript. No-op for empty output.
+func (r *WorkflowRun) recordTranscriptEntry(step WorkflowStepDef, stepID, output string) {
+	if step.Type != "agent" || step.Silent || !step.IsStreamVisible() {
+		return
+	}
+	if strings.TrimSpace(output) == "" {
+		return
+	}
+	r.transcriptMu.Lock()
+	r.transcript = append(r.transcript, workflowTranscriptEntry{
+		StepID:      stepID,
+		Explanation: step.Explanation,
+		Output:      output,
+	})
+	r.transcriptMu.Unlock()
+}
+
+// snapshotTranscript returns a copy of the accumulated transcript entries.
+func (r *WorkflowRun) snapshotTranscript() []workflowTranscriptEntry {
+	r.transcriptMu.Lock()
+	defer r.transcriptMu.Unlock()
+	return append([]workflowTranscriptEntry(nil), r.transcript...)
+}
+
+// appendWorkflowTranscript mirrors a run's agent output into the chat transcript
+// (s.messages) so a finished workflow replays in a freshly attached TUI and a
+// follow-up chat message picks up with real context. For each visible agent step
+// (in execution order, deduplicated by step id) it splices the step agent's FULL
+// working history — the resolved prompt, every tool_use and tool_result, and the
+// final text — so the persisted conversation reflects what the agent actually
+// did. A follow-up turn is then grounded in those real tool calls rather than a
+// lossy summary. Thinking blocks are dropped (their signatures can't be
+// revalidated once re-sent under the session's own system prompt). A visible
+// agent step without an agent instance falls back to a user(anchor)→assistant
+// (text) pair. No-op when nothing visible was produced.
+func (s *Session) appendWorkflowTranscript(anchor string, exec *WorkflowRun) {
+	entries := exec.snapshotTranscript()
+	if len(entries) == 0 {
+		return
+	}
+	if strings.TrimSpace(anchor) == "" {
+		anchor = "Workflow run"
+	}
+	var msgs []llm.MessageParam
+	seen := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if seen[e.StepID] {
+			continue
+		}
+		seen[e.StepID] = true
+		if agent := exec.StepAgents[e.StepID]; agent != nil && len(agent.Messages) > 0 {
+			msgs = append(msgs, stripThinkingMessages(agent.Messages)...)
+			continue
+		}
+		// No agent instance (shouldn't happen for a visible agent step): keep the
+		// step's text behind a kickoff anchor so nothing is lost.
+		msgs = append(msgs,
+			llm.NewUserMessage(llm.NewTextBlock(anchor)),
+			llm.NewAssistantMessage(llm.NewTextBlock(strings.TrimRight(e.Output, "\n"))),
+		)
+	}
+	if len(msgs) == 0 {
+		return
+	}
+	msgs = coalesceRoles(msgs)
+	s.mu.Lock()
+	s.appendMessages(msgs...)
+	s.mu.Unlock()
+}
+
+// stripThinkingMessages copies msgs, dropping BlockThinking blocks. Messages
+// left with no content after the strip are omitted so the result stays
+// well-formed. Inputs are not mutated.
+func stripThinkingMessages(msgs []llm.MessageParam) []llm.MessageParam {
+	out := make([]llm.MessageParam, 0, len(msgs))
+	for _, m := range msgs {
+		blocks := make([]llm.ContentBlock, 0, len(m.Content))
+		for _, b := range m.Content {
+			if b.Type == llm.BlockThinking {
+				continue
+			}
+			blocks = append(blocks, b)
+		}
+		if len(blocks) == 0 {
+			continue
+		}
+		cp := m
+		cp.Content = blocks
+		out = append(out, cp)
+	}
+	return out
+}
+
+// coalesceRoles merges consecutive messages that share a role into one, keeping
+// user/assistant alternation valid when several step histories are concatenated
+// back-to-back (e.g. one step ending on a tool_result user turn followed by the
+// next step's user prompt). Block order is preserved; content is copied so the
+// inputs are not mutated.
+func coalesceRoles(msgs []llm.MessageParam) []llm.MessageParam {
+	out := make([]llm.MessageParam, 0, len(msgs))
+	for _, m := range msgs {
+		if n := len(out); n > 0 && out[n-1].Role == m.Role {
+			merged := append([]llm.ContentBlock(nil), out[n-1].Content...)
+			out[n-1].Content = append(merged, m.Content...)
+			if out[n-1].Timestamp.IsZero() {
+				out[n-1].Timestamp = m.Timestamp
+			}
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // FeatureToolOrchestrator is the feature flag name for the tool orchestrator mode.
@@ -570,153 +682,6 @@ func PersistAllowedDirectory(configPath string, dirs []string) error {
 	return os.Rename(tmp.Name(), configPath)
 }
 
-// workflowsFile is the JSON shape of config/workflow.json: {"workflows": [...]}.
-type workflowsFile struct {
-	Workflows []WorkflowDef `json:"workflows"`
-}
-
-// LoadWorkflowsFile reads a config/workflow.json file and returns its
-// validated workflow list, preserving file order. Returns nil on a missing
-// file or parse error; individually invalid workflows are skipped with a log
-// line. Duplicate names within the file are disambiguated by appending an
-// index so the UI can tell them apart.
-func LoadWorkflowsFile(path string) []*WorkflowDef {
-	if path == "" {
-		return nil
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	var cfg workflowsFile
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		LogError("[workflow] failed to parse %s: %v", path, err)
-		return nil
-	}
-
-	out := make([]*WorkflowDef, 0, len(cfg.Workflows))
-	for i := range cfg.Workflows {
-		wf := cfg.Workflows[i]
-		if err := validateWorkflow(&wf); err != nil {
-			LogError("[workflow] invalid workflow '%s': %v", wf.Name, err)
-			continue
-		}
-		out = append(out, &wf)
-	}
-
-	// Disambiguate duplicate names within the single file.
-	nameCount := make(map[string]int)
-	for _, wf := range out {
-		nameCount[wf.Name]++
-	}
-	seen := make(map[string]int)
-	for _, wf := range out {
-		if nameCount[wf.Name] > 1 {
-			seen[wf.Name]++
-			wf.Name = fmt.Sprintf("%s (%d)", wf.Name, seen[wf.Name])
-		}
-	}
-	return out
-}
-
-// validateWorkflow checks that a workflow definition is consistent.
-func validateWorkflow(pf *WorkflowDef) error {
-	if pf.Name == "" {
-		return fmt.Errorf("missing name")
-	}
-	if len(pf.Steps) == 0 {
-		return fmt.Errorf("no steps defined")
-	}
-
-	for stepID := range pf.Steps {
-		if stepID == "" {
-			return fmt.Errorf("step has empty id")
-		}
-	}
-
-	if pf.EntryPoint.ID == "" {
-		return fmt.Errorf("missing entry_point")
-	}
-	if _, ok := pf.Steps[pf.EntryPoint.ID]; !ok {
-		return fmt.Errorf("entry_point '%s' references unknown step", pf.EntryPoint.ID)
-	}
-
-	for stepID, step := range pf.Steps {
-		if step.Type == "" {
-			return fmt.Errorf("step '%s': missing type", stepID)
-		}
-		if step.Type != "agent" && step.Type != "tool" && step.Type != "bash" {
-			return fmt.Errorf("step '%s': unknown type '%s' (must be 'agent', 'tool', or 'bash')", stepID, step.Type)
-		}
-
-		for _, ns := range step.NextSteps {
-			if ns.ID != "" && ns.ID != "stop" {
-				if _, ok := pf.Steps[ns.ID]; !ok {
-					return fmt.Errorf("step '%s': next_step '%s' references unknown step", stepID, ns.ID)
-				}
-			}
-		}
-
-		if step.Type == "tool" {
-			if step.Tool == "" {
-				return fmt.Errorf("step '%s': type 'tool' requires 'tool' field", stepID)
-			}
-			for _, opt := range step.Options {
-				for _, s := range opt.Steps {
-					if s.ID != "" && s.ID != "stop" {
-						if _, ok := pf.Steps[s.ID]; !ok {
-							return fmt.Errorf("step '%s' option '%s' step references unknown step '%s'", stepID, opt.Title, s.ID)
-						}
-					}
-				}
-			}
-			continue
-		}
-
-		if step.Type == "bash" {
-			if step.Command == "" {
-				return fmt.Errorf("step '%s': type 'bash' requires 'command' field", stepID)
-			}
-			if step.Agent != "" || step.ForkFrom != "" || step.Prompt != "" {
-				return fmt.Errorf("step '%s': type 'bash' cannot have 'agent', 'fork_from', or 'prompt'", stepID)
-			}
-			if step.TimeoutSec != nil && *step.TimeoutSec <= 0 {
-				return fmt.Errorf("step '%s': timeout_sec must be > 0", stepID)
-			}
-			continue
-		}
-
-		// timeout_sec is only enforced on bash steps today; reject it elsewhere
-		// rather than silently ignoring so configs fail loudly at load time.
-		if step.TimeoutSec != nil {
-			return fmt.Errorf("step '%s': timeout_sec only valid on type='bash'", stepID)
-		}
-
-		// Agent step validation
-		hasAgent := step.Agent != ""
-		hasFork := step.ForkFrom != ""
-
-		if !hasAgent && !hasFork {
-			return fmt.Errorf("step '%s': must have either 'agent' or 'fork_from'", stepID)
-		}
-		if hasAgent && hasFork {
-			return fmt.Errorf("step '%s': cannot have both 'agent' and 'fork_from'", stepID)
-		}
-
-		if hasFork {
-			if _, ok := pf.Steps[step.ForkFrom]; !ok {
-				return fmt.Errorf("step '%s': fork_from '%s' references unknown step", stepID, step.ForkFrom)
-			}
-		}
-
-		if step.Prompt == "" {
-			return fmt.Errorf("step '%s': missing prompt", stepID)
-		}
-	}
-
-	return nil
-}
-
 // envVars returns template variables describing the runtime environment.
 func envVars(cwd, model string) map[string]string {
 	vars := map[string]string{
@@ -752,22 +717,13 @@ func envVars(cwd, model string) map[string]string {
 // prompt includes from, in precedence order (highest first).
 // toolTimeouts carries the parent session's tool_timeouts bounds so the
 // runner's tool dispatches honour the same settings.json floor/cap.
-func NewAgentRunner(config SubagentConfig, cred config.Credential, parentModel, cwd string, toolTimeouts ToolTimeouts, searchDirs ...string) (*AgentRunner, error) {
-	model := config.Model
-	if model == "" {
-		model = parentModel
-	}
-
+func NewAgentRunner(config SubagentConfig, cred config.Credential, parentModel, cwd string, plugins PluginSource, toolTimeouts ToolTimeouts, searchDirs ...string) (*AgentRunner, error) {
 	maxTurns := config.MaxTurns
 	if maxTurns <= 0 {
 		maxTurns = 20
 	}
 
-	effort := config.Effort
-	if effort == "" {
-		effort = llm.DefaultEffortFromSpec(model)
-	}
-	client, err := llm.NewFromModel(model, PluginConfig{}, effort, int64(config.MaxTokens))
+	client, model, err := buildRunnerClient(config.Model, config.Effort, parentModel, plugins, int64(config.MaxTokens))
 	if err != nil {
 		return nil, fmt.Errorf("cannot build agent runner: %w", err)
 	}
@@ -788,6 +744,7 @@ func NewAgentRunner(config SubagentConfig, cred config.Credential, parentModel, 
 		Tools:        tools,
 		MaxTurns:     maxTurns,
 		ToolTimeouts: toolTimeouts,
+		plugins:      plugins,
 	}, nil
 }
 
@@ -803,19 +760,21 @@ func (a *AgentRunner) Clone(cred config.Credential) (*AgentRunner, error) {
 	copy(tools, a.Tools)
 
 	cloneSpec := llm.Spec(a.LLM) // e.g. "openai/gpt-5.1"
-	clonedClient, err := llm.NewFromModel(cloneSpec, PluginConfig{}, a.LLM.Effort(), a.LLM.MaxTokens())
+	clonedClient, err := llm.NewFromModel(cloneSpec, a.plugins, a.LLM.Effort(), a.LLM.MaxTokens())
 	if err != nil {
 		return nil, fmt.Errorf("cannot clone agent runner: %w", err)
 	}
 
 	return &AgentRunner{
-		Config:       a.Config,
-		LLM:          clonedClient,
-		Messages:     msgs,
-		System:       sys,
-		Tools:        tools,
-		MaxTurns:     a.MaxTurns,
-		ToolTimeouts: a.ToolTimeouts,
+		Config:          a.Config,
+		LLM:             clonedClient,
+		Messages:        msgs,
+		System:          sys,
+		Tools:           tools,
+		MaxTurns:        a.MaxTurns,
+		ToolTimeouts:    a.ToolTimeouts,
+		plugins:         a.plugins,
+		contextInjected: a.contextInjected,
 	}, nil
 }
 
@@ -1444,7 +1403,7 @@ func (s *Session) executeParallelSteps(
 					if step.Effort != "" {
 						config.Effort = step.Effort
 					}
-					ar, err := NewAgentRunner(config, cred, parentModel, s.cwd, s.projectConfig.ToolTimeouts, s.searchDirsSlice()...)
+					ar, err := NewAgentRunner(config, cred, parentModel, s.cwd, s.server.plugins, s.projectConfig.ToolTimeouts, s.searchDirsSlice()...)
 					if err != nil {
 						errs[idx] = fmt.Errorf("step '%s': %w", stepID, err)
 						return
@@ -1452,6 +1411,9 @@ func (s *Session) executeParallelSteps(
 					agent = ar
 					if s.headless {
 						agent.Tools = ExcludeTools(agent.Tools, "ask_question_to_user")
+					}
+					if step.Signal {
+						agent.Tools = appendSignalTool(agent.Tools)
 					}
 				} else if step.ForkFrom != "" {
 					mu.Lock()
@@ -1467,15 +1429,20 @@ func (s *Session) executeParallelSteps(
 						return
 					}
 					agent = ar
+					if step.Signal {
+						agent.Tools = appendSignalTool(agent.Tools)
+					}
 				}
 
 				vars := envVars(s.cwd, s.model)
 				vars["workflow.prompt"] = prompt
+				vars["workflow.dir"] = s.jobDir
 				mu.Lock()
 				for k, v := range buildStepVars(exec.StepResults) {
 					vars[k] = v
 				}
 				mu.Unlock()
+				mergeRuntimeVars(vars, exec.State, pf.Budget)
 				for k, v := range stepParams {
 					vars[k] = v
 				}
@@ -1491,6 +1458,9 @@ func (s *Session) executeParallelSteps(
 				}
 
 				stepExecuteTool := func(name string, params map[string]any, cwd string) (*ToolResult, error) {
+					if name == "workflow_signal" {
+						return s.handleWorkflowSignal(pf, exec.State, stepID, params), nil
+					}
 					for _, t := range step.DenyTools {
 						if t == name {
 							return &ToolResult{Output: fmt.Sprintf("tool '%s' is denied in step '%s'", name, stepID), IsError: true}, nil
@@ -1499,7 +1469,19 @@ func (s *Session) executeParallelSteps(
 					return executeTool(name, params, cwd)
 				}
 
-				output, err := agent.Send(stepCtx, resolvedMessage, stepExecuteTool, streamCb, s.cwd, s.hooksForStep(silent))
+				stepHooks := s.hooksForStep(silent)
+				if exec.State != nil {
+					base := stepHooks.OnStreamDone
+					stepHooks.OnStreamDone = func(inputTokens, outputTokens, cacheCreation, cacheRead, elapsedMs int64) {
+						atomic.AddInt64(&exec.State.Budget.TokensUsed, inputTokens+outputTokens+cacheCreation+cacheRead)
+						if base != nil {
+							base(inputTokens, outputTokens, cacheCreation, cacheRead, elapsedMs)
+						}
+					}
+				}
+
+				s.ensureWorkflowAgentContext(agent)
+				output, err := agent.Send(stepCtx, resolvedMessage, stepExecuteTool, streamCb, s.cwd, stepHooks)
 				stepElapsed := time.Since(stepStart).Milliseconds()
 
 				if err == nil && step.Output != "" {
@@ -1539,6 +1521,7 @@ func (s *Session) executeParallelSteps(
 				s.emitIfVisible(silent, "event.workflow_step_done", protocol.EventWorkflowStepDone{
 					StepID: stepID, StepIdx: myLogicalStep, Success: true, DurationMs: stepElapsed,
 				})
+				exec.recordTranscriptEntry(step, stepID, output)
 
 			case "tool":
 				toolVars := make(map[string]string, len(baseVars))
@@ -1596,16 +1579,65 @@ func (s *Session) executeParallelSteps(
 	return contRefs, nil
 }
 
-// executeWorkflow runs a full workflow to completion.
-func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt string) error {
+// executeWorkflow runs a full workflow to completion. When resume is non-nil
+// the run continues from the persisted cursor: step results, per-step agent
+// conversations, and budget accounting are restored, and the entry point is
+// replaced by resume.CurrentRef.
+func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt string, resume *WorkflowRunState) error {
 	exec := &WorkflowRun{
 		Def:         pf,
 		StepAgents:  make(map[string]*AgentRunner),
 		StepResults: make(map[string]*StepResult),
 	}
 
+	if resume != nil {
+		prompt = resume.Prompt
+	}
+	state := &WorkflowRunState{
+		Name:   pf.Name,
+		Status: WorkflowStatusRunning,
+		Prompt: prompt,
+	}
+	elapsed := elapsedTracker{start: time.Now()}
+	if resume != nil {
+		state.Iteration = resume.Iteration
+		state.Budget = resume.Budget
+		state.BudgetRouted = resume.BudgetRouted
+		state.ErrorRouted = resume.ErrorRouted
+		elapsed.base = resume.Budget.ElapsedSeconds
+		for id, r := range resume.StepResults {
+			exec.StepResults[id] = r
+		}
+	}
+	exec.State = state
+
 	cred := s.llm.Credential()
 	parentModel := s.model
+
+	// Rebuild step agents from a resume snapshot. A runner is fully derivable
+	// from its SubagentConfig plus conversation; rebuild failures are logged
+	// and skipped so the step falls back to a fresh agent when re-visited.
+	if resume != nil {
+		for id, snap := range resume.StepAgents {
+			stepDef, ok := pf.Steps[id]
+			if !ok {
+				continue
+			}
+			ar, err := NewAgentRunner(snap.Config, cred, parentModel, s.cwd, s.server.plugins, s.projectConfig.ToolTimeouts, s.searchDirsSlice()...)
+			if err != nil {
+				LogError("[workflow] resume: cannot rebuild agent for step '%s': %v", id, err)
+				continue
+			}
+			ar.Messages = append([]llm.MessageParam(nil), snap.Messages...)
+			if s.headless {
+				ar.Tools = ExcludeTools(ar.Tools, "ask_question_to_user")
+			}
+			if stepDef.Signal {
+				ar.Tools = appendSignalTool(ar.Tools)
+			}
+			exec.StepAgents[id] = ar
+		}
+	}
 
 	executeTool := func(name string, params map[string]any, cwd string) (*ToolResult, error) {
 		return s.executeToolConfirmed(ctx, name, params), nil
@@ -1650,22 +1682,76 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 	// Base vars: workflow.prompt is the magic variable
 	baseVars := envVars(s.cwd, s.model)
 	baseVars["workflow.prompt"] = prompt
+	// workflow.dir is the run's job directory (~/.vix/jobs/<id>) for scheduled
+	// runs, empty otherwise. Always present so the token never leaks unresolved.
+	baseVars["workflow.dir"] = s.jobDir
 	baseVars["session.id"] = s.id
 
-	// Resolve entry point params
+	// Resolve entry point params — or, on resume, pick up at the saved cursor.
 	currentRef := &StepRef{
 		ID:     pf.EntryPoint.ID,
 		Params: resolveParams(pf.EntryPoint.Params, baseVars),
 	}
+	if resume != nil && resume.CurrentRef != nil {
+		if _, ok := pf.Steps[resume.CurrentRef.ID]; ok {
+			currentRef = resume.CurrentRef
+		} else {
+			LogError("[workflow] resume: step '%s' no longer exists in %q, restarting from entry point", resume.CurrentRef.ID, pf.Name)
+		}
+	}
 	var routedFrom string
 	var logicalStep int
-	const maxIterations = 200
+
+	// Hard iteration cap. The configured budget governs the real limit (and
+	// routes to on_exceeded below); this is a safety net against runaway
+	// loops, widened when a budget legitimately allows more iterations.
+	maxIterations := 200
+	if pf.Budget != nil && pf.Budget.MaxIterations > 0 && pf.Budget.MaxIterations+50 > maxIterations {
+		maxIterations = pf.Budget.MaxIterations + 50
+	}
+
+	// Finalize on every exit path: completed runs clear their persisted state;
+	// interrupted runs (cancel/crash) park as paused, failed ones as blocked —
+	// both resumable from the cursor. Either way the run produced content the
+	// user may not have seen: flag the session unread.
+	finished := false
+	defer func() {
+		s.unread = true
+		// Mirror the run's visible agent output into the chat transcript before
+		// persisting, on every exit path (completed, paused, blocked, timed
+		// out) so the run replays in a fresh TUI and a follow-up chat turn has
+		// the output as context. No-op when nothing visible was produced.
+		s.appendWorkflowTranscript(prompt, exec)
+		if finished {
+			s.setWorkflowRunState(nil)
+			// A finished inline (transient) workflow run — e.g. a scheduled job
+			// — has nothing left to resume, and its definition was never
+			// persisted. Leaving the session in "workflow" mode would make a
+			// later reopen warn that the workflow "no longer exists" and switch
+			// to chat. Drop straight to chat mode here so that never happens.
+			if s.isInlineWorkflow(pf.Name) {
+				s.sessionMode = "chat"
+				s.activeWorkflow = ""
+			}
+			s.persist()
+			return
+		}
+		if ctx.Err() != nil {
+			state.Status = WorkflowStatusPaused
+		} else if state.Status == WorkflowStatusRunning {
+			state.Status = WorkflowStatusBlocked
+		}
+		state.Budget.ElapsedSeconds = elapsed.seconds()
+		s.saveWorkflowProgress(exec, currentRef)
+		s.emitWorkflowStatus(pf, state, currentRef)
+	}()
 
 	for iteration := 0; currentRef != nil && currentRef.ID != "" && currentRef.ID != "stop" && iteration < maxIterations; iteration++ {
 		step := pf.Steps[currentRef.ID]
 		stepID := currentRef.ID
 		stepParams := currentRef.Params
 		logicalStep++
+		state.Budget.ElapsedSeconds = elapsed.seconds()
 
 		if ctx.Err() != nil {
 			s.emit("event.workflow_complete", protocol.EventWorkflowComplete{
@@ -1676,6 +1762,45 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 			s.activePlan = nil
 			return ctx.Err()
 		}
+
+		// Budget gate: when any configured limit is spent, flip the run to
+		// budget_limited and divert — once — to the on_exceeded step (so the
+		// workflow can wrap up gracefully), or stop when none is configured.
+		if !state.BudgetRouted && state.budgetExceeded(pf.Budget) {
+			state.Status = WorkflowStatusBudgetLimited
+			state.BudgetRouted = true
+			s.emitWorkflowStatus(pf, state, currentRef)
+			routeVars := make(map[string]string, len(baseVars))
+			for k, v := range baseVars {
+				routeVars[k] = v
+			}
+			for k, v := range buildStepVars(exec.StepResults) {
+				routeVars[k] = v
+			}
+			mergeRuntimeVars(routeVars, state, pf.Budget)
+			if oe := pf.Budget.OnExceeded; oe != nil && oe.ID != "" && oe.ID != "stop" {
+				currentRef = &StepRef{ID: oe.ID, Params: resolveParams(oe.Params, routeVars)}
+				step = pf.Steps[currentRef.ID]
+				stepID = currentRef.ID
+				stepParams = currentRef.Params
+			} else {
+				stopped = true
+				break
+			}
+		}
+
+		// Each workflow_signal is only visible to the routing decisions that
+		// follow it: starting a new signal-capable step clears the previous one.
+		if step.Signal {
+			state.Signal = SignalState{}
+		}
+		state.Iteration++
+
+		// Refresh live accounting vars ($(workflow.*)) for prompts and
+		// execute_if conditions, then checkpoint the run so an interruption
+		// anywhere in this step resumes from this exact cursor.
+		mergeRuntimeVars(baseVars, state, pf.Budget)
+		s.saveWorkflowProgress(exec, currentRef)
 
 		silent := step.Silent
 		stepCtx := ctx
@@ -1980,7 +2105,7 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 				if step.Effort != "" {
 					config.Effort = step.Effort
 				}
-				ar, err := NewAgentRunner(config, cred, parentModel, s.cwd, s.projectConfig.ToolTimeouts, s.searchDirsSlice()...)
+				ar, err := NewAgentRunner(config, cred, parentModel, s.cwd, s.server.plugins, s.projectConfig.ToolTimeouts, s.searchDirsSlice()...)
 				if err != nil {
 					s.activePlan = nil
 					s.emit("event.workflow_complete", protocol.EventWorkflowComplete{
@@ -1993,6 +2118,9 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 				agent = ar
 				if s.headless {
 					agent.Tools = ExcludeTools(agent.Tools, "ask_question_to_user")
+				}
+				if step.Signal {
+					agent.Tools = appendSignalTool(agent.Tools)
 				}
 				agentLabel = step.Agent
 			} else if step.ForkFrom != "" {
@@ -2017,6 +2145,9 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 					return fmt.Errorf("step '%s': %w", stepID, err)
 				}
 				agent = ar
+				if step.Signal {
+					agent.Tools = appendSignalTool(agent.Tools)
+				}
 				agentLabel = stepID + " (from " + step.ForkFrom + ")"
 			}
 			_ = agentLabel
@@ -2049,9 +2180,11 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 			} else {
 				vars := envVars(s.cwd, s.model)
 				vars["workflow.prompt"] = prompt
+				vars["workflow.dir"] = s.jobDir
 				for k, v := range buildStepVars(exec.StepResults) {
 					vars[k] = v
 				}
+				mergeRuntimeVars(vars, state, pf.Budget)
 				for k, v := range stepParams {
 					vars[k] = v
 				}
@@ -2067,6 +2200,9 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 
 			// Tool executor with deny_tools enforcement
 			stepExecuteTool := func(name string, params map[string]any, cwd string) (*ToolResult, error) {
+				if name == "workflow_signal" {
+					return s.handleWorkflowSignal(pf, state, stepID, params), nil
+				}
 				if len(step.DenyTools) > 0 {
 					for _, t := range step.DenyTools {
 						if t == name {
@@ -2094,7 +2230,15 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 			stepHooks := &TurnHooks{
 				OnStreamDelta:   baseHooks.OnStreamDelta,
 				OnThinkingDelta: baseHooks.OnThinkingDelta,
-				OnStreamDone:    baseHooks.OnStreamDone,
+				OnStreamDone: func(inputTokens, outputTokens, cacheCreation, cacheRead, elapsedMs int64) {
+					// Budget accounting: fires once per LLM call, so every
+					// turn inside this step (tool loops, drains, continues)
+					// counts toward the run's token budget.
+					atomic.AddInt64(&state.Budget.TokensUsed, inputTokens+outputTokens+cacheCreation+cacheRead)
+					if baseHooks.OnStreamDone != nil {
+						baseHooks.OnStreamDone(inputTokens, outputTokens, cacheCreation, cacheRead, elapsedMs)
+					}
+				},
 				OnToolCall: func(ev protocol.EventToolCall) {
 					tracker.RecordCall(ev.Name)
 					if baseHooks.OnToolCall != nil {
@@ -2112,6 +2256,7 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 				OnBeforeStream: baseHooks.OnBeforeStream,
 			}
 
+			s.ensureWorkflowAgentContext(agent)
 			output, err := agent.Send(stepCtx, resolvedMessage, stepExecuteTool, streamCb, s.cwd, stepHooks)
 
 			// If the user enqueued a message during this step, inject it into the agent
@@ -2178,6 +2323,34 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 					ToolStats:           tracker.Stats(),
 					DurationMs:          stepElapsed,
 				})
+				// on_error: route to the configured fallback step (once)
+				// instead of aborting, so the workflow can wrap up — e.g.
+				// summarize progress after a terminal API error. Cancellation
+				// still aborts: there is no point steering a dead context.
+				if step.OnError != nil && ctx.Err() == nil && !state.ErrorRouted {
+					state.ErrorRouted = true
+					state.Status = WorkflowStatusBlocked
+					exec.StepResults[stepID] = &StepResult{
+						Output: fmt.Sprintf("Step '%s' failed: %v", stepID, err),
+						Params: stepParams,
+					}
+					exec.StepAgents[stepID] = agent
+					s.emitWorkflowStatus(pf, state, currentRef)
+					if step.OnError.ID == "" || step.OnError.ID == "stop" {
+						stopped = true
+						goto done
+					}
+					routeVars := make(map[string]string, len(baseVars))
+					for k, v := range baseVars {
+						routeVars[k] = v
+					}
+					for k, v := range buildStepVars(exec.StepResults) {
+						routeVars[k] = v
+					}
+					mergeRuntimeVars(routeVars, state, pf.Budget)
+					currentRef = &StepRef{ID: step.OnError.ID, Params: resolveParams(step.OnError.Params, routeVars)}
+					continue
+				}
 				s.emit("event.workflow_complete", protocol.EventWorkflowComplete{
 					WorkflowName: pf.Name,
 					Success:      false,
@@ -2203,6 +2376,7 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 				Parsed: parsed,
 				Params: stepParams,
 			}
+			exec.recordTranscriptEntry(step, stepID, output)
 
 			displayText := extractStepSummary(output, step.DisplayKey)
 			if step.DisplayKey != "" && !step.Silent {
@@ -2263,6 +2437,9 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 				for k, v := range buildStepVars(exec.StepResults) {
 					advanceVars[k] = v
 				}
+				// Re-merge live vars: a workflow_signal emitted during this
+				// step must be visible to the execute_if routing below.
+				mergeRuntimeVars(advanceVars, state, pf.Budget)
 				if len(step.NextSteps) == 1 {
 					ns := step.NextSteps[0]
 					resolvedCondition := resolveBashExpansions(resolveTemplateString(ns.ExecuteIf, advanceVars), s.cwd)
@@ -2313,6 +2490,13 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 	}
 
 done:
+	// Normal end of the run: mark finished so the deferred finalizer clears
+	// the persisted run state (completed runs are not resumable).
+	if state.Status == WorkflowStatusRunning {
+		state.Status = WorkflowStatusComplete
+	}
+	finished = true
+
 	var summary string
 	if pf.Summary != "" {
 		summaryVars := buildStepVars(exec.StepResults)

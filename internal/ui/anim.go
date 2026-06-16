@@ -11,6 +11,9 @@ import (
 )
 
 const (
+	// animFPS sets the thinking spinner cadence. Every tick re-runs the full
+	// Model.View, so this directly multiplies render cost; 30fps for a fluid
+	// spinner.
 	animFPS      = 30
 	animNumChars = 12
 )
@@ -47,7 +50,6 @@ type sessionsSpinnerMsg struct{ gen int }
 // sessionsSpinnerPeriod sets the sessions-list spinner cadence. A list spinner
 // doesn't need the chat spinner's 30fps; 12fps reads as smooth and is cheap.
 const sessionsSpinnerPeriod = time.Second / 12
-
 
 // ThinkingAnim renders a spinner row: each character cycles through braille
 // spinner frames with a phase offset so a wave ripples across the bar.
@@ -119,9 +121,10 @@ func (a *ThinkingAnim) View() string {
 	b.WriteString("  ") // indent to align with chat content
 
 	nFrames := len(animFrames)
+	step := frozenStep(a.step)
 	for i := range animNumChars {
 		// Each character is one step behind its left neighbour, creating a wave.
-		frame := (a.step - i + nFrames*animNumChars) % nFrames
+		frame := (step - i + nFrames*animNumChars) % nFrames
 		g := animFrames[frame]
 		b.WriteString(lipgloss.NewStyle().Foreground(a.ramp[i]).Render(string(g)))
 	}

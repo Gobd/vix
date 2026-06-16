@@ -68,6 +68,12 @@ type Session struct {
 	// goroutine (hot reload) while the session loop reads it.
 	workflowsMu sync.RWMutex
 	workflows   []*WorkflowDef
+	// inlineWorkflows names workflows registered transiently for this session
+	// (job/hook runs carrying a self-contained def), not loaded from config.
+	// A finished inline run drops back to chat mode so reopening it doesn't
+	// warn that the (unpersisted) workflow "no longer exists". Guarded by
+	// workflowsMu.
+	inlineWorkflows map[string]bool
 
 	// Skills registry
 	skills *agent.SkillRegistry
@@ -140,6 +146,13 @@ type Session struct {
 	sessionMode       string // "chat" or "workflow"
 	activeWorkflow    string // name of the active workflow when sessionMode=="workflow"
 
+	// workflowRunState is the last published snapshot of an in-flight (or
+	// interrupted) workflow run — its resume cursor, step results, per-step
+	// agent conversations, and budget accounting. Guarded by s.mu; snapshots
+	// are immutable once published (see saveWorkflowProgress). Persisted in
+	// the session record so interrupted runs survive a daemon restart.
+	workflowRunState *WorkflowRunState
+
 	// Persistence/attach state.
 	// attachRecord is non-nil when this session is resuming a persisted record;
 	// Run() emits event.replay (with restore validation) after initBrain.
@@ -148,6 +161,39 @@ type Session struct {
 	// action), distinguishing an explicit close (move record open->closed) from
 	// a bare disconnect (record stays open for next-run reopen).
 	closedByUser bool
+
+	// Provenance: empty origin means user-started; "vix" marks sessions the
+	// daemon initiated itself (scheduled job runs, synthetic alert sessions).
+	// trigger then records what fired it. Set at construction time by the job
+	// runner, persisted in the session record, surfaced in session.list.
+	origin  string
+	trigger *protocol.TriggerInfo
+	// jobStatus is the finished run's status (ok | error | timeout), set by
+	// the job runner just before the final persist so the record carries it
+	// (retention exempts failures from auto-dismissal; the TUI shows a badge).
+	jobStatus string
+	// jobDir is the absolute job directory (~/.vix/jobs/<id>) for scheduled
+	// runs, set by the job runner. It surfaces to workflow templates as
+	// $(workflow.dir) so a run can keep persistent state (e.g. a memory file)
+	// alongside its spec. Empty for non-job sessions.
+	jobDir string
+	// unread is the session-global "has content the user hasn't seen" flag.
+	// Set whenever a turn or workflow run completes (new content), cleared by
+	// the session.mark_read command the TUI sends when the user views the
+	// session. Persisted in the record so the indicator survives restarts;
+	// absent on legacy records, which therefore read as seen.
+	unread bool
+
+	// title is the display title shown in the Sessions list. Empty until the
+	// auto-titling pass runs (after titleEndTurnThreshold end_turn stops) or,
+	// for job runs, set at creation time by the job runner. Guarded by s.mu
+	// because the generation goroutine writes it off the turn loop.
+	title string
+	// endTurnCount counts completed chat turns (StopReason == end_turn).
+	// Maintained by the turn loop, re-derived from history on attach.
+	endTurnCount int
+	// titleGenInFlight prevents overlapping title generation calls.
+	titleGenInFlight bool
 }
 
 // NewSession creates a new agent session.
@@ -543,9 +589,10 @@ func (s *Session) Run() {
 
 	s.initBrain()
 
-	// Attached (resumed) session: rebuild the client's viewport and apply
-	// restore-time validation now that the model and workflows are resolved.
-	s.emitReplay()
+	// Rebuild the client's viewport (for resumes) and fire the SessionStart
+	// hooks, classified as startup vs resume. Must run as one unit: emitReplay
+	// clears attachRecord, so the resume check has to be captured before it.
+	s.announceStart()
 
 	for {
 		select {
@@ -562,7 +609,7 @@ func (s *Session) Run() {
 				s.lastRequestAt = time.Now()
 				var data protocol.SessionWorkflowData
 				json.Unmarshal(cmd.Data, &data)
-				s.handleWorkflowCommand(data.Name, data.Text)
+				s.handleWorkflowCommand(data.Name, data.Text, data.Workflow)
 			case "session.set_model":
 				var data protocol.SessionSetModelData
 				json.Unmarshal(cmd.Data, &data)
@@ -583,12 +630,15 @@ func (s *Session) Run() {
 
 					log.Printf("[session] model switched to %s (provider=%s)", spec, s.llm.Provider())
 
-					// Persist the choice to the chat agent's frontmatter so
-					// future sessions start with the same model. Best-effort:
-					// log on failure rather than fail the (already-successful)
-					// in-memory switch.
-					if err := WriteChatAgentModel(s.paths, s.chatAgent, spec); err != nil {
-						log.Printf("[session] WARN: failed to persist model choice to %s.md: %v", s.chatAgent, err)
+					// Persist the choice to state.json so future sessions
+					// start with the same model. Best-effort: log on failure
+					// rather than fail the (already-successful) in-memory
+					// switch.
+					statePath := s.paths.StateFile()
+					st := config.ReadState(statePath)
+					st.Model = spec
+					if err := config.WriteState(statePath, st); err != nil {
+						log.Printf("[session] WARN: failed to persist model choice to state.json: %v", err)
 					}
 					s.persist()
 				}
@@ -597,6 +647,15 @@ func (s *Session) Run() {
 				json.Unmarshal(cmd.Data, &data)
 				s.trimHistory(data.TurnIdx)
 				s.persist()
+			case "session.mark_read":
+				// The user is looking at this session: clear the persisted
+				// unread flag. Queued commands land between turns, so a
+				// mark_read sent mid-turn applies before the turn's own
+				// unread=true — the TUI re-sends on agent_done when focused.
+				if s.unread {
+					s.unread = false
+					s.persist()
+				}
 			case "session.close":
 				s.closedByUser = true
 				return
@@ -611,7 +670,7 @@ func (s *Session) Run() {
 // unconfigured state; set_model keeps the prior working client). It never
 // fabricates a client, so a missing credential can't leak into an LLM request.
 func (s *Session) applyModel(spec string, maxTokens int64) error {
-	client, err := llm.NewFromModel(spec, s.server.pluginConfig, llm.DefaultEffortFromSpec(spec), maxTokens)
+	client, err := llm.NewFromModel(spec, s.server.plugins, llm.DefaultEffortFromSpec(spec), maxTokens)
 	if err != nil {
 		return err
 	}
@@ -714,13 +773,17 @@ func (s *Session) initBrain() {
 		s.denyListMu.Unlock()
 	}
 
-	// Apply tool filtering AND model selection from the chat agent's
-	// frontmatter (e.g. general.md). The chat agent's `model:` field is the
-	// authoritative source for the session's model, falling back to the
-	// daemon default (s.model) when the frontmatter omits it.
+	// Apply tool filtering AND model selection. Resolution order for the
+	// session's model: the chat agent's frontmatter `model:` (explicit pin,
+	// used by custom agents) → the user's saved choice in state.json (written
+	// by the model picker) → the daemon default (s.model). Shipped agents
+	// carry no `model:` line.
 	agentFilePath := s.resolveAgentPath(s.chatAgent + ".md")
 	modelSpec := s.model
 	var modelMaxTokens int64
+	if saved := config.ReadState(s.paths.StateFile()).Model; saved != "" {
+		modelSpec = saved
+	}
 	if agentCfg, err := parseAgentFile(agentFilePath); err == nil {
 		if len(agentCfg.Tools) > 0 {
 			s.tools = FilterToolSchemasWithBounds(agentCfg.Tools, tDef, tMax)
@@ -828,15 +891,20 @@ func (s *Session) skillInfoList() []protocol.SkillInfo {
 	return infos
 }
 
-// workflowInfoList returns the list of WorkflowInfo in config order.
+// workflowInfoList returns the list of WorkflowInfo in config order, omitting
+// workflows that opted out of the TUI (display_in_tui: false) — they remain
+// runnable by name (scheduled jobs), just not listed in the switcher.
 func (s *Session) workflowInfoList() []protocol.WorkflowInfo {
 	wfs := s.snapshotWorkflows()
 	if len(wfs) == 0 {
 		return nil
 	}
-	infos := make([]protocol.WorkflowInfo, len(wfs))
-	for i, wf := range wfs {
-		infos[i] = protocol.WorkflowInfo{Name: wf.Name}
+	infos := make([]protocol.WorkflowInfo, 0, len(wfs))
+	for _, wf := range wfs {
+		if !wf.ShowInTUI() {
+			continue
+		}
+		infos = append(infos, protocol.WorkflowInfo{Name: wf.Name})
 	}
 	return infos
 }
@@ -853,6 +921,36 @@ func (s *Session) setWorkflows(wfs []*WorkflowDef) {
 	s.workflowsMu.Lock()
 	s.workflows = wfs
 	s.workflowsMu.Unlock()
+}
+
+// registerInlineWorkflow adds an inline workflow definition to the session's
+// workflow set, replacing any existing entry of the same name. Used by job and
+// hook runs that carry a self-contained workflow rather than referencing one
+// loaded from config/workflow.json, so the normal name-lookup path can resolve
+// it. Called from inside the session goroutine (handleWorkflowCommand), so it
+// is race-free with Run()'s initial workflow load.
+func (s *Session) registerInlineWorkflow(def *WorkflowDef) {
+	s.workflowsMu.Lock()
+	defer s.workflowsMu.Unlock()
+	if s.inlineWorkflows == nil {
+		s.inlineWorkflows = make(map[string]bool)
+	}
+	s.inlineWorkflows[def.Name] = true
+	for i, w := range s.workflows {
+		if w.Name == def.Name {
+			s.workflows[i] = def
+			return
+		}
+	}
+	s.workflows = append(s.workflows, def)
+}
+
+// isInlineWorkflow reports whether name was registered transiently for this
+// session (via registerInlineWorkflow) rather than loaded from config.
+func (s *Session) isInlineWorkflow(name string) bool {
+	s.workflowsMu.RLock()
+	defer s.workflowsMu.RUnlock()
+	return s.inlineWorkflows[name]
 }
 
 // ReloadWorkflows swaps in a freshly-loaded workflow list and re-emits
@@ -926,9 +1024,10 @@ func (s *Session) discoverInstructionFiles() []instructionFile {
 	}
 
 	if s.projectConfig.HasFeature(FeatureReadAgentsMD) {
-		path := filepath.Join(s.cwd, "AGENTS.md")
-		if data, err := os.ReadFile(path); err == nil {
-			files = append(files, instructionFile{Path: path, Content: string(data)})
+		for _, path := range s.paths.AgentsMD() {
+			if data, err := os.ReadFile(path); err == nil {
+				files = append(files, instructionFile{Path: path, Content: string(data)})
+			}
 		}
 	}
 
@@ -954,7 +1053,23 @@ func (s *Session) buildSystemPrompt() []llm.SystemBlock {
 		blocks = append(blocks, llm.SystemBlock{Text: filesText})
 	}
 
-	// Inject project instruction files (CLAUDE.md, AGENTS.md)
+	// Inject the shared project-context blocks (CLAUDE.md/AGENTS.md + skills
+	// metadata), the same set workflow agent steps receive via
+	// ensureWorkflowAgentContext.
+	blocks = append(blocks, s.contextSystemBlocks()...)
+
+	return blocks
+}
+
+// contextSystemBlocks returns the project-context system blocks shared by chat
+// turns and workflow agent steps: the project instruction files
+// (CLAUDE.md/AGENTS.md, each gated by its feature flag) and the available-skills
+// metadata (level 1 of progressive disclosure — names + descriptions only).
+// Empty when none apply.
+func (s *Session) contextSystemBlocks() []llm.SystemBlock {
+	var blocks []llm.SystemBlock
+
+	// Project instruction files (CLAUDE.md, AGENTS.md).
 	if instrFiles := s.discoverInstructionFiles(); len(instrFiles) > 0 {
 		for _, f := range instrFiles {
 			text := fmt.Sprintf("<system-reminder>\nContents of %s (project instructions):\n\n%s\n</system-reminder>", f.Path, f.Content)
@@ -963,8 +1078,7 @@ func (s *Session) buildSystemPrompt() []llm.SystemBlock {
 		log.Printf("[session] loaded %d instruction file(s)", len(instrFiles))
 	}
 
-	// Inject available-skills metadata (level 1 of progressive disclosure):
-	// just names + descriptions, so the model knows what it can load via the
+	// Available-skills metadata, so the model knows what it can load via the
 	// `skill` tool without paying for the full bodies up front.
 	if s.skills != nil && s.skills.Count() > 0 {
 		if block := s.skills.FormatForSystemPrompt(); block != "" {
@@ -999,7 +1113,22 @@ func (s *Session) AddUserMessage(text string, attachments ...protocol.Attachment
 		contentBlocks = append(contentBlocks, llm.NewImageBlock(att.MediaType, att.Data))
 	}
 
-	s.messages = append(s.messages, llm.NewUserMessage(contentBlocks...))
+	s.appendMessages(llm.NewUserMessage(contentBlocks...))
+}
+
+// appendMessages stamps each message with the current time (when not already
+// set) and appends it to the conversation history. Routing every append
+// through here keeps MessageParam.Timestamp in lockstep across all message
+// kinds (user, assistant, tool results, nudges) so a restored session replays
+// with original send times rather than the relaunch time.
+func (s *Session) appendMessages(msgs ...llm.MessageParam) {
+	now := time.Now()
+	for i := range msgs {
+		if msgs[i].Timestamp.IsZero() {
+			msgs[i].Timestamp = now
+		}
+	}
+	s.messages = append(s.messages, msgs...)
 }
 
 // snapshotMessagesForFork returns a copy of the conversation history at the
@@ -1530,7 +1659,7 @@ func (s *Session) streamWithRetry(
 				ElapsedMs:    stallErr.Elapsed.Milliseconds(),
 				SummaryChars: len(stallErr.Summary),
 			})
-			s.messages = append(s.messages, nudge)
+			s.appendMessages(nudge)
 			log.Printf("\033[31m[session req=%s] thinking stall after %s (attempt %d/%d, nudging and retrying)\033[0m",
 				turnID, stallErr.Elapsed, attempt+1, maxRetries)
 			lastReason = "Thinking stall — nudging model"
@@ -1669,7 +1798,9 @@ func (s *Session) handleInput(text string, attachments []protocol.Attachment) {
 		s.messages = nil
 		s.turnSnapshots = nil
 		s.todoList = nil
+		s.workflowRunState = nil
 		s.mu.Unlock()
+		s.persist()
 		s.emit("event.clear", nil)
 		s.emit("event.todo_list_updated", protocol.EventTodoListUpdated{Todos: []protocol.TodoItem{}})
 		s.emit("event.agent_done", nil)
@@ -1744,6 +1875,16 @@ func (s *Session) handleInput(text string, attachments []protocol.Attachment) {
 		}
 	}
 
+	// UserPromptSubmit hooks: may rewrite or veto the prompt before it enters
+	// the conversation.
+	newText, denyReason, denied := s.userPromptSubmitHook(s.ctx, text)
+	if denied {
+		s.emit("event.error", protocol.EventError{Message: "Prompt blocked by hook: " + denyReason})
+		s.emit("event.agent_done", nil)
+		return
+	}
+	text = newText
+
 	s.AddUserMessage(text, attachments...)
 
 	// Inner loop: agent turns
@@ -1783,13 +1924,14 @@ func (s *Session) handleInput(text string, attachments []protocol.Attachment) {
 		s.mu.Unlock()
 
 		LogLLMCall(s.model, system, s.messages, s.tools, msg)
-		s.messages = append(s.messages, msg.ToParam())
+		s.appendMessages(msg.ToParam())
 
 		if msg.StopReason == llm.StopEndTurn {
 			log.Printf("\033[34m[session] end of turn detected\033[0m")
+			s.endTurnCount++
 			if todoNudges < 3 && s.hasPendingTodos() {
 				todoNudges++
-				s.messages = append(s.messages, llm.NewUserMessage(
+				s.appendMessages(llm.NewUserMessage(
 					llm.NewTextBlock("You still have pending or in-progress TODO items. Please either complete them or call todo_write with an empty list to clear the list before finishing."),
 				))
 				continue
@@ -1806,7 +1948,7 @@ func (s *Session) handleInput(text string, attachments []protocol.Attachment) {
 			// Always append tool results — the API requires every tool_use
 			// to have a matching tool_result, even on cancellation.
 			if len(toolResults) > 0 {
-				s.messages = append(s.messages, llm.NewUserMessage(toolResults...))
+				s.appendMessages(llm.NewUserMessage(toolResults...))
 			}
 			if cancelled {
 				s.emit("event.stream_done", protocol.EventStreamDone{})
@@ -1823,7 +1965,10 @@ func (s *Session) handleInput(text string, attachments []protocol.Attachment) {
 	copy(snapshot, s.messages)
 	s.turnSnapshots = append(s.turnSnapshots, snapshot)
 	s.mu.Unlock()
+	s.unread = true // new content; cleared by session.mark_read when viewed
 	s.persist()
+	s.maybeGenerateTitle()
+	s.fireStop()
 	s.emit("event.agent_done", nil)
 }
 
@@ -1939,6 +2084,12 @@ func (s *Session) compactMessages(keepFromMsgIdx, summarizedTurns int, auto bool
 	fromTokens := s.lastInputTokens
 	s.mu.Unlock()
 
+	trigger := "manual"
+	if auto {
+		trigger = "auto"
+	}
+	s.firePreCompact(trigger)
+
 	summary, err := s.summarizeMessages(dropped)
 	if err != nil {
 		s.emit("event.error", protocol.EventError{Message: "Compaction failed: " + err.Error()})
@@ -1987,6 +2138,8 @@ func (s *Session) compactMessages(keepFromMsgIdx, summarizedTurns int, auto bool
 		SummarizedTurns: summarizedTurns,
 		Auto:            auto,
 	})
+
+	s.firePostCompact(trigger, summarizedTurns, fromTokens)
 }
 
 // summarizeMessages runs a one-shot, tool-free LLM call to summarize the given
@@ -2062,6 +2215,18 @@ type dispatchOptions struct {
 	emitToolCall func(ev protocol.EventToolCall)
 	// emitToolResult is called after each tool completes.
 	emitToolResult func(toolID, name string, input map[string]any, output string, isError bool, lineOffset int)
+	// beforeTool, when set, fires PreToolUse hooks before a tool executes. It
+	// returns rewritten input (modify), a deny reason, and a denied flag. Only
+	// wired for the main session dispatcher; nil for subagents.
+	beforeTool func(ctx context.Context, name string, input map[string]any) (newInput map[string]any, denyReason string, denied bool)
+	// afterTool, when set, fires PostToolUse hooks after a tool completes,
+	// possibly appending context to the result. Nil for subagents.
+	afterTool func(ctx context.Context, name string, input map[string]any, result *ToolResult)
+	// permissionRequest, when set, fires PermissionRequest hooks just before the
+	// user is asked to confirm a tool call. A deny short-circuits the prompt and
+	// rejects the tool with the returned reason. Only wired for the main session
+	// dispatcher; nil for subagents.
+	permissionRequest func(ctx context.Context, name string, input map[string]any) (denyReason string, denied bool)
 	// toolTimeoutDefault is the floor for tool-call timeouts used by the
 	// TimeoutSec field of emitted tool_call events. When zero, falls back to
 	// the package-level defaultToolTimeoutDefault constant.
@@ -2241,6 +2406,20 @@ func executeToolsParallel(ctx context.Context, tasks []*toolTask, opts dispatchO
 			defer wg.Done()
 
 			silent := isSilentCtx(ctx)
+			if opts.beforeTool != nil {
+				newInput, denyReason, denied := opts.beforeTool(ctx, t.toolUse.Name, t.input)
+				if denied {
+					t.result = &ToolResult{Output: denyReason, IsError: true}
+					t.apiResult = llm.NewToolResultBlock(t.toolUse.ID, denyReason, true)
+					if opts.emitToolResult != nil {
+						opts.emitToolResult(t.toolUse.ID, t.toolUse.Name, t.input, denyReason, true, 0)
+					}
+					return
+				}
+				if newInput != nil {
+					t.input = newInput
+				}
+			}
 			if !silent {
 				log.Printf("[dispatch] exec start: %s id=%s", t.toolUse.Name, t.toolUse.ID)
 			}
@@ -2260,6 +2439,9 @@ func executeToolsParallel(ctx context.Context, tasks []*toolTask, opts dispatchO
 				return
 			}
 
+			if opts.afterTool != nil {
+				opts.afterTool(ctx, t.toolUse.Name, t.input, result)
+			}
 			t.result = result
 			t.apiResult = llm.NewToolResultBlock(t.toolUse.ID, result.Output, result.IsError)
 			if opts.emitToolResult != nil {
@@ -2276,6 +2458,9 @@ func executeToolsParallel(ctx context.Context, tasks []*toolTask, opts dispatchO
 			continue
 		}
 		result := resolveConfirmation(ctx, t, opts)
+		if opts.afterTool != nil {
+			opts.afterTool(ctx, t.toolUse.Name, t.input, result)
+		}
 		t.result = result
 		t.apiResult = llm.NewToolResultBlock(t.toolUse.ID, result.Output, result.IsError)
 		if opts.emitToolResult != nil {
@@ -2304,6 +2489,20 @@ func executeToolsSequential(ctx context.Context, tasks []*toolTask, opts dispatc
 		}
 
 		silent := isSilentCtx(ctx)
+		if opts.beforeTool != nil {
+			newInput, denyReason, denied := opts.beforeTool(ctx, t.toolUse.Name, t.input)
+			if denied {
+				t.result = &ToolResult{Output: denyReason, IsError: true}
+				t.apiResult = llm.NewToolResultBlock(t.toolUse.ID, denyReason, true)
+				if opts.emitToolResult != nil {
+					opts.emitToolResult(t.toolUse.ID, t.toolUse.Name, t.input, denyReason, true, 0)
+				}
+				continue
+			}
+			if newInput != nil {
+				t.input = newInput
+			}
+		}
 		if !silent {
 			log.Printf("[dispatch] exec start: %s id=%s", t.toolUse.Name, t.toolUse.ID)
 		}
@@ -2321,6 +2520,9 @@ func executeToolsSequential(ctx context.Context, tasks []*toolTask, opts dispatc
 			result = resolveConfirmation(ctx, t, opts)
 		}
 
+		if opts.afterTool != nil {
+			opts.afterTool(ctx, t.toolUse.Name, t.input, result)
+		}
 		t.result = result
 		t.apiResult = llm.NewToolResultBlock(t.toolUse.ID, result.Output, result.IsError)
 		if opts.emitToolResult != nil {
@@ -2334,6 +2536,13 @@ func executeToolsSequential(ctx context.Context, tasks []*toolTask, opts dispatc
 func resolveConfirmation(ctx context.Context, t *toolTask, opts dispatchOptions) *ToolResult {
 	if opts.confirmFn == nil {
 		return &ToolResult{Output: "Permission denied.", IsError: true}
+	}
+	// PermissionRequest hooks run before the user is prompted: a deny skips the
+	// prompt entirely and rejects the tool with the hook's reason.
+	if opts.permissionRequest != nil {
+		if reason, denied := opts.permissionRequest(ctx, t.toolUse.Name, t.input); denied {
+			return &ToolResult{Output: "Permission denied by hook: " + reason, IsError: true}
+		}
 	}
 	approved, cancelled := opts.confirmFn(ctx, t.toolUse.Name, t.input)
 	if cancelled {
@@ -2360,6 +2569,15 @@ func (s *Session) sessionDispatchToolCalls(ctx context.Context, msg *llm.Message
 		toolTimeoutMax:     maxv,
 		executeTool: func(name string, input map[string]any) *ToolResult {
 			return s.executeToolDirect(ctx, name, input)
+		},
+		beforeTool: s.preToolUseHook,
+		afterTool:  s.postToolUseHook,
+		permissionRequest: func(ctx context.Context, name string, input map[string]any) (string, bool) {
+			var requestedDirs []string
+			if rd, ok := input["_requested_dirs"].([]string); ok {
+				requestedDirs = rd
+			}
+			return s.permissionRequestHook(ctx, name, input, requestedDirs)
 		},
 		handleSpecial: func(ctx context.Context, name string, input map[string]any) (*ToolResult, bool) {
 			switch name {
@@ -2442,15 +2660,41 @@ func providerFor(model string) string {
 	return "openai"
 }
 
-// handleWorkflowCommand handles a session.workflow command by looking up and executing
-// the workflow matching the given name.
-func (s *Session) handleWorkflowCommand(name, text string) {
+// handleWorkflowCommand handles a session.workflow command by looking up and
+// executing the workflow matching the given name. When inline is non-empty it
+// carries a self-contained workflow definition (a workflow.Def as JSON) which
+// is registered into the session's workflow set first, then resolved by its own
+// name through the normal lookup below.
+func (s *Session) handleWorkflowCommand(name, text string, inline json.RawMessage) {
 	// Unconfigured session: no usable LLM client. Workflows stream too, so
 	// refuse before doing any work and surface the error to the UI.
 	if s.configErr != nil {
 		s.emit("event.error", protocol.EventError{Message: s.unconfiguredMessage()})
 		s.emit("event.agent_done", nil)
 		return
+	}
+
+	// Inline workflow: validate and register it transiently, then fall through
+	// to the by-name lookup (using the def's own name). Registering here, inside
+	// the session goroutine, is race-free with Run()'s initial workflow load.
+	if len(inline) > 0 {
+		var def WorkflowDef
+		if err := json.Unmarshal(inline, &def); err != nil {
+			msg := fmt.Sprintf("invalid inline workflow: %v", err)
+			log.Printf("[session] %s", msg)
+			s.emit("event.error", protocol.EventError{Message: msg})
+			s.emit("event.agent_done", nil)
+			return
+		}
+		if err := validateWorkflow(&def); err != nil {
+			msg := fmt.Sprintf("invalid inline workflow: %v", err)
+			log.Printf("[session] %s", msg)
+			s.emit("event.error", protocol.EventError{Message: msg})
+			s.emit("event.agent_done", nil)
+			return
+		}
+		s.registerInlineWorkflow(&def)
+		name = def.Name
 	}
 
 	var wf *WorkflowDef
@@ -2472,6 +2716,34 @@ func (s *Session) handleWorkflowCommand(name, text string) {
 	s.activeWorkflow = name
 	s.persist()
 
+	// Resume an interrupted run of this workflow (user cancel or daemon
+	// restart): continue from the persisted cursor instead of starting over.
+	// Any text the user submitted alongside is injected into the resumed
+	// step's agent via the usual workflow-message channel. A different
+	// workflow name (or a fresh start after completion) discards old state.
+	var resume *WorkflowRunState
+	if st := s.snapshotWorkflowRunState(); st != nil {
+		if st.Name == name && st.Resumable() {
+			if _, ok := wf.Steps[st.CurrentRef.ID]; ok {
+				resume = st
+			}
+		}
+		if resume == nil {
+			s.setWorkflowRunState(nil)
+		}
+	}
+	if resume != nil && text != "" {
+		select {
+		case s.workflowMsgChan <- text:
+		default:
+		}
+	}
+	if resume != nil {
+		s.emit("event.stream_chunk", protocol.EventStreamChunk{
+			Text: fmt.Sprintf("Resuming workflow %q at step '%s' (iteration %d).\n", name, resume.CurrentRef.ID, resume.Iteration),
+		})
+	}
+
 	planCtx, planCancel := context.WithCancel(s.ctx)
 	s.planCancel = planCancel
 	defer func() {
@@ -2479,7 +2751,7 @@ func (s *Session) handleWorkflowCommand(name, text string) {
 		s.planCancel = nil
 	}()
 
-	err := s.executeWorkflow(planCtx, wf, text)
+	err := s.executeWorkflow(planCtx, wf, text, resume)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		s.emit("event.error", protocol.EventError{Message: fmt.Sprintf("workflow failed: %v", err)})
 	}
@@ -2543,7 +2815,19 @@ func (s *Session) handleSpawnAgent(ctx context.Context, input map[string]any) (s
 			return s.executeToolConfirmed(bgCtx, name, params), nil
 		}
 		bgDef, bgMax := s.toolTimeoutBounds()
-		taskID := s.backgroundTasks.SpawnBackground(bgCtx, config, prompt, cred, parentModel, bgExecuteTool, s.cwd, bgDef, bgMax, s.searchDirsSlice()...)
+		taskID := s.backgroundTasks.SpawnBackground(bgCtx, config, prompt, cred, parentModel, s.server.plugins, bgExecuteTool, s.cwd, bgDef, bgMax, s.searchDirsSlice()...)
+		s.fireSubagentStart(agentType, taskID, prompt)
+		// Fire SubagentStop when the background task completes, bound to the
+		// session context so it never outlives the session.
+		if task, ok := s.backgroundTasks.Load(taskID); ok {
+			go func() {
+				select {
+				case <-task.Done:
+					s.fireSubagentStop(agentType, taskID, task.Result)
+				case <-s.ctx.Done():
+				}
+			}()
+		}
 		s.emit("event.tool_result", protocol.EventToolResult{
 			Name:   "spawn_agent",
 			Output: fmt.Sprintf("Background task started. Task ID: %s", taskID),
@@ -2558,7 +2842,10 @@ func (s *Session) handleSpawnAgent(ctx context.Context, input map[string]any) (s
 	}
 	log.Printf("[subagent] spawning foreground agent (type=%s)", config.Name)
 	def, maxv := s.toolTimeoutBounds()
-	result, err := RunSubagent(ctx, config, prompt, cred, parentModel, executeTool, s.cwd, s.emitHooks(), def, maxv, s.searchDirsSlice()...)
+	agentID := nextTaskID()
+	s.fireSubagentStart(agentType, agentID, prompt)
+	result, err := RunSubagent(ctx, config, prompt, cred, parentModel, s.server.plugins, executeTool, s.cwd, s.emitHooks(), def, maxv, s.searchDirsSlice()...)
+	s.fireSubagentStop(agentType, agentID, result)
 
 	if err != nil {
 		return fmt.Sprintf("Subagent error: %v", err), true
@@ -2580,7 +2867,7 @@ func (s *Session) RunExploration(ctx context.Context, agentName, prompt string) 
 		return s.executeToolConfirmed(ctx, name, params), nil
 	}
 	def, maxv := s.toolTimeoutBounds()
-	return RunSubagent(ctx, config, prompt, s.llm.Credential(), s.model, executeTool, s.cwd, nil, def, maxv, s.searchDirsSlice()...)
+	return RunSubagent(ctx, config, prompt, s.llm.Credential(), s.model, s.server.plugins, executeTool, s.cwd, nil, def, maxv, s.searchDirsSlice()...)
 }
 
 func (s *Session) handleTaskOutput(ctx context.Context, input map[string]any) (string, bool) {

@@ -49,7 +49,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	got, found, err := loadSessionRecord(paths, rec.ID)
+	got, found, err := loadOpenSessionRecord(paths, rec.ID)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -105,16 +105,73 @@ func TestMoveToClosed(t *testing.T) {
 	if _, err := os.Stat(sessionRecordPath(paths.SessionsOpen(), rec.ID)); !os.IsNotExist(err) {
 		t.Error("record still present in open/ after move")
 	}
-	// Present in closed/ and still loadable.
+	// Present in closed/.
 	if _, err := os.Stat(sessionRecordPath(paths.SessionsClosed(), rec.ID)); err != nil {
 		t.Errorf("record not in closed/: %v", err)
 	}
-	got, found, err := loadSessionRecord(paths, rec.ID)
-	if err != nil || !found {
-		t.Fatalf("load after move: found=%v err=%v", found, err)
+	// No longer attachable: a closed record must not be resurrected.
+	_, found, err := loadOpenSessionRecord(paths, rec.ID)
+	if err != nil {
+		t.Fatalf("load after move: %v", err)
 	}
-	if got.ID != rec.ID {
-		t.Errorf("loaded wrong record: %s", got.ID)
+	if found {
+		t.Error("closed record still loadable for attach")
+	}
+}
+
+// TestSessionListVixOriginIgnoresCWDFilter: session.list scopes user sessions
+// to the requesting cwd, but vix-initiated records (job runs, alerts) run from
+// the job's cwd and must surface in every instance regardless of where the TUI
+// was launched.
+func TestSessionListVixOriginIgnoresCWDFilter(t *testing.T) {
+	dir := t.TempDir()
+	paths := config.NewVixPaths(dir, "", "/work")
+
+	userSame := sampleRecord()
+	userSame.ID = "user-same-cwd"
+	userSame.CWD = "/work"
+
+	userOther := sampleRecord()
+	userOther.ID = "user-other-cwd"
+	userOther.CWD = "/elsewhere"
+
+	vixRun := sampleRecord()
+	vixRun.ID = "vix-run"
+	vixRun.CWD = "/elsewhere" // the job's cwd, not the TUI's
+	vixRun.Origin = "vix"
+	vixRun.Trigger = &protocol.TriggerInfo{Type: "cron", Ref: "job-1"}
+
+	for _, r := range []sessionRecord{userSame, userOther, vixRun} {
+		if err := saveSessionRecord(paths, r); err != nil {
+			t.Fatalf("save %s: %v", r.ID, err)
+		}
+	}
+
+	srv := newInstanceTestServer(t)
+	RegisterBuiltinHandlers(srv)
+	resp, err := srv.GetHandler("session.list")(map[string]any{
+		"cwd": "/work", "config_dir": dir,
+	})
+	if err != nil {
+		t.Fatalf("session.list: %v", err)
+	}
+	sums, ok := resp["sessions"].([]protocol.SessionSummary)
+	if !ok {
+		t.Fatalf("sessions has unexpected type %T", resp["sessions"])
+	}
+
+	got := map[string]bool{}
+	for _, s := range sums {
+		got[s.ID] = true
+	}
+	if !got["user-same-cwd"] {
+		t.Error("user session for the requesting cwd missing")
+	}
+	if got["user-other-cwd"] {
+		t.Error("user session for another cwd leaked through the filter")
+	}
+	if !got["vix-run"] {
+		t.Error("vix-initiated session filtered out despite global visibility")
 	}
 }
 
@@ -123,10 +180,10 @@ func TestListOpenExcludesClosed(t *testing.T) {
 
 	open1 := sampleRecord()
 	open1.ID = "open-1"
-	open1.LastRequestAt = time.Now().Add(-2 * time.Hour)
+	open1.StartedAt = time.Now().Add(-time.Hour)
 	open2 := sampleRecord()
 	open2.ID = "open-2"
-	open2.LastRequestAt = time.Now()
+	open2.StartedAt = time.Now().Add(-2 * time.Hour)
 	closed := sampleRecord()
 	closed.ID = "closed-1"
 
@@ -143,7 +200,7 @@ func TestListOpenExcludesClosed(t *testing.T) {
 	if len(recs) != 2 {
 		t.Fatalf("open count = %d, want 2", len(recs))
 	}
-	// Sorted most-recent first.
+	// Sorted by creation time, oldest first.
 	if recs[0].ID != "open-2" || recs[1].ID != "open-1" {
 		t.Errorf("unexpected order: %s, %s", recs[0].ID, recs[1].ID)
 	}
@@ -158,7 +215,7 @@ func TestPersistenceDisabledNoHome(t *testing.T) {
 	if err := saveSessionRecord(paths, sampleRecord()); err != nil {
 		t.Errorf("save should be a no-op (nil), got %v", err)
 	}
-	_, found, err := loadSessionRecord(paths, "sess-abc")
+	_, found, err := loadOpenSessionRecord(paths, "sess-abc")
 	if err != nil || found {
 		t.Errorf("load on disabled store: found=%v err=%v", found, err)
 	}
@@ -169,9 +226,13 @@ func TestFirstUserMessageAndSummary(t *testing.T) {
 	if got := rec.firstUserMessage(); got != "first question" {
 		t.Errorf("firstUserMessage = %q", got)
 	}
+	rec.Title = "A generated title"
 	s := rec.summary()
 	if s.ID != rec.ID || s.FirstMessage != "first question" || s.Model != rec.Model {
 		t.Errorf("summary mismatch: %+v", s)
+	}
+	if s.Title != "A generated title" {
+		t.Errorf("summary title = %q", s.Title)
 	}
 	if s.StartedAt == "" || s.LastRequestAt == "" {
 		t.Errorf("summary timestamps not set: %+v", s)
@@ -205,6 +266,24 @@ func TestBuildReplayMessages(t *testing.T) {
 	}
 	if out[2].Blocks[0].Kind != "tool_result" || out[2].Blocks[0].Output != "out" {
 		t.Errorf("tool_result not projected: %+v", out[2].Blocks[0])
+	}
+}
+
+func TestBuildReplayMessagesTimestamp(t *testing.T) {
+	ts := time.Date(2021, 3, 4, 5, 6, 7, 0, time.UTC)
+	stamped := llm.NewUserMessage(llm.NewTextBlock("hi"))
+	stamped.Timestamp = ts
+	legacy := llm.NewAssistantMessage(llm.NewTextBlock("answer")) // zero timestamp
+
+	out := buildReplayMessages([]llm.MessageParam{stamped, legacy})
+	if len(out) != 2 {
+		t.Fatalf("replay messages = %d, want 2", len(out))
+	}
+	if want := ts.Format(time.RFC3339); out[0].Timestamp != want {
+		t.Errorf("stamped Timestamp = %q, want %q", out[0].Timestamp, want)
+	}
+	if out[1].Timestamp != "" {
+		t.Errorf("legacy (zero) Timestamp = %q, want empty", out[1].Timestamp)
 	}
 }
 
@@ -309,5 +388,231 @@ func TestEmitReplayWorkflowPresentKept(t *testing.T) {
 	}
 	if len(rep.Warnings) != 0 {
 		t.Errorf("warnings = %v, want none", rep.Warnings)
+	}
+}
+
+func TestDeleteSessionRecord(t *testing.T) {
+	paths := testPaths(t)
+
+	// Record in open/ is removed.
+	open := sampleRecord()
+	open.ID = "del-open"
+	if err := saveSessionRecord(paths, open); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := deleteSessionRecord(paths, open.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := os.Stat(sessionRecordPath(paths.SessionsOpen(), open.ID)); !os.IsNotExist(err) {
+		t.Error("record still present in open/ after delete")
+	}
+
+	// Record in closed/ is removed too.
+	closed := sampleRecord()
+	closed.ID = "del-closed"
+	if err := saveSessionRecord(paths, closed); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := moveSessionToClosed(paths, closed.ID); err != nil {
+		t.Fatalf("move: %v", err)
+	}
+	if err := deleteSessionRecord(paths, closed.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := os.Stat(sessionRecordPath(paths.SessionsClosed(), closed.ID)); !os.IsNotExist(err) {
+		t.Error("record still present in closed/ after delete")
+	}
+
+	// Missing record and disabled persistence are no-ops.
+	if err := deleteSessionRecord(paths, "no-such-id"); err != nil {
+		t.Errorf("delete missing: %v", err)
+	}
+	if err := deleteSessionRecord(config.NewVixPaths("", "", "/work"), "x"); err != nil {
+		t.Errorf("delete with persistence disabled: %v", err)
+	}
+}
+
+// writeClosedRecord saves rec and moves it to closed/, returning its path.
+func writeClosedRecord(t *testing.T, paths config.VixPaths, rec sessionRecord) string {
+	t.Helper()
+	if err := saveSessionRecord(paths, rec); err != nil {
+		t.Fatalf("save %s: %v", rec.ID, err)
+	}
+	if err := moveSessionToClosed(paths, rec.ID); err != nil {
+		t.Fatalf("move %s: %v", rec.ID, err)
+	}
+	return sessionRecordPath(paths.SessionsClosed(), rec.ID)
+}
+
+func TestTrimStaleClosedSessions(t *testing.T) {
+	paths := testPaths(t)
+	week := 7 * 24 * time.Hour
+
+	fresh := sampleRecord()
+	fresh.ID = "fresh"
+	fresh.LastRequestAt = time.Now().Add(-time.Hour)
+	freshPath := writeClosedRecord(t, paths, fresh)
+
+	stale := sampleRecord()
+	stale.ID = "stale"
+	stale.LastRequestAt = time.Now().Add(-2 * week)
+	stalePath := writeClosedRecord(t, paths, stale)
+
+	// Stale via StartedAt only (no LastRequestAt).
+	staleStart := sampleRecord()
+	staleStart.ID = "stale-start"
+	staleStart.StartedAt = time.Now().Add(-2 * week)
+	staleStart.LastRequestAt = time.Time{}
+	staleStartPath := writeClosedRecord(t, paths, staleStart)
+
+	// Corrupt file with an old mtime falls back to mtime and is trimmed.
+	corruptOld := filepath.Join(paths.SessionsClosed(), "corrupt-old.json")
+	if err := os.WriteFile(corruptOld, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * week)
+	if err := os.Chtimes(corruptOld, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	// Corrupt file with a fresh mtime is kept.
+	corruptFresh := filepath.Join(paths.SessionsClosed(), "corrupt-fresh.json")
+	if err := os.WriteFile(corruptFresh, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A stale record still in open/ must not be touched.
+	openStale := sampleRecord()
+	openStale.ID = "open-stale"
+	openStale.LastRequestAt = time.Now().Add(-2 * week)
+	if err := saveSessionRecord(paths, openStale); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	trimStaleClosedSessions(paths, week)
+
+	for _, p := range []string{stalePath, staleStartPath, corruptOld} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s should have been trimmed", filepath.Base(p))
+		}
+	}
+	for _, p := range []string{freshPath, corruptFresh, sessionRecordPath(paths.SessionsOpen(), openStale.ID)} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s should have been kept: %v", filepath.Base(p), err)
+		}
+	}
+}
+
+func TestTrimStaleClosedSessionsNever(t *testing.T) {
+	paths := testPaths(t)
+
+	stale := sampleRecord()
+	stale.ID = "stale"
+	stale.LastRequestAt = time.Now().Add(-365 * 24 * time.Hour)
+	p := writeClosedRecord(t, paths, stale)
+
+	// maxAge <= 0 means retention disabled ("never"): nothing is removed.
+	trimStaleClosedSessions(paths, 0)
+	trimStaleClosedSessions(paths, -time.Hour)
+
+	if _, err := os.Stat(p); err != nil {
+		t.Errorf("record should have been kept with retention disabled: %v", err)
+	}
+}
+
+// ── Unread flag ──
+
+// TestUnreadRoundTrip: the session-global unread flag persists and surfaces in
+// summaries; legacy records without the field read as seen.
+func TestUnreadRoundTrip(t *testing.T) {
+	paths := testPaths(t)
+
+	rec := sampleRecord()
+	rec.Unread = true
+	if err := saveSessionRecord(paths, rec); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	got, found, _ := loadOpenSessionRecord(paths, rec.ID)
+	if !found || !got.Unread {
+		t.Fatalf("unread flag lost: found=%v rec=%+v", found, got)
+	}
+	if !got.summary().Unread {
+		t.Fatal("summary must carry Unread")
+	}
+
+	// Legacy record: no unread field on disk → read.
+	legacy := sampleRecord()
+	legacy.ID = "sess-legacy"
+	if err := saveSessionRecord(paths, legacy); err != nil {
+		t.Fatalf("save legacy: %v", err)
+	}
+	got, _, _ = loadOpenSessionRecord(paths, legacy.ID)
+	if got.Unread || got.summary().Unread {
+		t.Fatal("legacy record must read as seen")
+	}
+}
+
+// TestMarkReadCommandClearsUnread: buildRecord reflects the session flag, and
+// the mark_read transition persists.
+func TestMarkReadCommandClearsUnread(t *testing.T) {
+	paths := testPaths(t)
+	srv := NewServer("/tmp/unused.sock", config.Credential{}, "t", "m", &config.DaemonConfig{}, nil)
+	sess := NewSession("sess-mr", srv, nil, "m", "/work", paths.Override(), false, true, true, true, context.Background())
+
+	sess.unread = true
+	sess.persist()
+	got, found, _ := loadOpenSessionRecord(sess.paths, "sess-mr")
+	if !found || !got.Unread {
+		t.Fatalf("turn-end persist must carry unread, got %+v", got)
+	}
+
+	// What the session.mark_read command handler does:
+	sess.unread = false
+	sess.persist()
+	got, _, _ = loadOpenSessionRecord(sess.paths, "sess-mr")
+	if got.Unread {
+		t.Fatal("mark_read must clear the persisted flag")
+	}
+}
+
+// TestSweepExemptsUnreadRuns: the open/ retention sweep never auto-dismisses
+// unread or failed job runs; read OK runs beyond the cap age out.
+func TestSweepExemptsUnreadRuns(t *testing.T) {
+	paths := testPaths(t)
+	trig := &protocol.TriggerInfo{Type: "cron", Ref: "job-x"}
+	mk := func(id string, age time.Duration, status string, unread bool) {
+		rec := sessionRecord{
+			ID: id, CWD: "/work", Origin: "vix", Trigger: trig,
+			JobStatus: status, Unread: unread,
+			SessionMode: "chat", StartedAt: time.Now().Add(-age),
+		}
+		if err := saveSessionRecord(paths, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Newest three stay regardless; the four older ones exercise the rules.
+	mk("r1", 1*time.Hour, "ok", false)
+	mk("r2", 2*time.Hour, "ok", false)
+	mk("r3", 3*time.Hour, "ok", false)
+	mk("r4", 4*time.Hour, "ok", true)     // unread → kept
+	mk("r5", 5*time.Hour, "error", false) // failure → kept
+	mk("r6", 6*time.Hour, "ok", false)    // read ok → swept
+	mk("r7", 7*time.Hour, "ok", false)    // read ok → swept
+
+	sweepJobRunRecords(paths, "job-x")
+
+	openIDs := map[string]bool{}
+	for _, r := range listSessionRecordsIn(paths.SessionsOpen()) {
+		openIDs[r.ID] = true
+	}
+	for _, want := range []string{"r1", "r2", "r3", "r4", "r5"} {
+		if !openIDs[want] {
+			t.Errorf("%s should have been kept in open/", want)
+		}
+	}
+	for _, gone := range []string{"r6", "r7"} {
+		if openIDs[gone] {
+			t.Errorf("%s should have been swept to closed/", gone)
+		}
 	}
 }

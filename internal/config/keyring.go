@@ -40,7 +40,10 @@ const (
 	KeySourceOAuthToken KeySource = "oauth-token"
 	KeySourceKeychain   KeySource = "keychain"
 	KeySourceEnvFile    KeySource = "dotenv"
-	KeySourceNone       KeySource = "none"
+	// KeySourceLocal marks a keyless local provider (NoneAuth): the credential
+	// is a fixed placeholder the server ignores.
+	KeySourceLocal KeySource = "local"
+	KeySourceNone  KeySource = "none"
 )
 
 // Credential bundles an API key or OAuth token with everything an adapter
@@ -289,6 +292,10 @@ func resolveProviderCredential(ctx context.Context, provider string, refresh boo
 				continue
 			}
 			return buildCredential(value, KeySourceOAuthToken, m)
+		case NoneAuth:
+			// Keyless local provider: any non-empty placeholder works — the
+			// server ignores the Authorization header.
+			return buildCredential("local", KeySourceLocal, m)
 		}
 	}
 	return Credential{Source: KeySourceNone}

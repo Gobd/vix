@@ -141,6 +141,20 @@ func (p VixPaths) ClaudeMD() []string {
 	return out
 }
 
+// AgentsMD returns the AGENTS.md paths to load, in order.
+// Normal mode also includes the project root AGENTS.md (outside .vix).
+func (p VixPaths) AgentsMD() []string {
+	if p.override != "" {
+		return []string{filepath.Join(p.override, "AGENTS.md")}
+	}
+	var out []string
+	if p.home != "" {
+		out = append(out, filepath.Join(p.home, "AGENTS.md"))
+	}
+	out = append(out, filepath.Join(p.cwd, "AGENTS.md"))
+	return out
+}
+
 // Primary returns the write target for session-scoped state (history, plans,
 // access stats when override is set, etc.). Override mode: override.
 // Normal mode: cwd/.vix.
@@ -161,6 +175,27 @@ func (p VixPaths) Logs() string {
 		return ""
 	}
 	return filepath.Join(p.home, "logs")
+}
+
+// JobsLog returns the directory holding append-only job-run logs
+// (<date>.jsonl files), a subdirectory of Logs(). Empty when Logs() is empty
+// (home unavailable in normal mode).
+func (p VixPaths) JobsLog() string {
+	base := p.Logs()
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, "jobs")
+}
+
+// HooksLog returns the directory holding append-only hook-run logs
+// (<date>.jsonl files), a subdirectory of Logs(). Empty when Logs() is empty.
+func (p VixPaths) HooksLog() string {
+	base := p.Logs()
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, "hooks")
 }
 
 // Sessions returns the directory where persisted session records live.
@@ -256,6 +291,76 @@ func (p VixPaths) StateFile() string {
 		return ""
 	}
 	return filepath.Join(p.home, "state.json")
+}
+
+// Jobs returns the directory holding scheduled job specs (<id>.json files).
+// Jobs are user-global like sessions — each spec carries its own cwd — so the
+// store lives next to sessions/: override mode uses override/jobs; normal mode
+// uses home/jobs (empty when home is unavailable, which disables the scheduler).
+func (p VixPaths) Jobs() string {
+	if p.override != "" {
+		return filepath.Join(p.override, "jobs")
+	}
+	if p.home == "" {
+		return ""
+	}
+	return filepath.Join(p.home, "jobs")
+}
+
+// JobState returns the path of one job's machine-written runtime state file
+// (next/last run times, statuses, error counters), kept separate from the
+// user-authored spec (job.json) so spec files never churn. It lives inside the
+// job's own subdirectory, a sibling of job.json: override mode:
+// override/jobs/<id>/state.json; normal mode: home/jobs/<id>/state.json. Empty
+// when the jobs directory is unavailable (no home directory).
+func (p VixPaths) JobState(id string) string {
+	dir := p.Jobs()
+	if dir == "" || id == "" {
+		return ""
+	}
+	return filepath.Join(dir, id, "state.json")
+}
+
+// Hooks returns the directory holding lifecycle-hook specs (<id>.json files).
+// Hooks are user-global like jobs — each spec carries its own cwd — so the
+// store lives next to jobs/: override mode uses override/hooks; normal mode
+// uses home/hooks (empty when home is unavailable, which disables the engine).
+func (p VixPaths) Hooks() string {
+	if p.override != "" {
+		return filepath.Join(p.override, "hooks")
+	}
+	if p.home == "" {
+		return ""
+	}
+	return filepath.Join(p.home, "hooks")
+}
+
+// HookState returns the path of one hook's machine-written runtime state file
+// (recent-fire history and last-fire summary), kept separate from the
+// user-authored spec (hook.json) so spec files never churn. It lives inside the
+// hook's own subdirectory, a sibling of hook.json: override mode:
+// override/hooks/<id>/state.json; normal mode: home/hooks/<id>/state.json.
+// Empty when the hooks directory is unavailable (no home directory).
+func (p VixPaths) HookState(id string) string {
+	dir := p.Hooks()
+	if dir == "" || id == "" {
+		return ""
+	}
+	return filepath.Join(dir, id, "state.json")
+}
+
+// HeartbeatMD returns the path of the heartbeat whiteboard file read by the
+// default heartbeat job's prompt. It lives inside the heartbeat job's own
+// subdirectory, a sibling of its job.json: override mode:
+// override/jobs/heartbeat/heartbeat.md; normal mode:
+// home/jobs/heartbeat/heartbeat.md. Empty when the jobs directory is
+// unavailable (no home directory).
+func (p VixPaths) HeartbeatMD() string {
+	dir := p.Jobs()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "heartbeat", "heartbeat.md")
 }
 
 func (p VixPaths) subdirs(name string) []string {

@@ -43,7 +43,6 @@ func main() {
 	webPort := flag.Int("web-port", 1337, "Port for the local web UI. 0 disables it. Env: VIX_WEB_PORT.")
 	noMissionControl := flag.Bool("no-mission-control", false, "Disable the mission-control web UI server. Env: VIX_NO_MISSION_CONTROL.")
 	pprofPort := flag.Int("pprof-port", 0, "Port for the pprof HTTP server (GET /debug/pprof/*). 0 disables it. Env: VIX_PPROF_PORT.")
-	exitWithClients := flag.Bool("exit-with-clients", false, "Shut down automatically once the last attached vix instance disconnects (after a short grace period). Off by default so a directly-launched vixd runs until signalled. vix sets this when it spawns a daemon. Env: VIX_EXIT_WITH_CLIENTS.")
 	flag.Parse()
 
 	// Env-var fallbacks for path-bearing flags. Precedence: explicit
@@ -79,11 +78,6 @@ func main() {
 			*pprofPort = p
 		}
 	}
-	if !*exitWithClients {
-		if v := os.Getenv("VIX_EXIT_WITH_CLIENTS"); v == "1" || v == "true" {
-			*exitWithClients = true
-		}
-	}
 
 	if *logDir != "" {
 		abs, err := filepath.Abs(*logDir)
@@ -115,7 +109,7 @@ func main() {
 	// the plugin loader and pre-session bootstrap have a stable identifier
 	// to log against; it does NOT determine the actual session model.
 	const model = "anthropic/claude-sonnet-4-5-20250929"
-	daemonConfig, err := config.LoadDaemonConfig()
+	daemonConfig, err := config.LoadDaemonConfig(Version)
 	if err != nil {
 		log.Printf("WARNING: Failed to load daemon config: %v", err)
 		daemonConfig = &config.DaemonConfig{}
@@ -165,10 +159,20 @@ func main() {
 	if err := providers.Configure(pluginPaths.Providers()); err != nil {
 		log.Printf("[providers] using embedded defaults: %v", err)
 	}
-	pluginCfg := daemon.LoadPlugins(pluginPaths.Plugins(), Version, model)
+	pluginSrc := daemon.NewPluginSource(pluginPaths.Plugins(), Version)
 
-	server := daemon.NewServer(*socketPathFlag, cred, sessionID, model, daemonConfig, pluginCfg)
-	server.SetExitWithClients(*exitWithClients)
+	server := daemon.NewServer(*socketPathFlag, cred, sessionID, model, daemonConfig, pluginSrc)
+	server.SetVersion(Version)
+	if config.JobsEnabled() {
+		server.EnableJobScheduler()
+	} else {
+		log.Printf("jobs: scheduler disabled (features.jobs=false or VIX_DISABLE_JOBS)")
+	}
+	if config.HooksEnabled() {
+		server.EnableHooks()
+	} else {
+		log.Printf("hooks: engine disabled (features.hooks=false or VIX_DISABLE_HOOKS)")
+	}
 	// Background once-per-day update check. Best-effort: stores the result on
 	// the server so sessions can surface it; never blocks startup.
 	go func() {

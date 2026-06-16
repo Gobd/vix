@@ -17,6 +17,10 @@ const (
 	// OAuthToken is an interactive OAuth login that yields a refreshable access
 	// token, resolved via the auth subsystem.
 	OAuthToken
+	// NoneAuth marks a method that needs no credential (local servers such as
+	// Ollama or llama.cpp). Resolution yields a fixed placeholder value so
+	// client construction proceeds without a key.
+	NoneAuth
 )
 
 // HeaderStyle selects how a credential authenticates an HTTP request.
@@ -75,6 +79,8 @@ func authKindName(k AuthKind) string {
 	switch k {
 	case OAuthMintKey, OAuthToken:
 		return AuthDefaultOAuth
+	case NoneAuth:
+		return "none"
 	default:
 		return AuthDefaultAPIKey
 	}
@@ -96,6 +102,8 @@ func credKindToAuthKind(kind string) AuthKind {
 		return OAuthMintKey
 	case providers.CredOAuthToken:
 		return OAuthToken
+	case providers.CredNone:
+		return NoneAuth
 	default:
 		return APIKeyAuth
 	}

@@ -51,6 +51,11 @@ type SessionStartData struct {
 	EnableAutomaticWritePermission bool   `json:"enable_automatic_write_permission"`
 	EnableAutomaticDirectoryAccess bool   `json:"enable_automatic_directory_access"`
 	Headless                       bool   `json:"headless"`
+	// ClientVersion is the vix binary version opening this session. The daemon
+	// refuses the session (event.error, code "version_mismatch") when it does
+	// not exactly match the daemon's own version — a long-lived daemon must
+	// never serve a client from a different build.
+	ClientVersion string `json:"client_version,omitempty"`
 	// Fork fields: when ForkSessionID is non-empty the new session is seeded
 	// with the conversation history of the named session up to and including
 	// the turn at ForkTurnIdx (0-based).
@@ -58,19 +63,31 @@ type SessionStartData struct {
 	ForkTurnIdx   int    `json:"fork_turn_idx,omitempty"`
 	// AttachSessionID, when non-empty, asks the daemon to resume a persisted
 	// session by ID instead of creating a fresh one: it loads the on-disk
-	// record (open/ or closed/), reuses that ID, and replays the conversation
-	// to the client via event.replay. If no record exists the daemon answers
-	// with event.error carrying Code "session_not_found".
+	// record from open/, reuses that ID, and replays the conversation to the
+	// client via event.replay. Records in closed/ are not attachable — an
+	// explicitly closed session stays closed. If no open record exists the
+	// daemon answers with event.error carrying Code "session_not_found".
 	AttachSessionID string `json:"attach_session_id,omitempty"`
+}
+
+// TriggerInfo records what fired a vix-initiated session: a scheduled job's
+// trigger type ("cron" | "at") and the job id.
+type TriggerInfo struct {
+	Type string `json:"type"`
+	Ref  string `json:"ref,omitempty"`
 }
 
 // SessionSummary is the lightweight projection of a persisted session returned
 // by the session.list RPC. It carries just enough to populate the Sessions
 // list without loading full conversation histories.
 type SessionSummary struct {
-	ID            string `json:"id"`
-	CWD           string `json:"cwd"`
-	Model         string `json:"model"`
+	ID    string `json:"id"`
+	CWD   string `json:"cwd"`
+	Model string `json:"model"`
+	// Title is the session's display title: set by an LLM summarization pass
+	// after a few turns (user sessions) or at creation time (job runs). When
+	// empty, clients fall back to FirstMessage.
+	Title         string `json:"title,omitempty"`
 	FirstMessage  string `json:"first_message,omitempty"`
 	StartedAt     string `json:"started_at,omitempty"`      // RFC3339
 	LastRequestAt string `json:"last_request_at,omitempty"` // RFC3339
@@ -78,6 +95,19 @@ type SessionSummary struct {
 	// in some connection). The launching client uses it to avoid attaching a
 	// session another instance already owns (exclusive single-writer ownership).
 	Attached bool `json:"attached,omitempty"`
+	// Origin distinguishes user-started sessions ("", the default) from
+	// vix-initiated ones ("vix" — scheduled job runs, synthetic alerts). The
+	// TUI groups the sessions list by it and never auto-claims vix-initiated
+	// sessions on launch.
+	Origin  string       `json:"origin,omitempty"`
+	Trigger *TriggerInfo `json:"trigger,omitempty"`
+	// JobStatus carries the finished run's status (ok | error | timeout) for
+	// vix-initiated sessions, powering the badge in the sessions list.
+	JobStatus string `json:"job_status,omitempty"`
+	// Unread reports whether the session holds content the user hasn't seen
+	// (session-global, persisted — survives restarts). Cleared via the
+	// session.mark_read command when the user views the session.
+	Unread bool `json:"unread,omitempty"`
 }
 
 // SessionInputData carries user chat input.
@@ -127,10 +157,16 @@ type SessionUserAnswerData struct {
 	Answers map[string]string `json:"answers,omitempty"` // question ID → answer (batch mode)
 }
 
-// SessionWorkflowData carries a workflow execution request.
+// SessionWorkflowData carries a workflow execution request. Name selects a
+// workflow already loaded by the session (from config/workflow.json). Workflow,
+// when present, is an inline definition (a workflow.Def) registered into the
+// session's workflow set for this run; the session looks it up by its own name.
+// Carried as raw JSON so the protocol package stays free of a workflow-package
+// dependency.
 type SessionWorkflowData struct {
-	Name string `json:"name"`
-	Text string `json:"text"`
+	Name     string          `json:"name"`
+	Text     string          `json:"text"`
+	Workflow json.RawMessage `json:"workflow,omitempty"`
 }
 
 // SessionWorkflowMessageData carries a user message to inject into the running workflow.
@@ -321,6 +357,11 @@ type ReplayBlock struct {
 type ReplayMessage struct {
 	Role   string        `json:"role"` // "user" | "assistant"
 	Blocks []ReplayBlock `json:"blocks"`
+	// Timestamp is when the turn was originally sent (RFC3339), so the
+	// replayed viewport shows original send times instead of the relaunch
+	// time. Empty for legacy sessions persisted before timestamps existed;
+	// the TUI omits the "Sent at" line in that case.
+	Timestamp string `json:"timestamp,omitempty"`
 }
 
 // EventReplay is emitted once, immediately after event.session_started, when a
@@ -332,11 +373,19 @@ type EventReplay struct {
 	Todos          []TodoItem      `json:"todos,omitempty"`
 	ActivePlan     *Plan           `json:"active_plan,omitempty"`
 	Model          string          `json:"model,omitempty"`
+	Title          string          `json:"title,omitempty"`
 	SessionMode    string          `json:"session_mode,omitempty"`
 	ActiveWorkflow string          `json:"active_workflow,omitempty"`
 	// Warnings are human-readable restore notices rendered into the viewport
 	// (e.g. "Saved with model X; switched to your current default Y.").
 	Warnings []string `json:"warnings,omitempty"`
+}
+
+// EventTitleUpdated is emitted on a session's stream when its display title
+// changes (LLM auto-titling after a few turns). The sessions list refresh for
+// other clients goes through event.sessions_changed.
+type EventTitleUpdated struct {
+	Title string `json:"title"`
 }
 
 // EventRetry notifies the UI about an API retry attempt.
@@ -390,6 +439,37 @@ type EventUpdateAvailable struct {
 	URL     string `json:"url,omitempty"`
 	Method  string `json:"method,omitempty"`
 }
+
+// --- Job events (scheduled jobs engine) ---
+// Broadcast to every attached client via BroadcastEvent; payloads are also
+// emitted by the scheduler as plain maps with matching keys.
+
+// EventJobRun signals a job lifecycle transition before/without a finished
+// run: status is "started", "invalid" (spec failed validation), or
+// "auto_disabled" (too many consecutive failures). Error carries detail for
+// the non-started statuses.
+type EventJobRun struct {
+	JobID  string `json:"job_id"`
+	Name   string `json:"name,omitempty"`
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+// EventJobDone reports a finished job run. Status is ok | error | timeout
+// (skipped runs are silent by design). SessionID references the persisted run
+// session in the sessions list.
+type EventJobDone struct {
+	JobID     string `json:"job_id"`
+	Name      string `json:"name,omitempty"`
+	Status    string `json:"status"`
+	Error     string `json:"error,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+}
+
+// EventSessionsChanged tells attached clients the persisted sessions list
+// changed outside their own connection (a job run was persisted or swept), so
+// they should re-fetch session.list.
+type EventSessionsChanged struct{}
 
 // --- Workflow events ---
 
@@ -452,6 +532,20 @@ type StepCost struct {
 	CacheReadTokens     int64   `json:"cache_read_tokens"`
 	Cost                float64 `json:"cost"`
 	DurationMs          int64   `json:"duration_ms,omitempty"`
+}
+
+// EventWorkflowStatus signals a workflow run status transition (paused,
+// blocked, budget_limited, resumed). Carries the run's live accounting so
+// clients can render an indicator without tracking step events themselves.
+type EventWorkflowStatus struct {
+	WorkflowName   string `json:"workflow_name"`
+	Status         string `json:"status"`
+	StepID         string `json:"step_id,omitempty"`
+	Iteration      int    `json:"iteration,omitempty"`
+	TokensUsed     int64  `json:"tokens_used,omitempty"`
+	TokenBudget    int64  `json:"token_budget,omitempty"`
+	ElapsedSeconds int64  `json:"elapsed_seconds,omitempty"`
+	Note           string `json:"note,omitempty"`
 }
 
 // EventWorkflowComplete signals a workflow has finished.

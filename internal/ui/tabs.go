@@ -9,6 +9,7 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"github.com/get-vix/vix/internal/config"
+	"github.com/get-vix/vix/internal/protocol"
 	"github.com/get-vix/vix/internal/update"
 )
 
@@ -40,18 +41,50 @@ func formatRunningTime(d time.Duration) string {
 // waitingBadge is the "Waiting for input" styled tag shown on sessions that need user attention.
 var waitingBadge = lipgloss.NewStyle().Background(colorSecondary).Foreground(lipgloss.Color("0")).Bold(true).Render(" Waiting for input ")
 
+// sessionGroupHeaderStyle styles the "User-initiated" / "Vix-initiated" group
+// headers in the Sessions tab: white text. The title itself is not
+// underlined — a short purple rule is drawn on the line below it instead.
+var sessionGroupHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+
+// sessionColumnHeaderStyle styles the column header row ("Session", "Title",
+// "Running") of the Sessions tab.
+var sessionColumnHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+
+// sessionHeaderRuleStyle styles the horizontal rule drawn below the column
+// header row of the Sessions tab.
+var sessionHeaderRuleStyle = lipgloss.NewStyle().Foreground(colorPrimary)
+
 // unreadDotStyle styles the ● indicator for sessions with unread messages.
 var unreadDotStyle = lipgloss.NewStyle().Foreground(colorSecondary)
+
+// sessionRowSelectedStyle highlights the row under the navigation cursor in
+// the Sessions tab: a dark gray background spanning the row, with
+// secondary-colored text. Leading indicators (unread dot, spinner) keep
+// their own foreground color on top of it.
+var sessionRowSelectedStyle = lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Background(lipgloss.Color("#262626"))
 
 // sessionsSpinnerStyle styles the loading spinner shown for sessions that are
 // actively working. Primary color distinguishes it from the secondary-tinted
 // unread dot.
 var sessionsSpinnerStyle = lipgloss.NewStyle().Foreground(colorPrimary)
 
+// vixDisplayRow is one row of the Vix-initiated group passed to the renderer:
+// a live attached session (live != nil) or a persisted, not-attached record
+// (live == nil). sum carries the record summary used to format the columns; for
+// a live row it is a copy of the session's vixSummary.
+type vixDisplayRow struct {
+	live *SessionState
+	sum  protocol.SessionSummary
+}
+
 // renderSessionsView renders the sessions list overview. spinnerFrame is the
 // current loading-spinner glyph (empty when the spinner is inactive); it is
 // shown in a busy session's leading-indicator slot in place of the unread dot.
-func renderSessionsView(sessions []*SessionState, width, height int, s Styles, selectedRow int, spinnerFrame string) string {
+// userSessions are the live user-initiated sessions (the top group). vixRows are
+// the Vix-initiated group: live attached sessions and persisted not-attached
+// records merged into a single StartedAt-ordered list. The selection index
+// space covers user rows first, then the vix rows in that order.
+func renderSessionsView(userSessions []*SessionState, vixRows []vixDisplayRow, width, height int, s Styles, selectedRow int, spinnerFrame string) string {
 	const colSession = 10
 	const colRunning = 10
 
@@ -70,12 +103,27 @@ func renderSessionsView(sessions []*SessionState, width, height int, s Styles, s
 		colMessage = 20
 	}
 
-	header := fmt.Sprintf("  %-*s  %-*s  %-*s%-*s", colSession, "Session", colMessage, "First message", colRunning, "Running", badgeVisible, "")
-	rows := []string{s.TabActiveStyle.Render(header)}
+	header := fmt.Sprintf("  %-*s  %-*s  %-*s%-*s", colSession, "Session", colMessage, "Title", colRunning, "Running", badgeVisible, "")
+	headerRule := "  " + sessionHeaderRuleStyle.Render(strings.Repeat("─", colSession+colMessage+colRunning+4))
+	// groupHeader renders a group title with a short purple underline rule and
+	// a blank line below it, separating the title from the table below.
+	groupHeader := func(title string) []string {
+		return []string{
+			"  " + sessionGroupHeaderStyle.Render(title),
+			"  " + sessionHeaderRuleStyle.Render(strings.Repeat("─", 5)),
+			"",
+		}
+	}
+	rows := []string{}
 
 	rowIdx := 0
 
-	for _, sess := range sessions {
+	if len(userSessions) > 0 {
+		rows = append(rows, groupHeader("User-initiated")...)
+		rows = append(rows, sessionColumnHeaderStyle.Render(header), headerRule)
+	}
+
+	for _, sess := range userSessions {
 		sessionCol := "connecting…"
 		runningCol := "—"
 		if sess.client != nil {
@@ -88,7 +136,7 @@ func renderSessionsView(sessions []*SessionState, width, height int, s Styles, s
 				sessionCol = id
 			}
 			if !sess.client.StartedAt().IsZero() {
-				runningCol = formatRunningTime(time.Since(sess.client.StartedAt()))
+				runningCol = formatRunningTime(renderSince(sess.client.StartedAt()))
 			}
 		}
 
@@ -102,10 +150,14 @@ func renderSessionsView(sessions []*SessionState, width, height int, s Styles, s
 			}
 			prefix := "⎇ " + parentShort + "/" + fmt.Sprintf("%d", sess.forkTurnIdx+1) + "  "
 			rest := "—"
-			for _, msg := range sess.chatMessages {
-				if msg.Type == MsgUser {
-					rest = strings.SplitN(msg.Text, "\n", 2)[0]
-					break
+			if sess.title != "" {
+				rest = sess.title
+			} else {
+				for _, msg := range sess.chatMessages {
+					if msg.Type == MsgUser {
+						rest = strings.SplitN(msg.Text, "\n", 2)[0]
+						break
+					}
 				}
 			}
 			full := prefix + rest
@@ -113,6 +165,12 @@ func renderSessionsView(sessions []*SessionState, width, height int, s Styles, s
 				full = full[:colMessage-1] + "…"
 			}
 			msgCol = full
+		} else if sess.title != "" {
+			line := sess.title
+			if len(line) > colMessage {
+				line = line[:colMessage-1] + "…"
+			}
+			msgCol = line
 		} else {
 			for _, msg := range sess.chatMessages {
 				if msg.Type == MsgUser {
@@ -140,13 +198,15 @@ func renderSessionsView(sessions []*SessionState, width, height int, s Styles, s
 		}
 		plainCols := fmt.Sprintf("%-*s  %-*s  %-*s", colSession, sessionCol, colMessage, msgCol, colRunning, runningCol) + badgeSlot
 		if rowIdx == selectedRow {
-			lead := " "
+			lead, leadStyle := "  ", sessionRowSelectedStyle
 			if busy {
-				lead = spinnerFrame
+				lead = spinnerFrame + " "
+				leadStyle = leadStyle.Foreground(colorPrimary)
 			} else if hasUnread {
-				lead = "●"
+				lead = "● "
+				leadStyle = leadStyle.Foreground(colorSecondary)
 			}
-			rows = append(rows, s.TabAlertStyle.Render(lead+" "+plainCols))
+			rows = append(rows, leadStyle.Render(lead)+sessionRowSelectedStyle.Render(plainCols))
 		} else if busy {
 			rows = append(rows, sessionsSpinnerStyle.Render(spinnerFrame)+" "+plainCols)
 		} else if hasUnread {
@@ -157,8 +217,111 @@ func renderSessionsView(sessions []*SessionState, width, height int, s Styles, s
 		rowIdx++
 	}
 
+	// Vix-initiated group: live attached sessions and persisted job runs/alerts,
+	// merged into one StartedAt-ordered list. Live rows can be opened (enter) or
+	// closed (x); persisted rows opened (enter) or dismissed (x).
+	if len(vixRows) > 0 {
+		if len(rows) > 0 {
+			rows = append(rows, "")
+		}
+		rows = append(rows, groupHeader("Vix-initiated")...)
+		rows = append(rows, sessionColumnHeaderStyle.Render(header), headerRule)
+
+		// vixCols formats the three shared columns of a vix-initiated row from
+		// its record summary (id, Title, ran ago). A titled record shows the
+		// bare title (e.g. the per-item GitHub-plan title), with a ⚠️ marker when
+		// the run failed; an untitled record (a raw alert) falls back to the
+		// "<job> · <status>  <first message>" form.
+		vixCols := func(sum protocol.SessionSummary) string {
+			idCol := sum.ID
+			if dash := strings.Index(idCol, "-"); dash >= 0 {
+				idCol = idCol[:dash]
+			} else if len(idCol) > colSession {
+				idCol = idCol[:colSession]
+			}
+
+			var msgCol string
+			if sum.Title != "" {
+				msgCol = vixRowTitle(sum)
+			} else {
+				badge := ""
+				if sum.Trigger != nil && sum.Trigger.Ref != "" {
+					badge = sum.Trigger.Ref
+				}
+				status := sum.JobStatus
+				if status == "" {
+					status = "alert"
+				}
+				msgCol = badge + " · " + status
+				if sum.FirstMessage != "" {
+					msgCol += "  " + sum.FirstMessage
+				}
+			}
+			// Rune-aware truncate, then pad to the column's display width so the
+			// Running column stays aligned even when a wide glyph (⚠️) is present.
+			msgCol = truncateLabel(msgCol, colMessage)
+			if pad := colMessage - lipgloss.Width(msgCol); pad > 0 {
+				msgCol += strings.Repeat(" ", pad)
+			}
+
+			ranCol := "—"
+			if t, err := time.Parse(time.RFC3339, sum.StartedAt); err == nil {
+				ranCol = formatRunningTime(renderSince(t)) + " ago"
+			}
+			return fmt.Sprintf("%-*s  %s  %-*s", colSession, idCol, msgCol, colRunning, ranCol)
+		}
+
+		for _, row := range vixRows {
+			busy := false
+			needsInput := false
+			unread := row.sum.Unread
+			if row.live != nil {
+				busy = spinnerFrame != "" &&
+					(row.live.agentState == StateStreaming ||
+						row.live.agentState == StateToolExecuting ||
+						row.live.agentState == StatePlanExecuting)
+				needsInput = row.live.agentState == StateConfirmPending || row.live.agentState == StateUserQuestion
+				unread = row.live.unreadCount > 0
+			}
+			badgeSlot := strings.Repeat(" ", badgeVisible)
+			if needsInput {
+				badgeSlot = "  " + waitingBadge
+			}
+			plainCols := vixCols(row.sum) + badgeSlot
+			switch {
+			case rowIdx == selectedRow:
+				lead, leadStyle := "  ", sessionRowSelectedStyle
+				if busy {
+					lead = spinnerFrame + " "
+					leadStyle = leadStyle.Foreground(colorPrimary)
+				} else if unread {
+					lead = "● "
+					leadStyle = leadStyle.Foreground(colorSecondary)
+				}
+				rows = append(rows, leadStyle.Render(lead)+sessionRowSelectedStyle.Render(plainCols))
+			case busy:
+				rows = append(rows, sessionsSpinnerStyle.Render(spinnerFrame)+" "+plainCols)
+			case unread:
+				rows = append(rows, unreadDotStyle.Render("●")+" "+plainCols)
+			default:
+				rows = append(rows, "  "+plainCols)
+			}
+			rowIdx++
+		}
+	}
+
 	content := strings.Join(rows, "\n")
 	return s.ViewportFocusedStyle.Width(width).Height(height).Render(content)
+}
+
+// vixRowTitle returns the Title-column text for a titled vix-initiated row: the
+// bare session title, prefixed with a ⚠️ marker when the run failed (error or
+// timeout). Callers handle the untitled (raw-alert) fallback separately.
+func vixRowTitle(sum protocol.SessionSummary) string {
+	if st := sum.JobStatus; st == "error" || st == "timeout" {
+		return "⚠️  " + sum.Title
+	}
+	return sum.Title
 }
 
 // truncateLabel shortens s to fit within w display columns, appending an
@@ -190,6 +353,7 @@ const (
 	settingTelemetry
 	settingCompactionAuto
 	settingCompactionThreshold
+	settingClosedRetention
 	settingsItemCount
 )
 
@@ -203,6 +367,7 @@ type settingsState struct {
 	telemetry           bool
 	compactionAuto      bool
 	compactionThreshold float64
+	closedRetentionMins int
 	updateCheck         bool
 	updateCurrent       string
 	updateLatest        string // newer release tag, "" when up-to-date/unknown
@@ -239,6 +404,8 @@ func (m *Model) toggleSetting(item settingsItem) {
 		_ = config.SetUpdateCheckEnabled(!config.UpdateCheckEnabled())
 	case settingCompactionThreshold:
 		// Threshold is adjusted with ←/→, not toggled.
+	case settingClosedRetention:
+		// Retention is adjusted with ←/→, not toggled.
 	case settingUpdateAction:
 		// Handled in the Settings key handler (model.go), not here — it triggers
 		// an install/quit rather than flipping a persisted flag.
@@ -253,6 +420,9 @@ func (m *Model) toggleSetting(item settingsItem) {
 func (m *Model) handleUpdateAction() tea.Cmd {
 	switch {
 	case m.updateInstalled:
+		// Intentionally no closeSessionsForQuit here: an update quit-all is a
+		// restart, not an exit — sessions must stay in open/ and restore on
+		// relaunch regardless of the close_all_sessions_on_quit preference.
 		if sess := m.currentSession(); sess != nil {
 			_ = sess.client.SendUpdateQuit()
 		}
@@ -287,6 +457,85 @@ func (m *Model) adjustCompactionThreshold(delta float64) {
 	_ = config.SetCompactionThreshold(v)
 }
 
+// closedRetentionPresets is the ←/→ ladder for the closed-session retention
+// row, in minutes. "Never" (0) is deliberately not on the ladder — it is only
+// settable by editing settings.json by hand.
+var closedRetentionPresets = []int{
+	60,           // 1 hour
+	6 * 60,       // 6 hours
+	24 * 60,      // 1 day
+	3 * 24 * 60,  // 3 days
+	7 * 24 * 60,  // 1 week
+	14 * 24 * 60, // 2 weeks
+	30 * 24 * 60, // 1 month
+}
+
+// retentionLabel renders a retention value (minutes) for display.
+func retentionLabel(mins int) string {
+	switch {
+	case mins <= 0:
+		return "Never"
+	case mins == 60:
+		return "1 hour"
+	case mins < 24*60:
+		return fmt.Sprintf("%d hours", mins/60)
+	case mins == 24*60:
+		return "1 day"
+	case mins == 7*24*60:
+		return "1 week"
+	case mins == 14*24*60:
+		return "2 weeks"
+	case mins == 30*24*60:
+		return "1 month"
+	case mins%(24*60) == 0:
+		return fmt.Sprintf("%d days", mins/(24*60))
+	default:
+		return fmt.Sprintf("%d mn", mins)
+	}
+}
+
+// adjustClosedRetention steps the closed-session retention to the next (dir>0)
+// or previous (dir<0) preset. From a non-preset value (including the JSON-only
+// "Never"), adjusting steps onto the nearest preset in the requested direction.
+func (m *Model) adjustClosedRetention(dir int) {
+	cur := config.ClosedSessionRetentionMinutes()
+	idx := -1
+	for i, p := range closedRetentionPresets {
+		if p == cur {
+			idx = i
+			break
+		}
+	}
+	var next int
+	if idx >= 0 {
+		i := idx + dir
+		if i < 0 || i >= len(closedRetentionPresets) {
+			return
+		}
+		next = closedRetentionPresets[i]
+	} else {
+		// Off-ladder value: step onto the first preset above (→) or the last
+		// preset below (←) the current value. "Never" (0) always lands on the
+		// first preset.
+		next = closedRetentionPresets[0]
+		if dir > 0 {
+			for _, p := range closedRetentionPresets {
+				if p > cur {
+					next = p
+					break
+				}
+			}
+		} else if cur > 0 {
+			for _, p := range closedRetentionPresets {
+				if p < cur {
+					next = p
+				}
+			}
+		}
+	}
+	_ = config.SetClosedSessionRetentionMinutes(next)
+}
+
 // updateActionLabel returns the text for the selectable Updates action row,
 // reflecting the current upgrade state.
 func updateActionLabel(st settingsState) string {
@@ -306,23 +555,26 @@ func updateActionLabel(st settingsState) string {
 
 // renderSettingsView renders the Settings tab content (global preferences).
 func renderSettingsView(width, height int, s Styles, st settingsState) string {
-	dimStyle := lipgloss.NewStyle().Foreground(colorDim)
-	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(colorPrimary)
+	// Body text and section titles are white (matching the Sessions/Models
+	// tabs); primary marks the cursor row and the separator rules.
+	textStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	sectionTitleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+	cursorStyle := lipgloss.NewStyle().Bold(true).Foreground(colorPrimary)
 	innerWidth := width - 4
 	if innerWidth < 0 {
 		innerWidth = 0
 	}
 
-	sep := dimStyle.Width(innerWidth).Render(strings.Repeat("─", innerWidth))
+	sep := sessionHeaderRuleStyle.Width(innerWidth).Render(strings.Repeat("─", innerWidth))
 
 	var lines []string
 	idx := 0 // running index of selectable settings, matches settingsItem
 
 	row := func(text string) {
 		if idx == st.cursor {
-			lines = append(lines, titleStyle.Width(innerWidth).Render("▸ "+text))
+			lines = append(lines, cursorStyle.Width(innerWidth).Render("▸ "+text))
 		} else {
-			lines = append(lines, dimStyle.Width(innerWidth).Render("  "+text))
+			lines = append(lines, textStyle.Width(innerWidth).Render("  "+text))
 		}
 		idx++
 	}
@@ -353,12 +605,12 @@ func renderSettingsView(width, height int, s Styles, st settingsState) string {
 		if len(lines) > 0 {
 			lines = append(lines, "")
 		}
-		lines = append(lines, titleStyle.Width(innerWidth).Render(name), sep)
+		lines = append(lines, sectionTitleStyle.Width(innerWidth).Render(name), sep)
 	}
 
 	// infoRow renders a non-selectable display line (does not advance idx).
 	infoRow := func(label, value string) {
-		lines = append(lines, dimStyle.Width(innerWidth).Render(fmt.Sprintf("  %-16s %s", label, value)))
+		lines = append(lines, textStyle.Width(innerWidth).Render(fmt.Sprintf("  %-16s %s", label, value)))
 	}
 
 	updateAvail := st.updateLatest != ""
@@ -373,18 +625,18 @@ func renderSettingsView(width, height int, s Styles, st settingsState) string {
 		case idx == st.cursor && highlight:
 			lines = append(lines, secondaryBold.Width(innerWidth).Render("▸ "+text))
 		case idx == st.cursor:
-			lines = append(lines, titleStyle.Width(innerWidth).Render("▸ "+text))
+			lines = append(lines, cursorStyle.Width(innerWidth).Render("▸ "+text))
 		case highlight:
 			lines = append(lines, secondary.Width(innerWidth).Render("  "+text))
 		default:
-			lines = append(lines, dimStyle.Width(innerWidth).Render("  "+text))
+			lines = append(lines, textStyle.Width(innerWidth).Render("  "+text))
 		}
 		idx++
 	}
 
 	// Updates section — first, so a pending upgrade is the first thing seen. The
 	// title is tinted secondary when an update is available.
-	updTitle := titleStyle
+	updTitle := sectionTitleStyle
 	if updateAvail {
 		updTitle = secondaryBold
 	}
@@ -416,7 +668,10 @@ func renderSettingsView(width, height int, s Styles, st settingsState) string {
 	toggleRow("Auto-compaction", st.compactionAuto)
 	sliderRow("Threshold       ", st.compactionThreshold)
 
-	lines = append(lines, "", dimStyle.Italic(true).Width(innerWidth).Render("↑↓ navigate · Enter toggle/select · ←→ adjust threshold"))
+	section("Sessions")
+	row(fmt.Sprintf("Closed session retention  ‹ %s ›", retentionLabel(st.closedRetentionMins)))
+
+	lines = append(lines, "", textStyle.Italic(true).Width(innerWidth).Render("↑↓ navigate · Enter toggle/select · ←→ adjust"))
 
 	content := strings.Join(lines, "\n")
 	return s.ViewportFocusedStyle.Width(width).Height(height).Render(content)
@@ -460,7 +715,8 @@ const modelsProviderColWidth = 20
 // the cursor index relative to the given slice (-1 when the cursor is outside
 // the slice, e.g. scrolled out of view).
 func renderModelGrid(models []ModelInfo, colWidth int, focused bool, modelSel int, activeModel string) []string {
-	dimStyle := lipgloss.NewStyle().Foreground(colorDim)
+	// Body text on the Models tab is white by design (matches the Sessions tab).
+	textStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
 	const cellGutter = 1
 	cellWidth := (colWidth - cellGutter*(modelGridCols-1)) / modelGridCols
 	if cellWidth < 8 {
@@ -478,7 +734,7 @@ func renderModelGrid(models []ModelInfo, colWidth int, focused bool, modelSel in
 			}
 			idx := r*modelGridCols + c
 			if idx >= len(models) {
-				cells = append(cells, dimStyle.Width(cellWidth).Render(""))
+				cells = append(cells, textStyle.Width(cellWidth).Render(""))
 				continue
 			}
 			m := models[idx]
@@ -500,7 +756,7 @@ func renderModelGrid(models []ModelInfo, colWidth int, focused bool, modelSel in
 			case isActive:
 				rendered = lipgloss.NewStyle().Foreground(colorSecondary).Width(cellWidth).Render(label)
 			default:
-				rendered = dimStyle.Width(cellWidth).Render(label)
+				rendered = textStyle.Width(cellWidth).Render(label)
 			}
 			cells = append(cells, rendered)
 		}
@@ -517,8 +773,9 @@ const modelsViewportChrome = 1
 // modelsHeaderLines returns the number of terminal lines the Models-tab right
 // column renders before the model grid, for the given auth + login state. The
 // renderer and the key handler both call it so the grid window and the scroll
-// clamp agree on how many rows fit.
-func modelsHeaderLines(st config.ProviderAuthStatus, loginStatus string) int {
+// clamp agree on how many rows fit. Local providers render one extra line: the
+// server reachability status.
+func modelsHeaderLines(st config.ProviderAuthStatus, loginStatus string, isLocal bool) int {
 	n := 2 // "Credentials" title + separator
 	// Each credential method renders a status row plus a buttons row; a method
 	// with a stored user-supplied base URL adds one more line.
@@ -531,6 +788,9 @@ func modelsHeaderLines(st config.ProviderAuthStatus, loginStatus string) int {
 	if loginStatus != "" {
 		n++
 	}
+	if isLocal {
+		n++ // server status line
+	}
 	// Models section header: blank, "Models:" title (with count), separator,
 	// filter line, two help lines, blank.
 	n += 7
@@ -539,8 +799,8 @@ func modelsHeaderLines(st config.ProviderAuthStatus, loginStatus string) int {
 
 // modelsGridRows returns how many grid rows fit in a Models-tab viewport of the
 // given height for the given auth/login state. Always >= 1.
-func modelsGridRows(height int, st config.ProviderAuthStatus, loginStatus string) int {
-	rows := height - modelsViewportChrome - modelsHeaderLines(st, loginStatus)
+func modelsGridRows(height int, st config.ProviderAuthStatus, loginStatus string, isLocal bool) int {
+	rows := height - modelsViewportChrome - modelsHeaderLines(st, loginStatus, isLocal)
 	if rows < 1 {
 		rows = 1
 	}
@@ -548,16 +808,20 @@ func modelsGridRows(height int, st config.ProviderAuthStatus, loginStatus string
 }
 
 // renderModelsView renders the Models tab: a provider column (split into logged
-// in / available) on the left, and an authentication panel + model grid for the
-// selected provider on the right.
+// in / local / available) on the left, and an authentication panel + model grid
+// for the selected provider on the right. Local providers carry a reachability
+// dot and their model grid is the live-discovered server list.
 func renderModelsView(width, height int, s Styles,
-	loggedIn, available []string,
+	loggedIn, local, available []string,
 	status map[string]config.ProviderAuthStatus,
+	localUI map[string]LocalProviderUI,
 	providerSel int, focus modelsFocusArea,
 	authRow, authBtn, modelSel, modelScroll int,
 	modelFilter, activeModel, loginStatus string) string {
 
-	dimStyle := lipgloss.NewStyle().Foreground(colorDim)
+	// Body text on the Models tab is white by design (matches the Sessions
+	// tab); primary marks the focused cursor, secondary marks active/status.
+	textStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
 	secondaryStyle := lipgloss.NewStyle().Foreground(colorSecondary)
 	innerWidth := width - 4
 	if innerWidth < 0 {
@@ -576,24 +840,35 @@ func renderModelsView(width, height int, s Styles,
 		rightWidth = 10
 	}
 
-	flat := append(append([]string{}, loggedIn...), available...)
+	// Display (and navigation) order: logged in, then available, then local
+	// last — must stay in lockstep with Model.modelsFlat.
+	flat := append(append(append([]string{}, loggedIn...), available...), local...)
 	provider := ""
 	if providerSel >= 0 && providerSel < len(flat) {
 		provider = flat[providerSel]
 	}
 	activeProvider := ProviderOf(activeModel)
+	_, providerIsLocal := localUI[provider]
+	if !providerIsLocal {
+		for _, name := range local {
+			if name == provider {
+				providerIsLocal = true
+				break
+			}
+		}
+	}
 
 	// ---- left: provider column ----
 	var leftLines []string
 	leftLines = append(leftLines,
-		lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Width(colWidth).Render("Providers"),
-		dimStyle.Width(colWidth).Render(strings.Repeat("─", colWidth)),
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Width(colWidth).Render("Providers"),
+		sessionHeaderRuleStyle.Width(colWidth).Render(strings.Repeat("─", colWidth)),
 	)
 	flatIdx := 0
-	renderGroup := func(header string, names []string) {
-		leftLines = append(leftLines, "", dimStyle.Bold(true).Underline(true).Width(colWidth).Render(header))
+	renderGroup := func(header string, names []string, dots bool) {
+		leftLines = append(leftLines, "", textStyle.Bold(true).Underline(true).Width(colWidth).Render(header))
 		if len(names) == 0 {
-			leftLines = append(leftLines, dimStyle.Italic(true).Width(colWidth).Render("  —"))
+			leftLines = append(leftLines, textStyle.Italic(true).Width(colWidth).Render("  —"))
 			return
 		}
 		for _, name := range names {
@@ -604,6 +879,13 @@ func renderModelsView(width, height int, s Styles,
 				prefix = "▸ "
 			}
 			label := prefix + DisplayNameForProvider(name)
+			if dots {
+				dot := "○ " // unreachable, or probe not answered yet
+				if localUI[name].Reachable {
+					dot = "● "
+				}
+				label = prefix + dot + DisplayNameForProvider(name)
+			}
 			if name == activeProvider {
 				label += " ★"
 			}
@@ -613,24 +895,25 @@ func renderModelsView(width, height int, s Styles,
 			case isSelected:
 				leftLines = append(leftLines, secondaryStyle.Width(colWidth).Render(label))
 			default:
-				leftLines = append(leftLines, dimStyle.Width(colWidth).Render(label))
+				leftLines = append(leftLines, textStyle.Width(colWidth).Render(label))
 			}
 			flatIdx++
 		}
 	}
-	renderGroup("Logged in:", loggedIn)
-	renderGroup("Available:", available)
+	renderGroup("Logged in:", loggedIn, false)
+	renderGroup("Available:", available, false)
+	renderGroup("Local:", local, true)
 
 	// ---- right: authentication + models ----
 	st := status[provider]
 	authActive := focus == modelsFocusAuth
-	sep := dimStyle.Width(rightWidth).Render(strings.Repeat("─", rightWidth))
+	sep := sessionHeaderRuleStyle.Width(rightWidth).Render(strings.Repeat("─", rightWidth))
 
 	authTitle := lipgloss.NewStyle().Bold(true)
 	if authActive {
 		authTitle = authTitle.Foreground(colorPrimary)
 	} else {
-		authTitle = authTitle.Foreground(colorDim)
+		authTitle = authTitle.Foreground(lipgloss.Color("15"))
 	}
 
 	var rightLines []string
@@ -652,7 +935,7 @@ func renderModelsView(width, height int, s Styles,
 			if authActive && authRow == row && authBtn == i {
 				cells = append(cells, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render(text))
 			} else {
-				cells = append(cells, dimStyle.Render(text))
+				cells = append(cells, textStyle.Render(text))
 			}
 		}
 		return "    " + strings.Join(cells, "  ")
@@ -670,7 +953,7 @@ func renderModelsView(width, height int, s Styles,
 		}
 		rightLines = append(rightLines, ms.Label+": "+val+defaultTag(ms.IsDefault))
 		if ms.RequiresBaseURL && ms.Stored && ms.BaseURL != "" {
-			rightLines = append(rightLines, dimStyle.Render("    ↳ "+ms.BaseURL))
+			rightLines = append(rightLines, textStyle.Render("    ↳ "+ms.BaseURL))
 		}
 		rightLines = append(rightLines, renderButtons(row, authButtonsFor(ms)))
 	}
@@ -679,19 +962,38 @@ func renderModelsView(width, height int, s Styles,
 		rightLines = append(rightLines, secondaryStyle.Render(loginStatus))
 	}
 
+	// Server status line for local providers: reachability dot + endpoint.
+	// The API key above is optional (proxied servers only) — say so.
+	if providerIsLocal {
+		ui := localUI[provider]
+		var serverLine string
+		switch {
+		case !ui.Fetched:
+			serverLine = textStyle.Render("Server: probing…")
+		case ui.Reachable:
+			serverLine = "Server: " + secondaryStyle.Render("●") + " " + ui.BaseURL + textStyle.Render(" — running · no API key required")
+		default:
+			serverLine = "Server: " + textStyle.Render("○ "+ui.BaseURL+" — not reachable")
+		}
+		rightLines = append(rightLines, serverLine)
+	}
+
 	// Models section.
 	modelsTitle := lipgloss.NewStyle().Bold(true)
 	if focus == modelsFocusModels {
 		modelsTitle = modelsTitle.Foreground(colorPrimary)
 	} else {
-		modelsTitle = modelsTitle.Foreground(colorDim)
+		modelsTitle = modelsTitle.Foreground(lipgloss.Color("15"))
 	}
 
 	allModels := DisplayModelsForProvider(provider)
+	if providerIsLocal {
+		allModels = localUI[provider].Models
+	}
 	filtered := FilterModels(allModels, modelFilter)
 
 	// Window the filtered list to the rows that fit, keeping the cursor visible.
-	gridRows := modelsGridRows(height, st, loginStatus)
+	gridRows := modelsGridRows(height, st, loginStatus, providerIsLocal)
 	maxVisible := gridRows * modelGridCols
 	totalRows := (len(filtered) + modelGridCols - 1) / modelGridCols
 	maxScrollRow := totalRows - gridRows
@@ -717,7 +1019,7 @@ func renderModelsView(width, height int, s Styles,
 	shown := len(window)
 
 	titleLine := modelsTitle.Render("Models:") + "   " +
-		dimStyle.Render(fmt.Sprintf("showing %d of %d", shown, len(filtered)))
+		textStyle.Render(fmt.Sprintf("showing %d of %d", shown, len(filtered)))
 	rightLines = append(rightLines, "", titleLine, sep)
 
 	// Filter line — type-to-filter while the grid is focused.
@@ -727,14 +1029,14 @@ func renderModelsView(width, height int, s Styles,
 	}
 	var filterLine string
 	if modelFilter == "" && focus != modelsFocusModels {
-		filterLine = dimStyle.Render("Filter: (type while focused to filter)")
+		filterLine = textStyle.Render("Filter: (type while focused to filter)")
 	} else {
 		filterLine = "Filter: " + secondaryStyle.Render(modelFilter) + caret
 	}
 	rightLines = append(rightLines,
 		filterLine,
-		dimStyle.Render("Selecting a model updates the default model for chat."),
-		dimStyle.Render("For workflows see https://getvix.dev/doc#workflows"),
+		textStyle.Render("Selecting a model updates the default model for chat."),
+		textStyle.Render("For workflows see https://getvix.dev/doc#workflows"),
 		"",
 	)
 
@@ -744,6 +1046,25 @@ func renderModelsView(width, height int, s Styles,
 	}
 	grid := renderModelGrid(window, rightWidth, focus == modelsFocusModels, selInWindow, activeModel)
 	rightLines = append(rightLines, grid...)
+
+	// Empty-state hints for local providers (rendered in the grid's space).
+	if providerIsLocal && len(filtered) == 0 && modelFilter == "" {
+		ui := localUI[provider]
+		hint := ""
+		switch {
+		case ui.Fetched && !ui.Reachable && provider == "ollama":
+			hint = "  server not reachable — start it with: ollama serve"
+		case ui.Fetched && !ui.Reachable:
+			hint = "  server not reachable — start it with: llama-server -m <model.gguf>"
+		case ui.Fetched && provider == "ollama":
+			hint = "  no models installed — try: ollama pull qwen3"
+		case ui.Fetched:
+			hint = "  no models reported by the server"
+		}
+		if hint != "" {
+			rightLines = append(rightLines, textStyle.Italic(true).Width(rightWidth).Render(hint))
+		}
+	}
 
 	// Footer for an active model that isn't in the provider's catalogue at all
 	// (e.g. a custom OpenRouter route set via agent frontmatter).
@@ -756,7 +1077,7 @@ func renderModelsView(width, height int, s Styles,
 			}
 		}
 		if !found {
-			rightLines = append(rightLines, dimStyle.Italic(true).Width(rightWidth).Render("  (custom: "+activeModel+")"))
+			rightLines = append(rightLines, textStyle.Italic(true).Width(rightWidth).Render("  (custom: "+activeModel+")"))
 		}
 	}
 

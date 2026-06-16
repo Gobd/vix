@@ -147,18 +147,24 @@ func TestListStoredProviderKeys(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "")
 	t.Setenv("MINIMAX_API_KEY", "")
 	t.Setenv("MIMO_API_KEY", "")
+	t.Setenv("AWS_BEARER_TOKEN_BEDROCK", "")
+	t.Setenv("OLLAMA_API_KEY", "")
+	t.Setenv("LLAMACPP_API_KEY", "")
 	DeleteProviderKey("anthropic")
 	DeleteProviderKey("openai")
 	DeleteProviderKey("openrouter")
 	DeleteProviderKey("minimax")
 	DeleteProviderKey("mimo")
+	DeleteProviderKey("bedrock")
+	DeleteProviderKey("ollama")
+	DeleteProviderKey("llamacpp")
 
 	StoreProviderKey("anthropic", "sk-ant-test-key")
 	defer DeleteProviderKey("anthropic")
 
 	keys := ListStoredProviderKeys()
-	if len(keys) != 5 {
-		t.Fatalf("expected 5 provider entries, got %d", len(keys))
+	if len(keys) != 8 {
+		t.Fatalf("expected 8 provider entries, got %d", len(keys))
 	}
 
 	anthropicFound := false
@@ -222,5 +228,32 @@ func TestMiMoTokenPlanCredential(t *testing.T) {
 	t.Setenv("MIMO_TOKENPLAN_BASE_URL", "https://override.example/v1")
 	if got := ResolveProviderCredential("mimo").BaseURL; got != "https://override.example/v1" {
 		t.Errorf("env override baseURL = %q, want the override", got)
+	}
+}
+
+// TestLocalProviderCredential covers keyless local providers (NoneAuth): with
+// nothing configured, resolution yields the placeholder credential; a set env
+// key wins because the api_key method is declared first.
+func TestLocalProviderCredential(t *testing.T) {
+	t.Setenv("OLLAMA_API_KEY", "")
+	DeleteProviderKey("ollama")
+
+	cred := ResolveProviderCredential("ollama")
+	if cred.Value == "" || cred.Source != KeySourceLocal {
+		t.Errorf("keyless resolution = %+v, want placeholder with KeySourceLocal", cred)
+	}
+
+	// An explicit key (e.g. proxied Ollama) takes precedence.
+	t.Setenv("OLLAMA_API_KEY", "proxy-secret")
+	cred = ResolveProviderCredential("ollama")
+	if cred.Value != "proxy-secret" || cred.Source != KeySourceEnv {
+		t.Errorf("env-key resolution = %+v, want proxy-secret from env", cred)
+	}
+
+	// The status panel surfaces only the user-manageable API-key method; the
+	// none method is implicit and never rendered as a row.
+	st := GetProviderAuthStatus("ollama")
+	if len(st.Methods) != 1 || st.Methods[0].Label != "API Key" {
+		t.Errorf("ollama auth status = %+v, want a single API Key method", st.Methods)
 	}
 }
