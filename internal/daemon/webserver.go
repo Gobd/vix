@@ -16,8 +16,6 @@ import (
 	"time"
 
 	"github.com/get-vix/vix/internal/config"
-	"github.com/get-vix/vix/internal/daemon/hooks"
-	"github.com/get-vix/vix/internal/daemon/jobs"
 	"golang.org/x/net/websocket"
 )
 
@@ -68,6 +66,9 @@ func StartWebServer(ctx context.Context, s *Server, port int) {
 		w.Write(data)
 	})
 
+	// Create a scheduled job from the web UI (local origins only).
+	mux.HandleFunc("/api/jobs", handleCreateJob(s))
+
 	// New per-session API routes
 	mux.HandleFunc("/api/session/{id}/interview-data", handleInterviewData(s))
 	mux.HandleFunc("/api/session/{id}/signed-url", handleSignedURL(s))
@@ -92,18 +93,18 @@ func StartWebServer(ctx context.Context, s *Server, port int) {
 			}
 		}()
 
-		if err := sendUpdate(conn, s.Version(), s.Sessions(), collectVitals(), s.Jobs(), s.Hooks()); err != nil {
+		if err := sendUpdate(conn, s); err != nil {
 			return
 		}
 
 		for {
 			select {
 			case <-ch:
-				if err := sendUpdate(conn, s.Version(), s.Sessions(), collectVitals(), s.Jobs(), s.Hooks()); err != nil {
+				if err := sendUpdate(conn, s); err != nil {
 					return
 				}
 			case <-ticker.C:
-				if err := sendUpdate(conn, s.Version(), s.Sessions(), collectVitals(), s.Jobs(), s.Hooks()); err != nil {
+				if err := sendUpdate(conn, s); err != nil {
 					return
 				}
 			case <-readDone:
@@ -290,8 +291,15 @@ func handleCallAgent(s *Server) http.HandlerFunc {
 	}
 }
 
-func sendUpdate(conn *websocket.Conn, version string, sessions []SessionInfo, vitals ServerVitals, jobList []jobs.JobSnapshot, hookList []hooks.HookSnapshot) error {
-	data, err := json.Marshal(wsMessage{Sessions: sessions, Vitals: vitals, Jobs: jobList, Hooks: hookList, Version: version})
+func sendUpdate(conn *websocket.Conn, s *Server) error {
+	data, err := json.Marshal(wsMessage{
+		Sessions:   s.Sessions(),
+		Vitals:     collectVitals(),
+		Jobs:       s.Jobs(),
+		Hooks:      s.Hooks(),
+		DefaultCWD: s.DefaultCWD(),
+		Version:    s.Version(),
+	})
 	if err != nil {
 		return err
 	}
