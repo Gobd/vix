@@ -59,6 +59,9 @@ type TurnHooks struct {
 	// timeout. The caller appends a nudge message and retries; this hook
 	// lets the TUI surface the event.
 	OnThinkingStall func(elapsedMs int64, summaryChars int)
+	// ConfirmFn, when non-nil, is called when a tool requires user confirmation.
+	// Signature matches dispatchOptions.confirmFn. Nil means deny immediately.
+	ConfirmFn func(ctx context.Context, name string, input map[string]any) (approved, cancelled bool)
 }
 
 // BackgroundTask tracks an in-flight or completed background subagent.
@@ -290,7 +293,11 @@ func subagentDispatchToolCalls(
 		toolTimeoutDefault: toolTimeoutDefault,
 		toolTimeoutMax:     toolTimeoutMax,
 		executeTool: func(name string, input map[string]any) *ToolResult {
-			input["confirmed"] = true
+			if hooks == nil || hooks.ConfirmFn == nil {
+				// No confirmation bubbling: approve unconditionally so subagent
+				// tools never block waiting for a human.
+				input["confirmed"] = true
+			}
 			result, err := executeTool(name, input, cwd)
 			if err != nil {
 				return &ToolResult{Output: err.Error(), IsError: true}
@@ -307,6 +314,9 @@ func subagentDispatchToolCalls(
 				hooks.OnToolResult(toolID, name, input, output, isError)
 			}
 		},
+	}
+	if hooks != nil && hooks.ConfirmFn != nil {
+		opts.confirmFn = hooks.ConfirmFn
 	}
 	return dispatchToolCalls(ctx, msg, opts)
 }

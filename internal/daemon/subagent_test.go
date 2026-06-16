@@ -1,9 +1,12 @@
 package daemon
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/get-vix/vix/internal/daemon/llm"
 )
 
 // ── parseAgentFile ──
@@ -204,4 +207,81 @@ func TestLoadCustomAgents(t *testing.T) {
 			t.Errorf("expected 0 agents, got %d", len(agents))
 		}
 	})
+}
+
+// ── subagentDispatchToolCalls ──
+
+func minimalToolUseMessage(toolName string, input map[string]any) *llm.Message {
+	return &llm.Message{
+		Content: []llm.ContentBlock{
+			{
+				Type:  llm.BlockToolUse,
+				ID:    "tu_test",
+				Name:  toolName,
+				Input: input,
+			},
+		},
+		ToolCalls: []llm.ToolCall{
+			{
+				ID:    "tu_test",
+				Name:  toolName,
+				Input: input,
+			},
+		},
+	}
+}
+
+func TestSubagentDispatchToolCalls_ConfirmFnCalled(t *testing.T) {
+	called := false
+	hooks := &TurnHooks{
+		ConfirmFn: func(ctx context.Context, name string, input map[string]any) (approved, cancelled bool) {
+			called = true
+			return true, false
+		},
+	}
+
+	executeTool := func(name string, params map[string]any, cwd string) (*ToolResult, error) {
+		if _, ok := params["confirmed"]; !ok {
+			return &ToolResult{NeedsConfirmation: true, ToolName: name, Params: params}, nil
+		}
+		return &ToolResult{Output: "ok"}, nil
+	}
+
+	msg := minimalToolUseMessage("bash", map[string]any{"command": "echo hi"})
+	results := subagentDispatchToolCalls(context.Background(), msg, executeTool, "/tmp", hooks, 0, 0)
+
+	if !called {
+		t.Fatal("expected ConfirmFn to be called for NeedsConfirmation result")
+	}
+	if len(results) == 0 {
+		t.Fatal("expected tool results")
+	}
+	if results[0].IsError {
+		t.Fatalf("expected tool to run successfully after ConfirmFn approved it, got error: %s", results[0].Output)
+	}
+	if results[0].Output != "ok" {
+		t.Errorf("expected output 'ok', got %q", results[0].Output)
+	}
+}
+
+func TestSubagentDispatchToolCalls_NilConfirmFnAutoApproves(t *testing.T) {
+	executeTool := func(name string, params map[string]any, cwd string) (*ToolResult, error) {
+		if _, ok := params["confirmed"]; !ok {
+			return &ToolResult{NeedsConfirmation: true, ToolName: name, Params: params}, nil
+		}
+		return &ToolResult{Output: "ok"}, nil
+	}
+
+	msg := minimalToolUseMessage("bash", map[string]any{"command": "echo hi"})
+	results := subagentDispatchToolCalls(context.Background(), msg, executeTool, "/tmp", nil, 0, 0)
+
+	if len(results) == 0 {
+		t.Fatal("expected result blocks")
+	}
+	if results[0].IsError {
+		t.Fatalf("expected auto-approval to allow tool to run successfully, got error: %s", results[0].Output)
+	}
+	if results[0].Output != "ok" {
+		t.Errorf("expected output 'ok' from auto-approved tool, got %q", results[0].Output)
+	}
 }

@@ -557,7 +557,7 @@ func TestUnreadRoundTrip(t *testing.T) {
 func TestMarkReadCommandClearsUnread(t *testing.T) {
 	paths := testPaths(t)
 	srv := NewServer("/tmp/unused.sock", config.Credential{}, "t", "m", &config.DaemonConfig{}, nil)
-	sess := NewSession("sess-mr", srv, nil, "m", "/work", paths.Override(), false, true, true, true, context.Background())
+	sess := NewSession("sess-mr", srv, nil, "m", "/work", paths.Override(), false, true, true, true, false, context.Background())
 
 	sess.unread = true
 	sess.persist()

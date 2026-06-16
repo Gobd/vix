@@ -2707,6 +2707,73 @@ func resolveConfirmation(ctx context.Context, t *toolTask, opts dispatchOptions)
 	return opts.executeTool(t.toolUse.Name, p)
 }
 
+// buildConfirmFn returns the confirmation closure used both by
+// sessionDispatchToolCalls and by foreground subagents.
+func (s *Session) buildConfirmFn() func(ctx context.Context, name string, input map[string]any) (approved, cancelled bool) {
+	return func(ctx context.Context, name string, input map[string]any) (approved, cancelled bool) {
+		// Extract requested directories for directory-access confirmations.
+		var requestedDirs []string
+		if rd, ok := input["_requested_dirs"].([]string); ok {
+			requestedDirs = rd
+		}
+		// Extract suggested pattern for bash/URL confirmations.
+		suggestedPattern, _ := input["_suggested_pattern"].(string)
+		s.emit("event.confirm_request", protocol.EventConfirmRequest{
+			ToolName:         name,
+			Params:           snapshotInput(input),
+			RequestedDirs:    requestedDirs,
+			Detail:           buildConfirmDetail(s.cwd, name, input),
+			SuggestedPattern: suggestedPattern,
+		})
+		cmd, ok := s.waitForCommand(s.ctx, "session.confirm")
+		if !ok {
+			return false, true
+		}
+		var confirmData protocol.SessionConfirmData
+		json.Unmarshal(cmd.Data, &confirmData)
+		// If approved and directories were requested, add them to the session.
+		if confirmData.Approved && len(requestedDirs) > 0 {
+			for _, dir := range requestedDirs {
+				s.addAllowedDir(dir)
+			}
+			if confirmData.PersistDirs {
+				s.persistAllowedDirs(requestedDirs)
+			}
+			// Clean the internal field before re-execution.
+			delete(input, "_requested_dirs")
+		}
+		// If approved and this is a write-class tool, remember the file for auto-approval.
+		if confirmData.Approved && writeClassTools[name] {
+			if pathStr, ok := input["path"].(string); ok {
+				if resolved, err := resolvePathInAllowed(s.cwd, s.toolAllowedDirs(), pathStr); err == nil {
+					s.addApprovedWriteFile(resolved)
+				}
+			}
+		}
+		// If the user chose "Always allow" on a write tool, persist the directory.
+		if confirmData.PersistWriteDir != "" {
+			dir := confirmData.PersistWriteDir
+			s.addAllowedDir(dir)
+			s.persistAllowedDirs([]string{dir})
+		}
+		if confirmData.PersistBashPattern != "" {
+			if err := PersistApprovedBashPrefix(s.paths.ProjectSettingsWrite(), confirmData.PersistBashPattern); err != nil {
+				log.Printf("[session] failed to persist bash prefix: %v", err)
+			} else {
+				s.approvedBashPrefixes = append(s.approvedBashPrefixes, confirmData.PersistBashPattern)
+			}
+		}
+		if confirmData.PersistURLPattern != "" {
+			if err := PersistApprovedURLPrefix(s.paths.ProjectSettingsWrite(), confirmData.PersistURLPattern); err != nil {
+				log.Printf("[session] failed to persist url prefix: %v", err)
+			} else {
+				s.approvedURLPrefixes = append(s.approvedURLPrefixes, confirmData.PersistURLPattern)
+			}
+		}
+		return confirmData.Approved, false
+	}
+}
+
 // sessionDispatchToolCalls is the Session-specific wrapper around the unified dispatcher.
 func (s *Session) sessionDispatchToolCalls(ctx context.Context, msg *llm.Message) []llm.ContentBlock {
 	def, maxv := s.toolTimeoutBounds()
@@ -2749,68 +2816,7 @@ func (s *Session) sessionDispatchToolCalls(ctx context.Context, msg *llm.Message
 			}
 			return nil, false
 		},
-		confirmFn: func(ctx context.Context, name string, input map[string]any) (approved, cancelled bool) {
-			// Extract requested directories for directory-access confirmations.
-			var requestedDirs []string
-			if rd, ok := input["_requested_dirs"].([]string); ok {
-				requestedDirs = rd
-			}
-			// Extract suggested pattern for bash/URL confirmations.
-			suggestedPattern, _ := input["_suggested_pattern"].(string)
-			s.emit("event.confirm_request", protocol.EventConfirmRequest{
-				ToolName:         name,
-				Params:           snapshotInput(input),
-				RequestedDirs:    requestedDirs,
-				Detail:           buildConfirmDetail(s.cwd, name, input),
-				SuggestedPattern: suggestedPattern,
-			})
-			cmd, ok := s.waitForCommand(s.ctx, "session.confirm")
-			if !ok {
-				return false, true
-			}
-			var confirmData protocol.SessionConfirmData
-			json.Unmarshal(cmd.Data, &confirmData)
-			// If approved and directories were requested, add them to the session.
-			if confirmData.Approved && len(requestedDirs) > 0 {
-				for _, dir := range requestedDirs {
-					s.addAllowedDir(dir)
-				}
-				if confirmData.PersistDirs {
-					s.persistAllowedDirs(requestedDirs)
-				}
-				// Clean the internal field before re-execution.
-				delete(input, "_requested_dirs")
-			}
-			// If approved and this is a write-class tool, remember the file for auto-approval.
-			if confirmData.Approved && writeClassTools[name] {
-				if pathStr, ok := input["path"].(string); ok {
-					if resolved, err := resolvePathInAllowed(s.cwd, s.toolAllowedDirs(), pathStr); err == nil {
-						s.addApprovedWriteFile(resolved)
-					}
-				}
-			}
-			// If the user chose "Always allow" on a write tool, persist the directory.
-			if confirmData.PersistWriteDir != "" {
-				dir := confirmData.PersistWriteDir
-				s.addAllowedDir(dir)
-				s.persistAllowedDirs([]string{dir})
-			}
-			if confirmData.PersistBashPattern != "" {
-				if err := PersistApprovedBashPrefix(s.paths.ProjectSettingsWrite(), confirmData.PersistBashPattern); err != nil {
-					log.Printf("[session] failed to persist bash prefix: %v", err)
-				} else {
-					s.approvedBashPrefixes = append(s.approvedBashPrefixes, confirmData.PersistBashPattern)
-				}
-			}
-			if confirmData.PersistURLPattern != "" {
-				if err := PersistApprovedURLPrefix(s.paths.ProjectSettingsWrite(), confirmData.PersistURLPattern); err != nil {
-					log.Printf("[session] failed to persist url prefix: %v", err)
-				} else {
-					s.approvedURLPrefixes = append(s.approvedURLPrefixes, confirmData.PersistURLPattern)
-				}
-			}
-			return confirmData.Approved, false
-		},
+		confirmFn: s.buildConfirmFn(),
 		emitToolCall: func(ev protocol.EventToolCall) {
 			s.emit("event.tool_call", ev)
 		},
@@ -3014,7 +3020,9 @@ func (s *Session) handleSpawnAgent(ctx context.Context, input map[string]any) (s
 	def, maxv := s.toolTimeoutBounds()
 	agentID := nextTaskID()
 	s.fireSubagentStart(agentType, agentID, prompt)
-	result, err := RunSubagent(ctx, config, prompt, cred, parentModel, s.server.plugins, executeTool, s.cwd, s.emitHooks(), def, maxv, s.searchDirsSlice()...)
+	subHooks := s.emitHooks()
+	subHooks.ConfirmFn = s.buildConfirmFn()
+	result, err := RunSubagent(ctx, config, prompt, cred, parentModel, s.server.plugins, executeTool, s.cwd, subHooks, def, maxv, s.searchDirsSlice()...)
 	s.fireSubagentStop(agentType, agentID, result)
 
 	if err != nil {
@@ -3037,7 +3045,9 @@ func (s *Session) RunExploration(ctx context.Context, agentName, prompt string) 
 		return s.executeToolConfirmed(ctx, name, params), nil
 	}
 	def, maxv := s.toolTimeoutBounds()
-	return RunSubagent(ctx, config, prompt, s.llm.Credential(), s.model, s.server.plugins, executeTool, s.cwd, nil, def, maxv, s.searchDirsSlice()...)
+	subHooks := s.emitHooks()
+	subHooks.ConfirmFn = s.buildConfirmFn()
+	return RunSubagent(ctx, config, prompt, s.llm.Credential(), s.model, s.server.plugins, executeTool, s.cwd, subHooks, def, maxv, s.searchDirsSlice()...)
 }
 
 func (s *Session) handleTaskOutput(ctx context.Context, input map[string]any) (string, bool) {
