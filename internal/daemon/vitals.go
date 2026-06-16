@@ -17,9 +17,10 @@ type ServerVitals struct {
 
 // wsMessage is the envelope sent over the WebSocket connection.
 type wsMessage struct {
-	Sessions []SessionInfo        `json:"sessions"`
-	Vitals   ServerVitals         `json:"vitals"`
-	Jobs     []jobs.JobSnapshot   `json:"jobs"`
-	Hooks    []hooks.HookSnapshot `json:"hooks"`
-	Version  string               `json:"version"`
+	Sessions   []SessionInfo        `json:"sessions"`
+	Vitals     ServerVitals         `json:"vitals"`
+	Jobs       []jobs.JobSnapshot   `json:"jobs"`
+	Hooks      []hooks.HookSnapshot `json:"hooks"`
+	DefaultCWD string               `json:"default_cwd"`
+	Version    string               `json:"version"`
 }

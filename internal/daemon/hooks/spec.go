@@ -1,6 +1,7 @@
 // Package hooks implements vixd's lifecycle-hooks engine: user-authored hook
-// specs (~/.vix/hooks/<id>.json) that fire on agent-loop events (a tool about
-// to run, a prompt submitted, a session starting, …) rather than on a timer.
+// specs (~/.vix/hooks/<id>/hook.json) that fire on agent-loop events (a tool
+// about to run, a prompt submitted, a session starting, …) rather than on a
+// timer.
 //
 // A hook either runs synchronously and returns a Decision that can veto/rewrite
 // the triggering action (mode "sync"), or fires-and-forgets in an isolated
@@ -76,8 +77,8 @@ type Permissions struct {
 	AutoDirs  *bool `json:"auto_dirs,omitempty"`
 }
 
-// Spec is a user-authored hook definition, one JSON file per hook under
-// ~/.vix/hooks/. Exactly one action runs: Command, a workflow (named via
+// Spec is a user-authored hook definition, one hook.json per hook under
+// ~/.vix/hooks/<id>/. Exactly one action runs: Command, a workflow (named via
 // WorkflowID or embedded inline in Workflow), or Prompt.
 type Spec struct {
 	ID       string      `json:"id"`

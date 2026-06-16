@@ -166,6 +166,11 @@ type Session struct {
 	// the job runner just before the final persist so the record carries it
 	// (retention exempts failures from auto-dismissal; the TUI shows a badge).
 	jobStatus string
+	// jobDir is the absolute job directory (~/.vix/jobs/<id>) for scheduled
+	// runs, set by the job runner. It surfaces to workflow templates as
+	// $(workflow.dir) so a run can keep persistent state (e.g. a memory file)
+	// alongside its spec. Empty for non-job sessions.
+	jobDir string
 	// unread is the session-global "has content the user hasn't seen" flag.
 	// Set whenever a turn or workflow run completes (new content), cleared by
 	// the session.mark_read command the TUI sends when the user views the

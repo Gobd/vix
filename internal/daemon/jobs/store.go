@@ -4,9 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -18,8 +18,9 @@ const (
 	StatusTimeout = "timeout"
 )
 
-// State is the machine-written runtime state of one job, persisted as a single
-// map keyed by job id in ~/.vix/jobs-state.json. Never hand-edited.
+// State is the machine-written runtime state of one job, persisted as
+// <id>/state.json inside the job's own subdirectory (a sibling of job.json).
+// Never hand-edited.
 type State struct {
 	NextRunAt         time.Time `json:"next_run_at,omitempty"`
 	LastRunAt         time.Time `json:"last_run_at,omitempty"`
@@ -40,26 +41,28 @@ type State struct {
 	SpecHash string `json:"spec_hash,omitempty"`
 }
 
-// Store reads job specs from a directory and round-trips the state file.
+// Store reads job specs from a directory and round-trips per-job state files.
 type Store struct {
-	specsDir  string
-	statePath string
+	specsDir string
 }
 
-// NewStore creates a store over the given spec directory and state file path.
-// Empty paths disable the respective operation (LoadSpecs returns nothing,
-// SaveState is a no-op) — that's the "no home directory" degradation.
-func NewStore(specsDir, statePath string) *Store {
-	return &Store{specsDir: specsDir, statePath: statePath}
+// NewStore creates a store over the given spec directory. An empty path
+// disables all operations (LoadSpecs returns nothing, SaveStateFor is a no-op)
+// — that's the "no home directory" degradation. Each job's runtime state lives
+// inside its own subdirectory as <id>/state.json, alongside the spec.
+func NewStore(specsDir string) *Store {
+	return &Store{specsDir: specsDir}
 }
 
 // SpecsDir returns the directory the store reads specs from.
 func (st *Store) SpecsDir() string { return st.specsDir }
 
-// LoadSpecs reads every *.json spec in the jobs directory. Returns the valid
-// specs keyed by id and a map of validation errors keyed by id (or filename
-// stem when the id itself is unusable). Files that fail to parse or validate
-// are reported, never fatal.
+// LoadSpecs reads every job spec under the jobs directory. Each job lives in
+// its own subdirectory as <id>/job.json; the directory name is the default id.
+// Returns the valid specs keyed by id and a map of validation errors keyed by
+// id (the subdirectory name when the id itself is unusable). Subdirectories
+// without a job.json (or whose job.json fails to parse/validate) are reported,
+// never fatal. A subdirectory holding only state.json (no job.json) is skipped.
 func (st *Store) LoadSpecs() (map[string]Spec, map[string]string) {
 	specs := make(map[string]Spec)
 	invalid := make(map[string]string)
@@ -71,22 +74,26 @@ func (st *Store) LoadSpecs() (map[string]Spec, map[string]string) {
 		return specs, invalid
 	}
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+		if !e.IsDir() {
 			continue
 		}
-		stem := strings.TrimSuffix(e.Name(), ".json")
-		data, err := os.ReadFile(filepath.Join(st.specsDir, e.Name()))
+		name := e.Name()
+		specPath := filepath.Join(st.specsDir, name, "job.json")
+		data, err := os.ReadFile(specPath)
 		if err != nil {
-			invalid[stem] = "read: " + err.Error()
+			if os.IsNotExist(err) {
+				continue // not a job directory
+			}
+			invalid[name] = "read: " + err.Error()
 			continue
 		}
 		var spec Spec
 		if err := json.Unmarshal(data, &spec); err != nil {
-			invalid[stem] = "parse: " + err.Error()
+			invalid[name] = "parse: " + err.Error()
 			continue
 		}
 		if spec.ID == "" {
-			spec.ID = stem
+			spec.ID = name
 		}
 		if err := spec.Validate(); err != nil {
 			invalid[spec.ID] = err.Error()
@@ -108,41 +115,27 @@ func SpecHash(s Spec) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// LoadState reads the state file. A missing or corrupt file yields an empty
-// map (state is reconstructible from the specs).
-func (st *Store) LoadState() map[string]*State {
-	out := make(map[string]*State)
-	if st.statePath == "" {
-		return out
+// SaveSpec writes a single job spec to <specsDir>/<id>/job.json atomically
+// (temp file + rename, same pattern as SaveStateFor). The job's subdirectory is
+// created if needed. Errors when the spec directory is unavailable (no home
+// directory), since there is nowhere to persist to.
+func (st *Store) SaveSpec(s Spec) error {
+	if st.specsDir == "" {
+		return fmt.Errorf("jobs store has no spec directory")
 	}
-	data, err := os.ReadFile(st.statePath)
-	if err != nil {
-		return out
+	if s.ID == "" {
+		return fmt.Errorf("cannot save spec with empty id")
 	}
-	json.Unmarshal(data, &out)
-	for id, s := range out {
-		if s == nil {
-			delete(out, id)
-		}
-	}
-	return out
-}
-
-// SaveState atomically writes the state map (temp file + rename, same pattern
-// as session records). No-op when the state path is unavailable.
-func (st *Store) SaveState(state map[string]*State) error {
-	if st.statePath == "" {
-		return nil
-	}
-	dir := filepath.Dir(st.statePath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	jobDir := filepath.Join(st.specsDir, s.ID)
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(state, "", "  ")
+	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, filepath.Base(st.statePath)+".*.tmp")
+	data = append(data, '\n')
+	tmp, err := os.CreateTemp(jobDir, "job.*.tmp")
 	if err != nil {
 		return err
 	}
@@ -156,5 +149,92 @@ func (st *Store) SaveState(state map[string]*State) error {
 		os.Remove(tmpName)
 		return err
 	}
-	return os.Rename(tmpName, st.statePath)
+	return os.Rename(tmpName, filepath.Join(jobDir, "job.json"))
+}
+
+// SpecExists reports whether a spec file with the given id is already present.
+func (st *Store) SpecExists(id string) bool {
+	if st.specsDir == "" || id == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(st.specsDir, id, "job.json"))
+	return err == nil
+}
+
+// LoadState reads every job's state file (<id>/state.json) under the spec
+// directory and returns them keyed by id. Missing or corrupt files are skipped
+// (state is reconstructible from the specs). Returns an empty map when the spec
+// directory is unavailable.
+func (st *Store) LoadState() map[string]*State {
+	out := make(map[string]*State)
+	if st.specsDir == "" {
+		return out
+	}
+	entries, err := os.ReadDir(st.specsDir)
+	if err != nil {
+		return out
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		id := e.Name()
+		data, err := os.ReadFile(filepath.Join(st.specsDir, id, "state.json"))
+		if err != nil {
+			continue
+		}
+		var s State
+		if err := json.Unmarshal(data, &s); err != nil {
+			continue
+		}
+		out[id] = &s
+	}
+	return out
+}
+
+// SaveStateFor atomically writes one job's state file to <id>/state.json (temp
+// file + rename). The job's subdirectory is created if needed. No-op when the
+// spec directory or id is unavailable.
+func (st *Store) SaveStateFor(id string, state *State) error {
+	if st.specsDir == "" || id == "" || state == nil {
+		return nil
+	}
+	jobDir := filepath.Join(st.specsDir, id)
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	tmp, err := os.CreateTemp(jobDir, "state.*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, filepath.Join(jobDir, "state.json"))
+}
+
+// DeleteState removes one job's state file. Used when a spec vanishes from disk
+// but its subdirectory lingers. A missing file is not an error. No-op when the
+// spec directory or id is unavailable.
+func (st *Store) DeleteState(id string) error {
+	if st.specsDir == "" || id == "" {
+		return nil
+	}
+	err := os.Remove(filepath.Join(st.specsDir, id, "state.json"))
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }

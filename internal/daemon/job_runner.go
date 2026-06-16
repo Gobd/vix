@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/get-vix/vix/internal/config"
 	"github.com/get-vix/vix/internal/daemon/jobs"
 	"github.com/get-vix/vix/internal/protocol"
 )
@@ -32,12 +34,25 @@ const jobTitleTimeFormat = "01/02/2006 3:04 PM"
 // runJob drives one scheduled job run to completion. ctx carries the per-run
 // timeout; cancelling it tears the session down.
 func (s *Server) runJob(ctx context.Context, spec jobs.Spec, resolvedPrompt string) jobs.RunResult {
-	runID := generateSessionID()
+	runID := jobs.RunIDFromContext(ctx)
+	if runID == "" {
+		runID = generateSessionID()
+	}
 	session := NewSession(runID, s, nil, s.model, spec.CWD, "", false,
 		spec.AutoWrite(), spec.AutoDirs(), true /*headless*/, ctx)
 	session.origin = "vix"
 	session.trigger = &protocol.TriggerInfo{Type: spec.Trigger.Type, Ref: spec.ID}
 	session.title = jobRunTitle(spec, time.Now())
+	// Expose the job's own directory (~/.vix/jobs/<id>) to workflow templates as
+	// $(workflow.dir), so a run can persist state (e.g. a memory file) alongside
+	// its spec. Empty when the home directory is unavailable. Also mark it
+	// allowed so the run can read/write there even when the jobs directory lives
+	// outside $HOME and cwd (e.g. under a --config-dir override) — this flows to
+	// the file-tool path checks and the bash sandbox's writable set alike.
+	if jobsRoot := config.NewVixPaths("", s.homeVixDir, "").Jobs(); jobsRoot != "" {
+		session.jobDir = filepath.Join(jobsRoot, spec.ID)
+		session.addAllowedDir(session.jobDir)
+	}
 
 	// Register so the web UI and session.list see the run while it's live.
 	s.sessionMu.Lock()
@@ -74,7 +89,11 @@ func (s *Server) runJob(ctx context.Context, spec jobs.Spec, resolvedPrompt stri
 		startCmd = protocol.SessionCommand{Type: "session.input", Data: data}
 	}
 	if !session.pushCommand(ctx, startCmd) {
-		return jobs.RunResult{Status: jobs.StatusError, Err: "session refused start command"}
+		return jobs.RunResult{
+			Status: jobs.StatusError,
+			Err:    "session refused start command",
+			Errors: []jobs.RunError{{Source: "start_refused", Message: "session refused start command"}},
+		}
 	}
 
 	// Consume the event stream (mandatory: emit blocks once eventChan fills
@@ -127,22 +146,28 @@ consume:
 			// is collapsing; persist what we have and report.
 			session.persist()
 			return jobs.RunResult{
-				Status:    jobs.StatusTimeout,
-				Err:       "run cancelled: " + ctx.Err().Error(),
-				SessionID: runID,
+				Status:     jobs.StatusTimeout,
+				Err:        "run cancelled: " + ctx.Err().Error(),
+				SessionID:  runID,
+				AgentTurns: agentTurns,
+				Errors:     []jobs.RunError{{Source: "timeout", Message: "run cancelled: " + ctx.Err().Error()}},
 			}
 		case <-session.ctx.Done():
 			break consume
 		}
 	}
 
-	res := jobs.RunResult{Status: jobs.StatusOK, SessionID: runID}
+	res := jobs.RunResult{Status: jobs.StatusOK, SessionID: runID, AgentTurns: agentTurns, Denials: denials}
 	if hadError {
 		res.Status = jobs.StatusError
 		res.Err = errMsg
+		res.Errors = append(res.Errors, jobs.RunError{Source: "agent", Message: errMsg})
 	}
 	if len(denials) > 0 && res.Err == "" {
 		res.Err = "needed approval for: " + strings.Join(denials, "; ")
+	}
+	if len(denials) > 0 {
+		res.Errors = append(res.Errors, jobs.RunError{Source: "denied", Message: "needed approval for: " + strings.Join(denials, "; ")})
 	}
 
 	// Skip rules — a skipped run leaves no trace:
@@ -151,7 +176,7 @@ consume:
 	//   heartbeat OK: the model said nothing needs attention.
 	if res.Status == jobs.StatusOK && (agentTurns == 0 || isHeartbeatOK(finalText.String())) {
 		deleteSessionRecord(session.paths, runID)
-		return jobs.RunResult{Status: jobs.StatusSkipped, SessionID: runID}
+		return jobs.RunResult{Status: jobs.StatusSkipped, SessionID: runID, AgentTurns: agentTurns}
 	}
 
 	// Every other finished run lands in open/: visible in the Vix-initiated

@@ -177,6 +177,27 @@ func (p VixPaths) Logs() string {
 	return filepath.Join(p.home, "logs")
 }
 
+// JobsLog returns the directory holding append-only job-run logs
+// (<date>.jsonl files), a subdirectory of Logs(). Empty when Logs() is empty
+// (home unavailable in normal mode).
+func (p VixPaths) JobsLog() string {
+	base := p.Logs()
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, "jobs")
+}
+
+// HooksLog returns the directory holding append-only hook-run logs
+// (<date>.jsonl files), a subdirectory of Logs(). Empty when Logs() is empty.
+func (p VixPaths) HooksLog() string {
+	base := p.Logs()
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, "hooks")
+}
+
 // Sessions returns the directory where persisted session records live.
 // Sessions are stored globally (not project-scoped): override mode uses
 // override/sessions; normal mode uses home/sessions (empty if home is
@@ -286,18 +307,18 @@ func (p VixPaths) Jobs() string {
 	return filepath.Join(p.home, "jobs")
 }
 
-// JobsState returns the path of the machine-written job runtime state file
+// JobState returns the path of one job's machine-written runtime state file
 // (next/last run times, statuses, error counters), kept separate from the
-// user-authored specs in Jobs() so spec files never churn. Override mode:
-// override/jobs-state.json; normal mode: home/jobs-state.json.
-func (p VixPaths) JobsState() string {
-	if p.override != "" {
-		return filepath.Join(p.override, "jobs-state.json")
-	}
-	if p.home == "" {
+// user-authored spec (job.json) so spec files never churn. It lives inside the
+// job's own subdirectory, a sibling of job.json: override mode:
+// override/jobs/<id>/state.json; normal mode: home/jobs/<id>/state.json. Empty
+// when the jobs directory is unavailable (no home directory).
+func (p VixPaths) JobState(id string) string {
+	dir := p.Jobs()
+	if dir == "" || id == "" {
 		return ""
 	}
-	return filepath.Join(p.home, "jobs-state.json")
+	return filepath.Join(dir, id, "state.json")
 }
 
 // Hooks returns the directory holding lifecycle-hook specs (<id>.json files).

@@ -523,7 +523,7 @@ const jobSpec = `{
 func TestSessionsVixInitiated(t *testing.T) {
 	h := harness.Start(t, sessionsMeta("a scheduled job run appears in the Vix-initiated group"),
 		harness.WithEnv("VIX_DISABLE_JOBS", "0"),
-		harness.WithHomeFile(".vix/jobs/e2e-demo.json", jobSpec),
+		harness.WithHomeFile(".vix/jobs/e2e-demo/job.json", jobSpec),
 	)
 
 	// The job fires at startup and runs against the mock (one turn → persisted).
@@ -570,7 +570,7 @@ const inlineWorkflowJobSpec = `{
 func TestSessionsVixInitiatedInlineWorkflow(t *testing.T) {
 	h := harness.Start(t, sessionsMeta("a scheduled job with an inline workflow runs and appears in the Vix-initiated group"),
 		harness.WithEnv("VIX_DISABLE_JOBS", "0"),
-		harness.WithHomeFile(".vix/jobs/e2e-inline.json", inlineWorkflowJobSpec),
+		harness.WithHomeFile(".vix/jobs/e2e-inline/job.json", inlineWorkflowJobSpec),
 	)
 
 	// The inline workflow's single agent step calls the mock once.

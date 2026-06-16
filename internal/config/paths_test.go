@@ -31,6 +31,13 @@ func TestVixPaths_NormalMode(t *testing.T) {
 		t.Errorf("Logs = %q, want %q", got, filepath.Join("/home/.vix", "logs"))
 	}
 
+	if got := p.JobsLog(); got != filepath.Join("/home/.vix", "logs", "jobs") {
+		t.Errorf("JobsLog = %q", got)
+	}
+	if got := p.HooksLog(); got != filepath.Join("/home/.vix", "logs", "hooks") {
+		t.Errorf("HooksLog = %q", got)
+	}
+
 	if got := p.AccessStatsDB(); got != filepath.Join("/project", ".vix", "access_stats.db") {
 		t.Errorf("AccessStatsDB = %q", got)
 	}
@@ -106,6 +113,13 @@ func TestVixPaths_OverrideMode(t *testing.T) {
 		t.Errorf("Logs = %q", got)
 	}
 
+	if got := p.JobsLog(); got != filepath.Join("/custom", "logs", "jobs") {
+		t.Errorf("JobsLog = %q", got)
+	}
+	if got := p.HooksLog(); got != filepath.Join("/custom", "logs", "hooks") {
+		t.Errorf("HooksLog = %q", got)
+	}
+
 	if got := p.AccessStatsDB(); got != filepath.Join("/custom", "access_stats.db") {
 		t.Errorf("AccessStatsDB = %q", got)
 	}
@@ -144,5 +158,11 @@ func TestVixPaths_NormalModeWithoutHome(t *testing.T) {
 
 	if got := p.Logs(); got != "" {
 		t.Errorf("Logs should be empty without home, got %q", got)
+	}
+	if got := p.JobsLog(); got != "" {
+		t.Errorf("JobsLog should be empty without home, got %q", got)
+	}
+	if got := p.HooksLog(); got != "" {
+		t.Errorf("HooksLog should be empty without home, got %q", got)
 	}
 }

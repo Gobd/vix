@@ -8,9 +8,10 @@ import (
 )
 
 // Lifecycle-hooks e2e scenarios. Hooks are enabled by default (the harness only
-// disables jobs), so each test seeds one or more ~/.vix/hooks/<id>.json specs and
-// drives the model into the matching event. Hook commands use jq/grep/echo/touch
-// (all present in the e2e image) the way real hooks are written.
+// disables jobs), so each test seeds one or more ~/.vix/hooks/<id>/hook.json
+// specs and drives the model into the matching event. Hook commands use
+// jq/grep/echo/touch (all present in the e2e image) the way real hooks are
+// written.
 //
 // Coverage: every event (PreToolUse, PostToolUse, UserPromptSubmit, SessionStart,
 // Stop), every decision (deny, modify, context), both modes (sync, async), the
@@ -37,7 +38,7 @@ func TestHookBlocksWrite(t *testing.T) {
 		Subcategory: "hooks.pre_tool_deny",
 		Description: "a blocking PreToolUse hook denies a write_file; the file never lands and the reason reaches the model",
 		Wire:        harness.WireMessages,
-	}, harness.WithHomeFile(".vix/hooks/block-write.json", blockWriteHook))
+	}, harness.WithHomeFile(".vix/hooks/block-write/hook.json", blockWriteHook))
 
 	h.UI.WaitStable(400 * time.Millisecond)
 
@@ -76,7 +77,7 @@ func TestHookPostToolUseContext(t *testing.T) {
 		Subcategory: "hooks.post_tool_context",
 		Description: "a PostToolUse hook appends context to a bash result; the note reaches the model",
 		Wire:        harness.WireMessages,
-	}, harness.WithHomeFile(".vix/hooks/post-ctx.json", postContextHook))
+	}, harness.WithHomeFile(".vix/hooks/post-ctx/hook.json", postContextHook))
 
 	h.UI.WaitStable(400 * time.Millisecond)
 
@@ -113,7 +114,7 @@ func TestHookVetoesPrompt(t *testing.T) {
 		Subcategory: "hooks.prompt_veto",
 		Description: "a blocking UserPromptSubmit hook aborts the turn before the model is ever called",
 		Wire:        harness.WireMessages,
-	}, harness.WithHomeFile(".vix/hooks/veto-prompt.json", vetoPromptHook))
+	}, harness.WithHomeFile(".vix/hooks/veto-prompt/hook.json", vetoPromptHook))
 
 	h.UI.WaitStable(400 * time.Millisecond)
 
@@ -136,7 +137,7 @@ func TestHookKillSwitch(t *testing.T) {
 		Description: "VIX_DISABLE_HOOKS=1 disables hooks; a would-be blocking hook does nothing",
 		Wire:        harness.WireMessages,
 	},
-		harness.WithHomeFile(".vix/hooks/block-write.json", blockWriteHook),
+		harness.WithHomeFile(".vix/hooks/block-write/hook.json", blockWriteHook),
 		harness.WithEnv("VIX_DISABLE_HOOKS", "1"),
 	)
 
@@ -177,7 +178,7 @@ func TestHookRewritesToolInput(t *testing.T) {
 		Subcategory: "hooks.pre_tool_modify",
 		Description: "a PreToolUse hook rewrites write_file's path; the write lands at the hook-chosen path",
 		Wire:        harness.WireMessages,
-	}, harness.WithHomeFile(".vix/hooks/rewrite-write.json", rewriteWriteHook))
+	}, harness.WithHomeFile(".vix/hooks/rewrite-write/hook.json", rewriteWriteHook))
 
 	h.UI.WaitStable(400 * time.Millisecond)
 
@@ -217,7 +218,7 @@ func TestHookRewritesPrompt(t *testing.T) {
 		Subcategory: "hooks.prompt_modify",
 		Description: "a UserPromptSubmit hook rewrites the prompt; the model sees the rewritten text",
 		Wire:        harness.WireMessages,
-	}, harness.WithHomeFile(".vix/hooks/rewrite-prompt.json", rewritePromptHook))
+	}, harness.WithHomeFile(".vix/hooks/rewrite-prompt/hook.json", rewritePromptHook))
 
 	h.UI.WaitStable(400 * time.Millisecond)
 
@@ -255,7 +256,7 @@ func TestHookNonBlockingDoesNotVeto(t *testing.T) {
 		Subcategory: "hooks.non_blocking",
 		Description: "a non-blocking sync hook that exits 2 cannot veto; the write still lands",
 		Wire:        harness.WireMessages,
-	}, harness.WithHomeFile(".vix/hooks/warn-write.json", warnWriteHook))
+	}, harness.WithHomeFile(".vix/hooks/warn-write/hook.json", warnWriteHook))
 
 	h.UI.WaitStable(400 * time.Millisecond)
 
@@ -293,7 +294,7 @@ func TestHookMatcherScopesToTool(t *testing.T) {
 		Subcategory: "hooks.matcher_scope",
 		Description: "a PreToolUse hook scoped to edit_file does not fire for write_file",
 		Wire:        harness.WireMessages,
-	}, harness.WithHomeFile(".vix/hooks/edit-only-block.json", editOnlyBlockHook))
+	}, harness.WithHomeFile(".vix/hooks/edit-only-block/hook.json", editOnlyBlockHook))
 
 	h.UI.WaitStable(400 * time.Millisecond)
 
@@ -340,8 +341,8 @@ func TestHookMostRestrictiveWins(t *testing.T) {
 		Description: "two PreToolUse hooks match one write; the deny wins over the allow",
 		Wire:        harness.WireMessages,
 	},
-		harness.WithHomeFile(".vix/hooks/allow-write.json", allowWriteHook),
-		harness.WithHomeFile(".vix/hooks/deny-write.json", denyWriteHook),
+		harness.WithHomeFile(".vix/hooks/allow-write/hook.json", allowWriteHook),
+		harness.WithHomeFile(".vix/hooks/deny-write/hook.json", denyWriteHook),
 	)
 
 	h.UI.WaitStable(400 * time.Millisecond)
@@ -381,7 +382,7 @@ func TestHookAsyncFireAndForget(t *testing.T) {
 		Subcategory: "hooks.async",
 		Description: "an async PostToolUse hook runs fire-and-forget; its side effect lands out of band",
 		Wire:        harness.WireMessages,
-	}, harness.WithHomeFile(".vix/hooks/async-post.json", asyncPostHook))
+	}, harness.WithHomeFile(".vix/hooks/async-post/hook.json", asyncPostHook))
 
 	h.UI.WaitStable(400 * time.Millisecond)
 
@@ -417,7 +418,7 @@ func TestHookSessionStartFires(t *testing.T) {
 		Subcategory: "hooks.session_start",
 		Description: "a SessionStart hook fires when the session begins",
 		Wire:        harness.WireMessages,
-	}, harness.WithHomeFile(".vix/hooks/session-start.json", sessionStartHook))
+	}, harness.WithHomeFile(".vix/hooks/session-start/hook.json", sessionStartHook))
 
 	h.UI.WaitStable(400 * time.Millisecond)
 	h.UI.Shot("session-start")
@@ -444,7 +445,7 @@ func TestHookStopFires(t *testing.T) {
 		Subcategory: "hooks.stop",
 		Description: "a Stop hook fires when a turn completes",
 		Wire:        harness.WireMessages,
-	}, harness.WithHomeFile(".vix/hooks/stop.json", stopHook))
+	}, harness.WithHomeFile(".vix/hooks/stop/hook.json", stopHook))
 
 	h.UI.WaitStable(400 * time.Millisecond)
 
@@ -483,7 +484,7 @@ func TestHookPromptFormBlocks(t *testing.T) {
 		Subcategory: "hooks.prompt_form",
 		Description: "a sync blocking prompt-form hook runs an LLM turn whose BLOCK: output vetoes the write",
 		Wire:        harness.WireMessages,
-	}, harness.WithHomeFile(".vix/hooks/prompt-form.json", promptFormHook))
+	}, harness.WithHomeFile(".vix/hooks/prompt-form/hook.json", promptFormHook))
 
 	h.UI.WaitStable(400 * time.Millisecond)
 

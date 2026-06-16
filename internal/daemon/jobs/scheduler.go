@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -37,12 +38,40 @@ type RunResult struct {
 	Status    string // ok | error | skipped | timeout
 	Err       string
 	SessionID string
+
+	// Detail surfaced back to the scheduler's RunLogger so all run-log lines
+	// are emitted from one place. AgentTurns and Denials enrich the "finished"
+	// line; Errors become one "error" line each.
+	AgentTurns int
+	Denials    []string
+	Errors     []RunError
+}
+
+// RunError is a single error captured during a run, with source naming where it
+// came from (e.g. "agent", "start_refused", "timeout", "persist").
+type RunError struct {
+	Source  string
+	Message string
 }
 
 // Runner executes one job run: an isolated session driving the resolved
 // prompt, through spec.Workflow when set. ctx carries the per-run timeout;
 // implementations must return when it is cancelled.
 type Runner func(ctx context.Context, spec Spec, resolvedPrompt string) RunResult
+
+// RunLogger records structured job-run lifecycle and error entries. It is
+// injected into the scheduler (nil-safe: every call is guarded) so the jobs
+// package stays free of filesystem/path concerns — the daemon supplies the
+// implementation that writes the daily JSONL files.
+type RunLogger interface {
+	// Started is called just before the runner is invoked.
+	Started(spec Spec)
+	// Error records one error encountered during the run. sessionID may be empty
+	// (e.g. a prompt-resolution failure before any session exists).
+	Error(spec Spec, sessionID, source, msg string)
+	// Finished is called once the run completes, with its total wall-clock time.
+	Finished(spec Spec, res RunResult, dur time.Duration)
+}
 
 // Scheduler owns the timer loop over the job store. One per daemon.
 type Scheduler struct {
@@ -52,6 +81,9 @@ type Scheduler struct {
 
 	// notify broadcasts a job lifecycle event to attached clients. Nil-safe.
 	notify func(eventType string, data any)
+	// logger records structured run-log entries. Nil-safe (guarded by the
+	// logStarted/logError/logFinished helpers).
+	logger RunLogger
 	// resolvePrompt expands $(file:) templates at fire time. Injectable for
 	// tests; defaults to the shared prompt loader resolving against spec.CWD.
 	resolvePrompt func(spec Spec) string
@@ -66,12 +98,13 @@ type Scheduler struct {
 }
 
 // NewScheduler builds a scheduler over the store. runner executes runs;
-// notify (optional) broadcasts lifecycle events; maxConcurrent <= 0 uses the
-// default. Runtime state is seeded from the store's persisted state file so
+// notify (optional) broadcasts lifecycle events; logger (optional) records
+// structured run-log entries; maxConcurrent <= 0 uses the default. Runtime
+// state is seeded from the store's persisted state file so
 // restarts don't forget completed one-shots, auto-disabled jobs, or pending
 // next-run times; reconcile drops entries whose spec vanished and resets
 // those whose spec changed (SpecHash).
-func NewScheduler(store *Store, runner Runner, notify func(string, any), maxConcurrent int) *Scheduler {
+func NewScheduler(store *Store, runner Runner, notify func(string, any), logger RunLogger, maxConcurrent int) *Scheduler {
 	if maxConcurrent <= 0 {
 		maxConcurrent = DefaultMaxConcurrentRuns
 	}
@@ -80,6 +113,7 @@ func NewScheduler(store *Store, runner Runner, notify func(string, any), maxConc
 		runner:        runner,
 		maxConcurrent: maxConcurrent,
 		notify:        notify,
+		logger:        logger,
 		resolvePrompt: func(spec Spec) string {
 			return prompt.GetLoader().Resolve(spec.Prompt, nil, spec.CWD, nil)
 		},
@@ -148,6 +182,123 @@ func (s *Scheduler) Reload() {
 	}
 }
 
+// CreateJob validates, persists, and schedules a new job spec. The spec must
+// carry a non-empty ID that is not already in use (derive one with UniqueID).
+// It returns an error if the spec is invalid, the ID is taken, or persistence
+// fails. On success the new job is reconciled into the timer loop synchronously
+// (so a Snapshot taken right after includes it) and the loop is woken to
+// recompute its next wake.
+func (s *Scheduler) CreateJob(spec Spec) error {
+	if err := spec.Validate(); err != nil {
+		return err
+	}
+	if s.idTaken(spec.ID) {
+		return fmt.Errorf("job id %q already exists", spec.ID)
+	}
+	if err := s.store.SaveSpec(spec); err != nil {
+		return err
+	}
+	s.reconcile(time.Now())
+	s.Reload()
+	return nil
+}
+
+// runIDKey carries a pre-generated run/session id through a run's context.
+type runIDKey struct{}
+
+// WithRunID stamps a pre-generated run/session id onto ctx so an on-demand run
+// adopts it instead of minting its own. The daemon's Runner reads it via
+// RunIDFromContext, letting RunNow's caller learn the session id up front.
+func WithRunID(ctx context.Context, id string) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, runIDKey{}, id)
+}
+
+// RunIDFromContext returns the run id stamped by WithRunID, or "" when absent.
+func RunIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(runIDKey{}).(string)
+	return id
+}
+
+// RunNow fires the job with the given id immediately, out of band from the
+// schedule. Unlike a scheduled run it does not advance NextRunAt or complete a
+// one-shot — it only records the outcome — and it runs even when the job is
+// disabled or already completed. It refuses only when a run for that id is
+// already in flight. The run executes in the background using runID as its
+// session id (threaded through ctx); validation errors surface synchronously.
+func (s *Scheduler) RunNow(ctx context.Context, id, runID string) error {
+	s.mu.Lock()
+	spec, ok := s.specs[id]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("job %q not found", id)
+	}
+	if s.running[id] {
+		s.mu.Unlock()
+		return fmt.Errorf("job %q is already running", id)
+	}
+	s.running[id] = true
+	st := s.state[id]
+	if st == nil {
+		st = &State{SpecHash: SpecHash(spec)}
+		s.state[id] = st
+	}
+	st.LastRunAt = time.Now()
+	s.persistLocked()
+	s.mu.Unlock()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go s.execute(WithRunID(ctx, runID), spec, true)
+	return nil
+}
+
+// UniqueID derives a filesystem-safe job id from base (typically the job name),
+// guaranteed not to collide with an existing spec. Falls back to "job" when
+// base slugifies to empty; appends -2, -3, … on collision.
+func (s *Scheduler) UniqueID(base string) string {
+	id := slugify(base)
+	if id == "" {
+		id = "job"
+	}
+	candidate := id
+	for i := 2; s.idTaken(candidate); i++ {
+		candidate = fmt.Sprintf("%s-%d", id, i)
+	}
+	return candidate
+}
+
+// idTaken reports whether a job id is already used, in memory or on disk.
+func (s *Scheduler) idTaken(id string) bool {
+	s.mu.Lock()
+	_, inMem := s.specs[id]
+	s.mu.Unlock()
+	return inMem || s.store.SpecExists(id)
+}
+
+// slugify reduces s to a lowercase, dash-separated id of [a-z0-9-].
+func slugify(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var b strings.Builder
+	prevDash := false
+	for _, r := range s {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+			prevDash = false
+		default:
+			if !prevDash && b.Len() > 0 {
+				b.WriteByte('-')
+				prevDash = true
+			}
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
 // Start runs the timer loop until ctx is cancelled. Call in a goroutine.
 func (s *Scheduler) Start(ctx context.Context) {
 	s.reconcile(time.Now())
@@ -213,7 +364,7 @@ func (s *Scheduler) reconcile(now time.Time) {
 	s.specs = specs
 
 	// Invalid specs: park a state entry carrying the validation error so the
-	// feedback loop (skill reads jobs-state.json) and the UI can surface it.
+	// feedback loop (skill reads <id>/state.json) and the UI can surface it.
 	for id, msg := range invalid {
 		st := s.state[id]
 		if st == nil {
@@ -277,6 +428,7 @@ func (s *Scheduler) reconcile(now time.Time) {
 		if s.running[id] {
 			continue
 		}
+		s.store.DeleteState(id)
 		delete(s.state, id)
 	}
 
@@ -386,18 +538,20 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 	s.mu.Unlock()
 
 	for _, id := range due {
-		go s.execute(ctx, specsByID[id])
+		go s.execute(ctx, specsByID[id], false)
 	}
 }
 
 // execute resolves the prompt and drives one run through the Runner, then
-// applies the result. Runs in its own goroutine, bounded by s.sem.
-func (s *Scheduler) execute(ctx context.Context, spec Spec) {
+// applies the result. Runs in its own goroutine, bounded by s.sem. manual is
+// true for on-demand runs (RunNow): those record their outcome but leave the
+// schedule untouched (see applyResult).
+func (s *Scheduler) execute(ctx context.Context, spec Spec, manual bool) {
 	select {
 	case s.sem <- struct{}{}:
 		defer func() { <-s.sem }()
 	case <-ctx.Done():
-		s.applyResult(spec, RunResult{Status: StatusSkipped, Err: "daemon shutting down"})
+		s.applyResult(spec, RunResult{Status: StatusSkipped, Err: "daemon shutting down"}, manual)
 		return
 	}
 
@@ -407,18 +561,21 @@ func (s *Scheduler) execute(ctx context.Context, spec Spec) {
 	// loader inlines an error marker; never send that to the model.
 	missingFile := strings.Contains(resolved, "[Error: file ")
 	if spec.SkipIfEmpty && (missingFile || effectivelyEmpty(resolved)) {
-		s.applyResult(spec, RunResult{Status: StatusSkipped})
+		s.applyResult(spec, RunResult{Status: StatusSkipped}, manual)
 		return
 	}
 	if missingFile {
-		s.applyResult(spec, RunResult{Status: StatusError, Err: "prompt file not found"})
+		s.logError(spec, "", "prompt_resolve", "prompt file not found")
+		s.applyResult(spec, RunResult{Status: StatusError, Err: "prompt file not found"}, manual)
 		return
 	}
 
 	s.notifyEvent("event.job_run", map[string]any{
 		"job_id": spec.ID, "name": spec.Name, "status": "started",
 	})
+	s.logStarted(spec)
 
+	start := time.Now()
 	runCtx, cancel := context.WithTimeout(ctx, spec.TimeoutDuration())
 	defer cancel()
 	res := s.runner(runCtx, spec, resolved)
@@ -428,11 +585,39 @@ func (s *Scheduler) execute(ctx context.Context, spec Spec) {
 			res.Err = "run exceeded timeout " + spec.TimeoutDuration().String()
 		}
 	}
-	s.applyResult(spec, res)
+	for _, e := range res.Errors {
+		s.logError(spec, res.SessionID, e.Source, e.Message)
+	}
+	s.logFinished(spec, res, time.Since(start))
+	s.applyResult(spec, res, manual)
 }
 
-// applyResult records a finished run and computes the next fire time.
-func (s *Scheduler) applyResult(spec Spec, res RunResult) {
+// logStarted/logError/logFinished forward to the injected RunLogger, guarding
+// nil so tests and logger-less embeddings stay silent.
+func (s *Scheduler) logStarted(spec Spec) {
+	if s.logger != nil {
+		s.logger.Started(spec)
+	}
+}
+
+func (s *Scheduler) logError(spec Spec, sessionID, source, msg string) {
+	if s.logger != nil {
+		s.logger.Error(spec, sessionID, source, msg)
+	}
+}
+
+func (s *Scheduler) logFinished(spec Spec, res RunResult, dur time.Duration) {
+	if s.logger != nil {
+		s.logger.Finished(spec, res, dur)
+	}
+}
+
+// applyResult records a finished run and computes the next fire time. When
+// manual is true (an on-demand RunNow), the run's outcome is recorded but the
+// schedule is left untouched: no rescheduling, no one-shot completion, and no
+// error-streak/auto-disable bookkeeping — a user-initiated test run must not
+// consume a one-shot or shift the next cron slot.
+func (s *Scheduler) applyResult(spec Spec, res RunResult, manual bool) {
 	now := time.Now()
 	s.mu.Lock()
 	delete(s.running, spec.ID)
@@ -445,6 +630,21 @@ func (s *Scheduler) applyResult(spec Spec, res RunResult) {
 	st.LastError = res.Err
 	if res.SessionID != "" {
 		st.LastSessionID = res.SessionID
+	}
+
+	if manual {
+		s.persistLocked()
+		s.mu.Unlock()
+		if res.Status != StatusSkipped {
+			s.notifyEvent("event.job_done", map[string]any{
+				"job_id":     spec.ID,
+				"name":       spec.Name,
+				"status":     res.Status,
+				"error":      res.Err,
+				"session_id": res.SessionID,
+			})
+		}
+		return
 	}
 
 	failed := res.Status == StatusError || res.Status == StatusTimeout
@@ -494,6 +694,7 @@ func (s *Scheduler) applyResult(spec Spec, res RunResult) {
 		})
 	}
 	if autoDisabled {
+		s.logError(spec, res.SessionID, "auto_disable", "disabled after repeated failures")
 		s.notifyEvent("event.job_run", map[string]any{
 			"job_id": spec.ID, "name": spec.Name, "status": "auto_disabled",
 			"error": "disabled after repeated failures",
@@ -513,9 +714,12 @@ func backoffFor(n int) time.Duration {
 	return d
 }
 
-// persistLocked writes the state file. Caller holds s.mu. Best-effort.
+// persistLocked writes every job's state file (<id>/state.json). Caller holds
+// s.mu. Best-effort: write errors are ignored (state is reconstructible).
 func (s *Scheduler) persistLocked() {
-	s.store.SaveState(s.state)
+	for id, st := range s.state {
+		s.store.SaveStateFor(id, st)
+	}
 }
 
 // notifyEvent forwards to the notify hook when set.

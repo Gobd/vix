@@ -48,6 +48,18 @@ func main() {
 		os.Exit(runSessionCommand(os.Args[2:]))
 	}
 
+	// `vix job run <id>` — fire a scheduled job immediately by id, out of band
+	// from its schedule. Sibling verb group to `vix daemon`/`vix session`.
+	if len(os.Args) >= 2 && os.Args[1] == "job" {
+		os.Exit(runJobCommand(os.Args[2:]))
+	}
+
+	// `vix hook trigger <id>` — fire a lifecycle hook immediately by id, out of
+	// band from its event.
+	if len(os.Args) >= 2 && os.Args[1] == "hook" {
+		os.Exit(runHookCommand(os.Args[2:]))
+	}
+
 	versionFlag := flag.Bool("version", false, "Print version and exit")
 	forceInit := flag.Bool("force-init", false, "Delete and re-create the .vix directory")
 	testMode := flag.Bool("test", false, "Fill chat with fake data for UI testing")
@@ -686,6 +698,144 @@ Flags:
 		return 1
 	}
 	fmt.Println(id)
+	return 0
+}
+
+// dialDaemon resolves the socket path (flag, else VIX_SOCKET_PATH, else the
+// default) and an optional auth token, returning a pinged client ready for a
+// one-shot RPC. On failure it prints the reason to stderr and returns
+// (nil, exitCode).
+func dialDaemon(socketPath, authTokenPath string) (*daemon.Client, int) {
+	sock := socketPath
+	if sock == "" {
+		if v := os.Getenv("VIX_SOCKET_PATH"); v != "" {
+			sock = v
+		} else {
+			sock = "/tmp/vixd.sock"
+		}
+	}
+
+	authToken := ""
+	if authTokenPath != "" {
+		raw, err := os.ReadFile(authTokenPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: cannot read --auth-token-path %q: %v\n", authTokenPath, err)
+			return nil, 1
+		}
+		authToken = strings.TrimSpace(string(raw))
+		if authToken == "" {
+			fmt.Fprintf(os.Stderr, "Error: --auth-token-path %q is empty after trimming whitespace\n", authTokenPath)
+			return nil, 1
+		}
+	}
+
+	client := daemon.NewClient(sock)
+	client.SetAuthToken(authToken)
+	if !client.Ping() {
+		fmt.Fprintf(os.Stderr, "Error: vixd is not running — start it with `vix daemon start`\n")
+		return nil, 1
+	}
+	return client, 0
+}
+
+// runJobCommand implements `vix job run <id>`: fire a scheduled job immediately
+// by id in the running daemon, out of band from its schedule. The run proceeds
+// in the background; the command prints the run's session id. Returns the exit
+// code.
+func runJobCommand(args []string) int {
+	usage := func() {
+		fmt.Fprintf(os.Stderr, `Usage: vix job run <id> [flags]
+
+  run <id>   Fire the job with the given id immediately, out of band from its
+             schedule. A manual run records its outcome but does not advance the
+             schedule or complete a one-shot, and runs even when the job is
+             disabled. The run proceeds in the background and lands under
+             "Vix-initiated" sessions. Prints the run's session id.
+
+Flags:
+  -socket-path string      Unix socket path (env VIX_SOCKET_PATH, default /tmp/vixd.sock)
+  -auth-token-path string  Shared-secret token file, must match the daemon's
+`)
+	}
+	if len(args) == 0 || args[0] != "run" {
+		usage()
+		return 1
+	}
+
+	fs := flag.NewFlagSet("vix job run", flag.ExitOnError)
+	socketPath := fs.String("socket-path", "", "Unix socket path for the vix↔vixd connection. Env: VIX_SOCKET_PATH. Default: /tmp/vixd.sock.")
+	authTokenPath := fs.String("auth-token-path", "", "Path to a file holding the shared-secret token. Must match the daemon's -auth-token-path.")
+	fs.Parse(args[1:])
+	if fs.NArg() < 1 {
+		fmt.Fprintf(os.Stderr, "Error: missing job id\n\n")
+		usage()
+		return 1
+	}
+	id := fs.Arg(0)
+
+	client, code := dialDaemon(*socketPath, *authTokenPath)
+	if client == nil {
+		return code
+	}
+
+	sessionID, err := client.RunJob(id)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	fmt.Println(sessionID)
+	return 0
+}
+
+// runHookCommand implements `vix hook trigger <id>`: fire a lifecycle hook
+// immediately by id in the running daemon, out of band from its event. Prints
+// the run's session id (workflow/prompt hooks) or the fire id (command hooks).
+// Returns the exit code.
+func runHookCommand(args []string) int {
+	usage := func() {
+		fmt.Fprintf(os.Stderr, `Usage: vix hook trigger <id> [flags]
+
+  trigger <id>  Fire the hook with the given id immediately, out of band from
+                its event. It runs fire-and-forget regardless of mode, even when
+                the hook is disabled. Workflow/prompt hooks run in an isolated
+                session (its id is printed); command hooks print their fire id.
+
+Flags:
+  -socket-path string      Unix socket path (env VIX_SOCKET_PATH, default /tmp/vixd.sock)
+  -auth-token-path string  Shared-secret token file, must match the daemon's
+`)
+	}
+	if len(args) == 0 || args[0] != "trigger" {
+		usage()
+		return 1
+	}
+
+	fs := flag.NewFlagSet("vix hook trigger", flag.ExitOnError)
+	socketPath := fs.String("socket-path", "", "Unix socket path for the vix↔vixd connection. Env: VIX_SOCKET_PATH. Default: /tmp/vixd.sock.")
+	authTokenPath := fs.String("auth-token-path", "", "Path to a file holding the shared-secret token. Must match the daemon's -auth-token-path.")
+	fs.Parse(args[1:])
+	if fs.NArg() < 1 {
+		fmt.Fprintf(os.Stderr, "Error: missing hook id\n\n")
+		usage()
+		return 1
+	}
+	id := fs.Arg(0)
+
+	client, code := dialDaemon(*socketPath, *authTokenPath)
+	if client == nil {
+		return code
+	}
+
+	sessionID, fireID, err := client.TriggerHook(id)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	if sessionID != "" {
+		fmt.Println(sessionID)
+	} else {
+		fmt.Println(fireID)
+	}
 	return 0
 }
 

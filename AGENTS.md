@@ -77,8 +77,10 @@ means restart the daemon: `vix daemon stop && vix daemon start`.
 
 ## Scheduled jobs
 
-vixd runs a scheduler over `~/.vix/jobs/*.json` (hot-reloaded; runtime state in
-`~/.vix/jobs-state.json` — spec/state split so user files never churn). Each
+vixd runs a scheduler over `~/.vix/jobs/<id>/job.json` (one subdirectory per job,
+hot-reloaded; machine-written runtime state in `~/.vix/jobs/<id>/state.json` —
+one per job, sibling of `job.json`, spec/state split so user files never churn).
+Each
 run executes in an isolated headless session (plain prompt, or a workflow named
 via `workflow_id` or embedded inline via `workflow` — at most one) and lands in
 the Sessions tab under "Vix-initiated".
@@ -86,10 +88,26 @@ Triggers: `cron` (robfig syntax incl. `@every`) and one-shot `at`. The shipped
 `heartbeat` job reads `~/.vix/heartbeat.md` every 30 minutes and skips with
 zero tokens while the file is effectively empty (or the run answers
 HEARTBEAT_OK). The model-facing surface is the `jobs` skill (no tool, no slash
-command): the agent writes job files directly and verifies via
-jobs-state.json. Engine: `internal/daemon/jobs/`; runner:
+command): the agent writes job files directly and verifies via each job's
+`state.json`. Engine: `internal/daemon/jobs/`; runner:
 `internal/daemon/job_runner.go`. Kill switch: `"features": {"jobs": false}` or
 `VIX_DISABLE_JOBS=1`.
+
+### Running a job/hook on demand
+
+`vix job run <id>` and `vix hook trigger <id>` fire a job or lifecycle hook
+immediately by id, out of band from its schedule/event. Both are sibling CLI
+verb groups to `vix daemon`/`vix session` (dispatched in `cmd/vix/main.go`
+before flag parsing), talk to the daemon over the socket
+(`Client.RunJob`/`Client.TriggerHook` → `job.run`/`hook.trigger` handlers in
+`handlers.go`), and print the run's session id. The run proceeds in the
+background and lands under "Vix-initiated". A manual job run records its outcome
+but **does not** reschedule or complete a one-shot (`Scheduler.RunNow` +
+the manual branch of `applyResult`); a manual hook trigger runs fire-and-forget
+regardless of mode (`Server.TriggerHook` → `fireHookAsync`). Both run even when
+the job/hook is disabled; a job run is refused only when one is already in
+flight. The run's session id is threaded through the run context
+(`jobs.WithRunID`/`jobs.RunIDFromContext`) so the CLI learns it up front.
 
 ### Detecting whether `vixd` is running (sandbox caveat)
 
@@ -114,6 +132,57 @@ does not reliably show the host process that launched the session, even though i
   session. If you genuinely need a daemon for an out-of-band task (e.g. driving
   the TUI for a VHS recording), prefer an explicit, isolated instance (e.g. a
   separate `--config-dir` and socket path) rather than touching the default one.
+
+## Run logs (jobs & hooks)
+
+Every job run and hook fire is recorded as append-only JSONL under
+`~/.vix/logs/` (resolved via `VixPaths.JobsLog()` / `VixPaths.HooksLog()`), one
+daily file per subsystem:
+
+```
+~/.vix/logs/jobs/<YYYY-MM-DD>.jsonl     # one line per job lifecycle event
+~/.vix/logs/hooks/<YYYY-MM-DD>.jsonl    # one line per hook lifecycle event
+```
+
+Each line is a JSON object with a `phase` field. Jobs emit `started` → optional
+`error` → `finished` (correlate by `job_id`, and `session_id` once the run has
+one). Hooks emit `fired` → optional `error` → `finished` (correlate by
+`fire_id`). Error lines carry a `source` naming where the failure came from
+(`prompt_resolve`, `agent`, `timeout`, `start_refused`, `auto_disable`,
+`command_exec`). Errors are also mirrored to `vixd.log` via `LogError`. Writers
+live in `internal/daemon/run_log.go`; the scheduler logs jobs through an injected
+`jobs.RunLogger`, and `hook_runner.go` logs hooks. Retention is
+`logs.retention_days` in `settings.json` (default 10, `0`/negative = keep
+forever); the daemon sweeps whole stale daily files at startup and every 24h.
+
+These files are line-delimited JSON, so prefer `jq` over hand-parsing. Useful
+queries (substitute the date as needed; logs are UTC):
+
+```bash
+# Last run for a given job id (most recent finished line)
+grep -h '"phase":"finished"' ~/.vix/logs/jobs/*.jsonl \
+  | jq -c 'select(.job_id=="stale-branches")' | tail -1
+
+# Full timeline for one job today (started/error/finished in order)
+jq -c 'select(.job_id=="heartbeat")' ~/.vix/logs/jobs/$(date -u +%F).jsonl
+
+# Latest job errors across all jobs (most recent 20)
+grep -h '"phase":"error"' ~/.vix/logs/jobs/*.jsonl | jq -c '{ts,job_id,source,error}' | tail -20
+
+# All failed/timed-out job runs in the last few days
+jq -c 'select(.phase=="finished" and (.status=="error" or .status=="timeout"))' \
+  ~/.vix/logs/jobs/*.jsonl
+
+# Reconstruct one hook fire by its fire_id
+jq -c 'select(.fire_id=="f9e2c1d0")' ~/.vix/logs/hooks/*.jsonl
+
+# Latest hook errors (e.g. command_exec failures with exit codes)
+grep -h '"phase":"error"' ~/.vix/logs/hooks/*.jsonl \
+  | jq -c '{ts,hook_id,source,error,exit_code}' | tail -20
+```
+
+When the daemon runs with `--config-dir <dir>`, the logs live under
+`<dir>/logs/{jobs,hooks}/` instead of `~/.vix/logs/`.
 
 ## Consent before implementation
 

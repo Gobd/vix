@@ -119,7 +119,11 @@ func TestPermissionDefaults(t *testing.T) {
 func writeSpec(t *testing.T, dir string, s Spec) {
 	t.Helper()
 	data, _ := json.MarshalIndent(s, "", "  ")
-	if err := os.WriteFile(filepath.Join(dir, s.ID+".json"), data, 0o644); err != nil {
+	jobDir := filepath.Join(dir, s.ID)
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(jobDir, "job.json"), data, 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -127,13 +131,20 @@ func writeSpec(t *testing.T, dir string, s Spec) {
 func TestStoreLoadSpecs(t *testing.T) {
 	dir := t.TempDir()
 	writeSpec(t, dir, validSpec("good"))
-	os.WriteFile(filepath.Join(dir, "broken.json"), []byte("{nope"), 0o644)
+	// A subdir with a malformed job.json is reported invalid.
+	os.MkdirAll(filepath.Join(dir, "broken"), 0o755)
+	os.WriteFile(filepath.Join(dir, "broken", "job.json"), []byte("{nope"), 0o644)
+	// A subdir with a structurally-invalid spec is reported invalid.
 	bad := validSpec("bad")
 	bad.Prompt = ""
 	writeSpec(t, dir, bad)
-	os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("ignored"), 0o644)
+	// A stray top-level file and a subdir without job.json are both ignored,
+	// not reported.
+	os.WriteFile(filepath.Join(dir, "stray.json"), []byte("{}"), 0o644)
+	os.MkdirAll(filepath.Join(dir, "not-a-job"), 0o755)
+	os.WriteFile(filepath.Join(dir, "not-a-job", "notes.txt"), []byte("ignored"), 0o644)
 
-	st := NewStore(dir, filepath.Join(dir, "state.json"))
+	st := NewStore(dir)
 	specs, invalid := st.LoadSpecs()
 	if len(specs) != 1 || specs["good"].ID != "good" {
 		t.Fatalf("specs = %v", specs)
@@ -146,35 +157,69 @@ func TestStoreLoadSpecs(t *testing.T) {
 	}
 }
 
-func TestStoreIDDefaultsToFilename(t *testing.T) {
+func TestStoreIDDefaultsToDirname(t *testing.T) {
 	dir := t.TempDir()
 	s := validSpec("ignored")
 	s.ID = ""
 	data, _ := json.Marshal(s)
-	os.WriteFile(filepath.Join(dir, "from-file.json"), data, 0o644)
+	os.MkdirAll(filepath.Join(dir, "from-dir"), 0o755)
+	os.WriteFile(filepath.Join(dir, "from-dir", "job.json"), data, 0o644)
 
-	specs, invalid := NewStore(dir, "").LoadSpecs()
+	specs, invalid := NewStore(dir).LoadSpecs()
 	if len(invalid) != 0 {
 		t.Fatalf("invalid = %v", invalid)
 	}
-	if _, ok := specs["from-file"]; !ok {
-		t.Fatalf("id should default to filename stem, got %v", specs)
+	if _, ok := specs["from-dir"]; !ok {
+		t.Fatalf("id should default to directory name, got %v", specs)
+	}
+}
+
+// TestStoreStateFileInSpecsDirIgnored: each job's state.json now lives inside
+// its own subdirectory alongside job.json. LoadSpecs must read the spec and not
+// be confused by the sibling state file.
+func TestStoreStateFileInSpecsDirIgnored(t *testing.T) {
+	dir := t.TempDir()
+	writeSpec(t, dir, validSpec("real"))
+	st := NewStore(dir)
+	if err := st.SaveStateFor("real", &State{LastStatus: StatusOK}); err != nil {
+		t.Fatal(err)
+	}
+	specs, invalid := st.LoadSpecs()
+	if len(invalid) != 0 {
+		t.Fatalf("state file must not be reported invalid: %v", invalid)
+	}
+	if len(specs) != 1 || specs["real"].ID != "real" {
+		t.Fatalf("specs = %v, want only real", specs)
 	}
 }
 
 func TestStoreStateRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	st := NewStore(dir, filepath.Join(dir, "state.json"))
+	st := NewStore(dir)
 	in := map[string]*State{
 		"a": {LastStatus: StatusOK, ConsecutiveErrors: 0, SpecHash: "x"},
 		"b": {LastStatus: StatusError, ConsecutiveErrors: 3},
 	}
-	if err := st.SaveState(in); err != nil {
-		t.Fatal(err)
+	for id, s := range in {
+		if err := st.SaveStateFor(id, s); err != nil {
+			t.Fatal(err)
+		}
 	}
 	out := st.LoadState()
 	if out["a"].LastStatus != StatusOK || out["b"].ConsecutiveErrors != 3 {
 		t.Fatalf("round trip mismatch: %+v", out)
+	}
+
+	// DeleteState drops one job's file without touching the rest.
+	if err := st.DeleteState("a"); err != nil {
+		t.Fatal(err)
+	}
+	out = st.LoadState()
+	if _, ok := out["a"]; ok {
+		t.Fatalf("a should be gone after DeleteState, got %+v", out)
+	}
+	if out["b"] == nil {
+		t.Fatal("b must survive DeleteState(a)")
 	}
 }
 
@@ -217,8 +262,8 @@ func (r *testRunner) count(id string) int {
 
 func newTestScheduler(t *testing.T, dir string, runner *testRunner) *Scheduler {
 	t.Helper()
-	store := NewStore(dir, filepath.Join(dir, "state.json"))
-	s := NewScheduler(store, runner.fn, nil, 2)
+	store := NewStore(dir)
+	s := NewScheduler(store, runner.fn, nil, nil, 2)
 	// No $(file:) usage in scheduler tests: identity resolution keeps them
 	// independent of the prompt loader.
 	s.resolvePrompt = func(spec Spec) string { return spec.Prompt }
@@ -256,6 +301,31 @@ func TestSchedulerFiresDueJob(t *testing.T) {
 	sched.mu.Unlock()
 	if st.LastStatus != StatusOK || !st.Completed {
 		t.Fatalf("state = %+v, want ok+completed", st)
+	}
+}
+
+func TestSchedulerPersistsPerJobStateFile(t *testing.T) {
+	dir := t.TempDir()
+	s := validSpec("solo")
+	s.Trigger = Trigger{Type: "at", Time: time.Now().Add(-time.Minute).Format(time.RFC3339)}
+	writeSpec(t, dir, s)
+
+	runner := newTestRunner(nil)
+	sched := newTestScheduler(t, dir, runner)
+	now := time.Now()
+	sched.reconcile(now)
+	sched.tick(context.Background(), now)
+	waitFor(t, "job to run", func() bool { return runner.count("solo") == 1 })
+
+	statePath := filepath.Join(dir, "solo", "state.json")
+	waitFor(t, "per-job state.json to land", func() bool {
+		_, err := os.Stat(statePath)
+		return err == nil
+	})
+
+	// No global state file is written anywhere under the jobs dir.
+	if _, err := os.Stat(filepath.Join(dir, "jobs-state.json")); !os.IsNotExist(err) {
+		t.Fatalf("global jobs-state.json must not exist, stat err = %v", err)
 	}
 }
 
@@ -326,19 +396,17 @@ func TestSchedulerCatchupCap(t *testing.T) {
 		s.Trigger = Trigger{Type: "at", Time: base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339)}
 		writeSpec(t, dir, s)
 	}
-	store := NewStore(dir, filepath.Join(dir, "state.json"))
+	store := NewStore(dir)
 	// Pre-seed state as if a previous daemon had scheduled them (so they read
 	// as "missed while down" rather than newly created).
-	pre := make(map[string]*State)
 	specs, _ := store.LoadSpecs()
 	for id, sp := range specs {
 		at := sp.AtTime()
-		pre[id] = &State{NextRunAt: at, SpecHash: SpecHash(sp)}
+		store.SaveStateFor(id, &State{NextRunAt: at, SpecHash: SpecHash(sp)})
 	}
-	store.SaveState(pre)
 
 	runner := newTestRunner(nil)
-	sched := NewScheduler(store, runner.fn, nil, 2)
+	sched := NewScheduler(store, runner.fn, nil, nil, 2)
 	sched.resolvePrompt = func(spec Spec) string { return spec.Prompt }
 
 	now := time.Now()
@@ -524,7 +592,7 @@ func TestSchedulerValidationErrorSurfaced(t *testing.T) {
 	// The state file (the skill's feedback loop) must carry it too.
 	onDisk := sched.store.LoadState()
 	if onDisk["bad"] == nil || onDisk["bad"].ValidationError == "" {
-		t.Fatal("validation error must persist to jobs-state.json")
+		t.Fatal("validation error must persist to the job's state.json")
 	}
 }
 
@@ -535,7 +603,7 @@ func TestSchedulerRemovedSpecDropsState(t *testing.T) {
 	sched := newTestScheduler(t, dir, runner)
 	sched.reconcile(time.Now())
 
-	os.Remove(filepath.Join(dir, "gone.json"))
+	os.RemoveAll(filepath.Join(dir, "gone"))
 	sched.reconcile(time.Now())
 
 	sched.mu.Lock()

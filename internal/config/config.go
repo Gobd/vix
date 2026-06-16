@@ -260,6 +260,35 @@ func JobsMaxConcurrentRuns() int {
 	return cfg.Jobs.MaxConcurrentRuns
 }
 
+// DefaultLogRetentionDays is how long job/hook run logs are kept when
+// logs.retention_days is absent or invalid in settings.json.
+const DefaultLogRetentionDays = 10
+
+// LogRetentionDays reads logs.retention_days from ~/.vix/settings.json: how many
+// days of job/hook run logs (~/.vix/logs/{jobs,hooks}/<date>.jsonl) the daemon
+// keeps before sweeping older daily files. Returns DefaultLogRetentionDays when
+// the key is absent or the file is missing/unparsable. A value of 0 (or
+// negative) disables the sweep entirely — logs are kept forever.
+func LogRetentionDays() int {
+	p := filepath.Join(HomeVixDir(), "settings.json")
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return DefaultLogRetentionDays
+	}
+	var cfg struct {
+		Logs struct {
+			RetentionDays *int `json:"retention_days"`
+		} `json:"logs"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return DefaultLogRetentionDays
+	}
+	if cfg.Logs.RetentionDays == nil {
+		return DefaultLogRetentionDays
+	}
+	return *cfg.Logs.RetentionDays
+}
+
 // Compaction defaults mirror the daemon-side defaults in internal/daemon.
 const (
 	defaultCompactionAuto      = true

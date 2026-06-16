@@ -199,6 +199,69 @@ func TestExecuteWorkflow_CancelParksRunAsPaused(t *testing.T) {
 	}
 }
 
+// TestExecuteWorkflow_WorkflowDirResolves pins that $(workflow.dir) resolves to
+// the session's job directory in bash steps, and is empty (not a literal token)
+// for non-job sessions.
+func TestExecuteWorkflow_WorkflowDirResolves(t *testing.T) {
+	s := newWorkflowTestSession(t)
+	s.jobDir = "/home/user/.vix/jobs/demo"
+	wf := &WorkflowDef{
+		Name:       "dir",
+		EntryPoint: StepRef{ID: "show"},
+		Steps: map[string]WorkflowStepDef{
+			"show": {Type: "bash", Command: "echo memory-at:$(workflow.dir)/memory.md"},
+		},
+	}
+	if err := s.executeWorkflow(s.ctx, wf, "obj", nil); err != nil {
+		t.Fatalf("executeWorkflow: %v", err)
+	}
+	out := streamedText(drainEvents(s))
+	if !strings.Contains(out, "memory-at:/home/user/.vix/jobs/demo/memory.md") {
+		t.Errorf("$(workflow.dir) should resolve to the job directory, got:\n%s", out)
+	}
+
+	// Non-job session: the token resolves to empty, never leaking literally.
+	s2 := newWorkflowTestSession(t)
+	wf2 := &WorkflowDef{
+		Name:       "dir2",
+		EntryPoint: StepRef{ID: "show"},
+		Steps: map[string]WorkflowStepDef{
+			"show": {Type: "bash", Command: "echo memory-at:[$(workflow.dir)]"},
+		},
+	}
+	if err := s2.executeWorkflow(s2.ctx, wf2, "obj", nil); err != nil {
+		t.Fatalf("executeWorkflow: %v", err)
+	}
+	out2 := streamedText(drainEvents(s2))
+	if !strings.Contains(out2, "memory-at:[]") {
+		t.Errorf("$(workflow.dir) should be empty for non-job sessions, got:\n%s", out2)
+	}
+}
+
+// TestSessionJobDirIsAllowed pins that a job directory living outside both cwd
+// and $HOME (e.g. under a --config-dir override) becomes accessible once the job
+// runner marks it allowed — so a run can persist its memory file there.
+func TestSessionJobDirIsAllowed(t *testing.T) {
+	t.Setenv("HOME", "/Users/nobody")
+	s := &Session{cwd: "/work"}
+	jobDir := "/srv/vix-config/jobs/demo"
+
+	// Outside cwd, $HOME, and system dirs: not accessible by default.
+	if s.isPathAllowed(jobDir + "/memory.md") {
+		t.Fatal("job dir outside cwd/$HOME must not be accessible before being allowed")
+	}
+
+	// The job runner allows the job directory; now writes there pass the gate.
+	s.addAllowedDir(jobDir)
+	if !s.isPathAllowed(jobDir + "/memory.md") {
+		t.Error("job dir must be accessible after addAllowedDir")
+	}
+	// A sibling job's directory stays off-limits.
+	if s.isPathAllowed("/srv/vix-config/jobs/other/memory.md") {
+		t.Error("only the run's own job dir should be allowed, not siblings")
+	}
+}
+
 // ── workflow_signal ──
 
 func TestHandleWorkflowSignal(t *testing.T) {

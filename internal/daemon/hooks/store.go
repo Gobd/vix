@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // Store reads hook specs from a directory. Unlike jobs, hooks keep no runtime
@@ -23,9 +22,11 @@ func NewStore(specsDir string) *Store {
 // SpecsDir returns the directory the store reads specs from.
 func (st *Store) SpecsDir() string { return st.specsDir }
 
-// LoadSpecs reads every *.json spec in the hooks directory. Returns the valid
-// specs and a map of validation errors keyed by id (or filename stem when the
-// id itself is unusable). Files that fail to parse or validate are reported,
+// LoadSpecs reads every hook spec under the hooks directory. Each hook lives in
+// its own subdirectory as <id>/hook.json; the directory name is the default id.
+// Returns the valid specs and a map of validation errors keyed by id (or the
+// subdirectory name when the id itself is unusable). Subdirectories without a
+// hook.json are ignored; ones that fail to parse or validate are reported,
 // never fatal.
 func (st *Store) LoadSpecs() ([]Spec, map[string]string) {
 	var specs []Spec
@@ -39,22 +40,26 @@ func (st *Store) LoadSpecs() ([]Spec, map[string]string) {
 	}
 	seen := make(map[string]bool)
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+		if !e.IsDir() {
 			continue
 		}
-		stem := strings.TrimSuffix(e.Name(), ".json")
-		data, err := os.ReadFile(filepath.Join(st.specsDir, e.Name()))
+		name := e.Name()
+		specPath := filepath.Join(st.specsDir, name, "hook.json")
+		data, err := os.ReadFile(specPath)
 		if err != nil {
-			invalid[stem] = "read: " + err.Error()
+			if os.IsNotExist(err) {
+				continue // not a hook directory
+			}
+			invalid[name] = "read: " + err.Error()
 			continue
 		}
 		var spec Spec
 		if err := json.Unmarshal(data, &spec); err != nil {
-			invalid[stem] = "parse: " + err.Error()
+			invalid[name] = "parse: " + err.Error()
 			continue
 		}
 		if spec.ID == "" {
-			spec.ID = stem
+			spec.ID = name
 		}
 		if err := spec.Validate(); err != nil {
 			invalid[spec.ID] = err.Error()

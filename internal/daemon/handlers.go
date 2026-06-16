@@ -133,4 +133,35 @@ func RegisterBuiltinHandlers(s *Server) {
 		}
 		return map[string]any{"status": "ok", "session_id": id}, nil
 	})
+
+	// job.run fires a scheduled job immediately by id, out of band from its
+	// schedule (backs `vix job run <id>`). Returns the run's session id; the run
+	// proceeds in the background and lands under "Vix-initiated".
+	s.RegisterHandler("job.run", func(data map[string]any) (map[string]any, error) {
+		id, _ := data["id"].(string)
+		if id == "" {
+			return map[string]any{"status": "error", "message": "missing 'id'"}, nil
+		}
+		sessionID, err := s.RunJob(id)
+		if err != nil {
+			return map[string]any{"status": "error", "message": err.Error()}, nil
+		}
+		return map[string]any{"status": "ok", "session_id": sessionID}, nil
+	})
+
+	// hook.trigger fires a lifecycle hook immediately by id, out of band from its
+	// event (backs `vix hook trigger <id>`). Workflow/prompt hooks run in an
+	// isolated session (its id is returned); command hooks have no session, so
+	// only the fire id is returned.
+	s.RegisterHandler("hook.trigger", func(data map[string]any) (map[string]any, error) {
+		id, _ := data["id"].(string)
+		if id == "" {
+			return map[string]any{"status": "error", "message": "missing 'id'"}, nil
+		}
+		sessionID, fireID, err := s.TriggerHook(id)
+		if err != nil {
+			return map[string]any{"status": "error", "message": err.Error()}, nil
+		}
+		return map[string]any{"status": "ok", "session_id": sessionID, "fire_id": fireID}, nil
+	})
 }

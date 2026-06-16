@@ -11,5 +11,8 @@
     "agent_id": "agent_7501kqrztj1te17ssqz5wqpnvkf3",
     "auth_mode": "public"
   },
+  "logs": {
+    "retention_days": 10
+  },
   "version": 1
 }

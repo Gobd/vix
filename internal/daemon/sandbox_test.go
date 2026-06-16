@@ -208,9 +208,12 @@ func TestResolvePathInCwd_DotDotTraversal_Rejected(t *testing.T) {
 
 func TestResolvePathInCwd_SymlinkEscape_Rejected(t *testing.T) {
 	cwd := t.TempDir()
-	// Create a symlink inside cwd that points outside
-	target := t.TempDir() // a different temp dir
-	os.WriteFile(filepath.Join(target, "secret.txt"), []byte("secret"), 0o644)
+	// Point the symlink at a synthetic absolute path that cannot alias any
+	// real system directory. A real t.TempDir() target won't work here: on
+	// macOS it lives under /var/folders/... and on Linux under /tmp/..., both
+	// of which are policy-allowed system paths, so resolving into them is not
+	// an escape. Using a fake root makes the escape unambiguous on every OS.
+	target := "/vix_test_fake_target"
 
 	link := filepath.Join(cwd, "escape")
 	if err := os.Symlink(target, link); err != nil {

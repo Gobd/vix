@@ -152,6 +152,44 @@ func (c *Client) CreateMessageSession(spec json.RawMessage) (string, error) {
 	return id, nil
 }
 
+// RunJob asks the daemon to fire the job with the given id immediately, out of
+// band from its schedule. Returns the run's session id. Backs `vix job run`.
+func (c *Client) RunJob(id string) (string, error) {
+	resp, err := c.sendRequest(map[string]any{
+		"action": "job.run",
+		"id":     id,
+	})
+	if err != nil {
+		return "", err
+	}
+	if resp["status"] != "ok" {
+		msg, _ := resp["message"].(string)
+		return "", fmt.Errorf("job.run failed: %s", msg)
+	}
+	sessionID, _ := resp["session_id"].(string)
+	return sessionID, nil
+}
+
+// TriggerHook asks the daemon to fire the hook with the given id immediately,
+// out of band from its event. Returns the run's session id (empty for command
+// hooks, which have no session) and the fire id. Backs `vix hook trigger`.
+func (c *Client) TriggerHook(id string) (sessionID, fireID string, err error) {
+	resp, err := c.sendRequest(map[string]any{
+		"action": "hook.trigger",
+		"id":     id,
+	})
+	if err != nil {
+		return "", "", err
+	}
+	if resp["status"] != "ok" {
+		msg, _ := resp["message"].(string)
+		return "", "", fmt.Errorf("hook.trigger failed: %s", msg)
+	}
+	sessionID, _ = resp["session_id"].(string)
+	fireID, _ = resp["fire_id"].(string)
+	return sessionID, fireID, nil
+}
+
 // ListSessions returns the persisted open sessions for cwd, so the TUI can
 // reopen them on launch. Sessions are stored globally (~/.vix/sessions) and
 // filtered by cwd daemon-side.

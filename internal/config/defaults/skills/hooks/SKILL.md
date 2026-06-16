@@ -5,9 +5,11 @@ description: Create and manage lifecycle hooks that vixd fires automatically on 
 
 # Lifecycle hooks
 
-vixd fires user-authored hooks on agent-loop events. Each hook is one JSON file
-in `~/.vix/hooks/`; the directory is hot-reloaded, so **creating a hook = writing
-a file with `write_file`**. There is no dedicated tool.
+vixd fires user-authored hooks on agent-loop events. Each hook lives in its own
+subdirectory under `~/.vix/hooks/` holding a `hook.json` spec; the directory is
+hot-reloaded, so **creating a hook = writing `~/.vix/hooks/<id>/hook.json` with
+`write_file`**. There is no dedicated tool. Keep any helper script the hook runs
+(e.g. `script.sh`) in the same directory.
 
 A hook either runs **synchronously** and returns a decision that can veto or
 rewrite the triggering action (`"mode": "sync"`), or **asynchronously**,
@@ -17,7 +19,7 @@ fire-and-forget, in an isolated session (`"mode": "async"`, the default).
 > `deny_list` + permission system, which runs *before* any hook. A blocking hook
 > can veto the common tool paths, but don't rely on it as airtight enforcement.
 
-## Hook spec — `~/.vix/hooks/<id>.json`
+## Hook spec — `~/.vix/hooks/<id>/hook.json`
 
 ```json
 {
@@ -27,7 +29,7 @@ fire-and-forget, in an isolated session (`"mode": "async"`, the default).
   "trigger": { "event": "PreToolUse", "matcher": "write_file|edit_file" },
   "mode": "sync",
   "blocking": true,
-  "command": "$(git rev-parse --show-toplevel)/.vix/hooks/block-env.sh",
+  "command": "$HOME/.vix/hooks/block-env-writes/script.sh",
   "cwd": "",
   "timeout": "5s",
   "created_by": "agent:<your-session-id>"
@@ -163,7 +165,7 @@ threshold is crossed. (An async workflow/prompt hook also lands in
 
 ## Example: block writes to protected files (deterministic)
 
-`~/.vix/hooks/protect.json`:
+`~/.vix/hooks/protect/hook.json`:
 
 ```json
 {

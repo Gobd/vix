@@ -12,21 +12,21 @@ import (
 const feedbackHookID = "feedback-at-10"
 
 // feedbackScript is the shipped SessionStart command hook. It counts fresh
-// sessions in its own feedback/ dir next to the script (hooks/feedback/count.log)
-// and, on the 10th, opens a one-time conversation (guarded by the
-// hooks/feedback/asked marker) by calling back into the daemon via
+// sessions in its own hook dir (hooks/feedback-at-10/count.log) and, on the
+// 10th, opens a one-time conversation (guarded by the
+// hooks/feedback-at-10/asked marker) by calling back into the daemon via
 // `vix session create`. vix_bin and socket_path come from the hook context on
 // stdin, so it works regardless of PATH or socket path.
 const feedbackScript = `#!/usr/bin/env bash
 # Shipped by vix. After 10 fresh sessions, open a one-time conversation asking
-# for feedback. Counts in this hook's own feedback/ dir (count.log) and fires
-# exactly once (guarded by feedback/asked). To change the copy, edit message.md
-# next to this script. To turn it off, set "enabled": false in
-# feedback-at-10.json (or delete both files).
+# for feedback. Counts in this hook's own dir (count.log) and fires exactly once
+# (guarded by the asked marker). To change the copy, edit message.md next to
+# this script. To turn it off, set "enabled": false in hook.json (or delete the
+# hook directory).
 set -euo pipefail
 ctx=$(cat)
 self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-dir="$self/feedback"
+dir="$self"
 mkdir -p "$dir"
 echo 1 >> "$dir/count.log"
 n=$(wc -l < "$dir/count.log" | tr -d ' ')
@@ -59,17 +59,24 @@ Thank you for helping us improve vix!
 
 // feedbackSeedSentinel marks that the default feedback hook has been seeded
 // once. It lives in the hooks dir (a dotfile, so the registry ignores it) and
-// gates seeding independently of directory existence, so the hook's own state
-// dir (feedback/) can be pre-created without re-triggering a seed.
+// gates seeding independently of directory existence, so the hook's own
+// directory (hooks/feedback-at-10/) can be pre-created without re-triggering a
+// seed.
 const feedbackSeedSentinel = ".feedback-seeded"
 
-// seedDefaultFeedbackHook writes the shipped feedback hook into hooksDir: the
-// spec, the executable script, and the message.md copy. Existing files are left
-// untouched (so a user's edits/disable survive), then a sentinel is written so
-// this runs at most once. Never seeded on an auth-enabled daemon (the script's
-// `vix session create` callback can't present the shared secret).
+// seedDefaultFeedbackHook writes the shipped feedback hook into hooksDir under
+// its own subdirectory (hooks/feedback-at-10/): the spec (hook.json), the
+// executable script (script.sh), and the message.md copy. Existing files are
+// left untouched (so a user's edits/disable survive), then a sentinel is
+// written so this runs at most once. Never seeded on an auth-enabled daemon
+// (the script's `vix session create` callback can't present the shared secret).
 func seedDefaultFeedbackHook(hooksDir string) {
-	scriptPath := filepath.Join(hooksDir, feedbackHookID+".sh")
+	hookDir := filepath.Join(hooksDir, feedbackHookID)
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		LogError("hooks: cannot create %s: %v", hookDir, err)
+		return
+	}
+	scriptPath := filepath.Join(hookDir, "script.sh")
 
 	spec := hooks.Spec{
 		ID:        feedbackHookID,
@@ -85,9 +92,9 @@ func seedDefaultFeedbackHook(hooksDir string) {
 		LogError("hooks: marshal feedback hook spec: %v", err)
 		return
 	}
-	writeIfAbsent(filepath.Join(hooksDir, feedbackHookID+".json"), append(data, '\n'), 0o644)
+	writeIfAbsent(filepath.Join(hookDir, "hook.json"), append(data, '\n'), 0o644)
 	writeIfAbsent(scriptPath, []byte(feedbackScript), 0o755)
-	writeIfAbsent(filepath.Join(hooksDir, "message.md"), []byte(feedbackMessage), 0o644)
+	writeIfAbsent(filepath.Join(hookDir, "message.md"), []byte(feedbackMessage), 0o644)
 
 	// Sentinel last: if any artifact failed to write we still want a retry next
 	// start, so only stamp it once the trio is in place.
@@ -95,7 +102,7 @@ func seedDefaultFeedbackHook(hooksDir string) {
 		LogError("hooks: write feedback seed sentinel: %v", err)
 		return
 	}
-	LogInfo("hooks: seeded default feedback hook at %s", hooksDir)
+	LogInfo("hooks: seeded default feedback hook at %s", hookDir)
 }
 
 // writeIfAbsent writes data to path only when path does not already exist, so

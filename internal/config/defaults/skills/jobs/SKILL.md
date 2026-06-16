@@ -5,8 +5,9 @@ description: Create and manage scheduled jobs (cron tasks, reminders, heartbeat 
 
 # Scheduled jobs
 
-vixd runs a scheduler over plain JSON files in `~/.vix/jobs/`. Each file is one
-job; the directory is hot-reloaded, so **creating a job = writing a file with
+vixd runs a scheduler over per-job directories in `~/.vix/jobs/`. Each job lives
+in its own subdirectory holding a `job.json` spec; the directory is
+hot-reloaded, so **creating a job = writing `~/.vix/jobs/<id>/job.json` with
 `write_file`**. There is no dedicated tool.
 
 Every run executes in an isolated headless session: either a plain chat turn
@@ -14,7 +15,7 @@ with the general agent, or a workflow when `workflow_id` (a named workflow) or
 `workflow` (an inline definition) is set. Finished runs appear in the user's
 Sessions tab under "Vix-initiated".
 
-## Job spec — `~/.vix/jobs/<id>.json`
+## Job spec — `~/.vix/jobs/<id>/job.json`
 
 ```json
 {
@@ -34,7 +35,7 @@ Sessions tab under "Vix-initiated".
 
 Field rules:
 
-- `id` — defaults to the filename stem; must be unique.
+- `id` — defaults to the directory name; must be unique.
 - `trigger` — exactly one of:
   - `{"type": "cron", "expr": "...", "tz": "..."}` — standard 5-field cron
     (`*/30 9-19 * * *`) **or** descriptors (`@every 30m`, `@hourly`, `@daily`).
@@ -66,9 +67,9 @@ Field rules:
 
 ## After writing a job: verify it registered
 
-The scheduler validates on (re)load and records problems in
-`~/.vix/jobs-state.json`. Always read it back after creating or editing a job
-and check your job's entry:
+The scheduler validates on (re)load and records each job's runtime state in
+that job's own `~/.vix/jobs/<id>/state.json` (a sibling of `job.json`). Always
+read it back after creating or editing a job and check the fields:
 
 - `validation_error` non-empty → fix the spec.
 - `next_run_at` set → scheduled correctly.
@@ -81,7 +82,7 @@ To test-fire a new job, give it a near-due schedule (an `at` a minute out, or
 
 ## Heartbeat (already installed)
 
-`~/.vix/jobs/heartbeat.json` ships enabled: every 30 minutes (9:00-19:59) it
+`~/.vix/jobs/heartbeat/job.json` ships enabled: every 30 minutes (9:00-19:59) it
 reads `~/.vix/heartbeat.md` and follows it. The file is the *whiteboard*: add
 or remove tasks there — never touch the job. While the file holds only
 headings/comments the run skips with zero tokens. A run whose final answer is

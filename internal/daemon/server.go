@@ -53,6 +53,12 @@ type Server struct {
 	// User-level config directory (~/.vix/)
 	homeVixDir string
 
+	// cwd is vixd's own working directory, captured once at construction. Used
+	// as the default working directory offered to web-UI job creation (the
+	// `default_cwd` field of the WebSocket payload) so a created job runs where
+	// the daemon was launched unless the user overrides it.
+	cwd string
+
 	// vixBin is the path to the vix CLI binary, resolved once at construction as
 	// the sibling of the running vixd executable (falling back to "vix" on
 	// PATH). Exposed to hooks via the context envelope so a hook can call back
@@ -188,6 +194,9 @@ func NewServer(sockPath string, cred config.Credential, sessionID, model string,
 		authToken:  daemonConfig.AuthToken,
 		vixBin:     resolveVixBin(),
 	}
+	if wd, err := os.Getwd(); err == nil {
+		s.cwd = wd
+	}
 
 	// Set LLM log directory to ~/.vix/logs/
 	if s.homeVixDir != "" {
@@ -276,8 +285,7 @@ func (s *Server) authOK(token string) bool {
 func (s *Server) EnableJobScheduler() {
 	paths := config.NewVixPaths("", s.homeVixDir, "")
 	dir := paths.Jobs()
-	statePath := paths.JobsState()
-	if dir == "" || statePath == "" {
+	if dir == "" {
 		return
 	}
 	// First enable (no jobs directory yet): seed the default heartbeat job and
@@ -296,7 +304,8 @@ func (s *Server) EnableJobScheduler() {
 		s.BroadcastEvent(protocol.SessionEvent{Type: eventType, Data: data})
 		s.notifySubscribers()
 	}
-	s.jobScheduler = jobs.NewScheduler(jobs.NewStore(dir, statePath), s.JobRunner(), notify, config.JobsMaxConcurrentRuns())
+	logger := jobRunLogger{dir: s.jobsLogDir}
+	s.jobScheduler = jobs.NewScheduler(jobs.NewStore(dir), s.JobRunner(), notify, logger, config.JobsMaxConcurrentRuns())
 }
 
 // EnableHooks builds the lifecycle-hooks registry from ~/.vix/hooks. Safe to
@@ -350,7 +359,12 @@ func seedDefaultHeartbeat(jobsDir, heartbeatPath string) {
 		CreatedBy:   "vix",
 	}
 	data, _ := json.MarshalIndent(job, "", "  ")
-	target := filepath.Join(jobsDir, "heartbeat.json")
+	heartbeatDir := filepath.Join(jobsDir, "heartbeat")
+	if err := os.MkdirAll(heartbeatDir, 0o755); err != nil {
+		LogError("jobs: cannot create %s: %v", heartbeatDir, err)
+		return
+	}
+	target := filepath.Join(heartbeatDir, "job.json")
 	if err := os.WriteFile(target, append(data, '\n'), 0o644); err != nil {
 		LogError("jobs: seed heartbeat job: %v", err)
 	} else {
@@ -367,7 +381,7 @@ func seedDefaultHeartbeat(jobsDir, heartbeatPath string) {
 
 <!--
 vix reads this file on the "heartbeat" job's schedule (every 30 minutes,
-9:00-19:59 by default — edit ~/.vix/jobs/heartbeat.json to change it).
+9:00-19:59 by default — edit ~/.vix/jobs/heartbeat/job.json to change it).
 
 While this file only contains headings and comments, the check is skipped
 BEFORE any model call: zero tokens spent. Write a task below to put the
@@ -423,6 +437,10 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		go s.jobScheduler.Start(ctx)
 		LogInfo("jobs: scheduler started")
 	}
+
+	// Run-log retention: prune job/hook run logs older than the configured
+	// number of days at startup, then once a day while the daemon is up.
+	go s.runLogSweepLoop(ctx)
 
 	// One-shot stale trim of closed session records in the default global
 	// store (~/.vix/sessions/closed). Retention comes from settings.json
@@ -973,7 +991,51 @@ func (s *Server) Hooks() []hooks.HookSnapshot {
 	return s.hookRegistry.Snapshot()
 }
 
-// getSession returns the live session with the given ID, or nil if not found.
+// DefaultCWD returns vixd's own working directory, offered to the web UI as the
+// default working directory for newly created jobs.
+func (s *Server) DefaultCWD() string {
+	return s.cwd
+}
+
+// CreateJob persists and schedules a new job from the web UI. It assigns a
+// unique id derived from the job name when the spec doesn't carry one, then
+// validates + writes via the scheduler and notifies web subscribers so the Jobs
+// tab refreshes. Returns the assigned id.
+func (s *Server) CreateJob(spec jobs.Spec) (string, error) {
+	if s.jobScheduler == nil {
+		return "", fmt.Errorf("jobs engine is disabled")
+	}
+	if spec.ID == "" {
+		base := spec.Name
+		if base == "" {
+			base = "job"
+		}
+		spec.ID = s.jobScheduler.UniqueID(base)
+	}
+	if err := s.jobScheduler.CreateJob(spec); err != nil {
+		return "", err
+	}
+	s.notifySubscribers()
+	return spec.ID, nil
+}
+
+// RunJob fires the job with the given id immediately, out of band from the
+// schedule, mirroring `vix job run <id>`. It generates the run's session id up
+// front and returns it once the run has been accepted; the run itself proceeds
+// in the background (its outcome lands under "Vix-initiated" sessions and the
+// run log). Errors surface synchronously for an unknown id, a run already in
+// flight, or a disabled jobs engine.
+func (s *Server) RunJob(id string) (string, error) {
+	if s.jobScheduler == nil {
+		return "", fmt.Errorf("jobs engine is disabled")
+	}
+	runID := generateSessionID()
+	if err := s.jobScheduler.RunNow(s.serverCtx, id, runID); err != nil {
+		return "", err
+	}
+	return runID, nil
+}
+
 func (s *Server) getSession(id string) *Session {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()

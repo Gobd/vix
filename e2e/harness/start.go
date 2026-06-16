@@ -114,8 +114,8 @@ type config struct {
 //	{{HOME}}     → the absolute per-test HOME
 //	{{MOCK_URL}} → the mock LLM server base URL (no trailing /v1)
 //
-// Used e.g. to drop a ~/.vix/jobs/<id>.json spec for the scheduled-jobs engine,
-// or a ~/.vix/.env for credential-resolution scenarios.
+// Used e.g. to drop a ~/.vix/jobs/<id>/job.json spec for the scheduled-jobs
+// engine, or a ~/.vix/.env for credential-resolution scenarios.
 type homeFile struct{ rel, content string }
 
 // WithEnv sets an extra environment variable on the spawned vix/vixd processes.
@@ -162,9 +162,9 @@ func WithTermSize(cols, rows int) Option {
 }
 
 // WithHomeFile seeds a file under the per-test HOME before vixd starts (e.g. a
-// scheduled-job spec at ".vix/jobs/<id>.json", or ".vix/.env"). The content may
-// use the {{WORKDIR}}, {{HOME}} and {{MOCK_URL}} placeholders, expanded to the
-// per-test values.
+// scheduled-job spec at ".vix/jobs/<id>/job.json", or ".vix/.env"). The content
+// may use the {{WORKDIR}}, {{HOME}} and {{MOCK_URL}} placeholders, expanded to
+// the per-test values.
 func WithHomeFile(rel, content string) Option {
 	return func(c *config) { c.homeFiles = append(c.homeFiles, homeFile{rel: rel, content: content}) }
 }
@@ -260,6 +260,23 @@ func Start(t *testing.T, meta Meta, opts ...Option) *Harness {
 // lives outside the workdir, such as persisted session records.
 func (h *Harness) HomePath(rel ...string) string {
 	return filepath.Join(append([]string{h.home}, rel...)...)
+}
+
+// RunCLI runs the vix binary as a one-shot subcommand against this test's
+// daemon, with the per-test HOME, socket, and env. It returns the combined
+// stdout+stderr and any exit error. Used to drive the out-of-band verbs
+// `vix job run <id>` and `vix hook trigger <id>` (not the TUI).
+func (h *Harness) RunCLI(args ...string) (string, error) {
+	h.t.Helper()
+	bin, err := vixBinary()
+	if err != nil {
+		h.t.Fatalf("e2e: resolve vix binary: %v", err)
+	}
+	cmd := exec.Command(bin, args...)
+	cmd.Env = h.daemonEnv(h.cfg, nil)
+	cmd.Dir = h.workdir
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 // requireE2E skips unless the runner opted in and both binaries are resolvable.

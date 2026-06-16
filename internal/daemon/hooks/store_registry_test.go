@@ -6,20 +6,27 @@ import (
 	"testing"
 )
 
-func writeSpec(t *testing.T, dir, name, body string) {
+func writeSpec(t *testing.T, dir, id, body string) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+	hookDir := filepath.Join(dir, id)
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hookDir, "hook.json"), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestStoreLoadSpecs(t *testing.T) {
 	dir := t.TempDir()
-	writeSpec(t, dir, "ok.json", `{"id":"ok","enabled":true,"trigger":{"event":"PreToolUse"},"command":"true"}`)
-	writeSpec(t, dir, "noid.json", `{"enabled":true,"trigger":{"event":"Stop"},"command":"true"}`)
-	writeSpec(t, dir, "bad.json", `{not json`)
-	writeSpec(t, dir, "invalid.json", `{"id":"invalid","trigger":{"event":"Nope"},"command":"true"}`)
-	writeSpec(t, dir, "ignore.txt", `not a spec`)
+	writeSpec(t, dir, "ok", `{"id":"ok","enabled":true,"trigger":{"event":"PreToolUse"},"command":"true"}`)
+	writeSpec(t, dir, "noid", `{"enabled":true,"trigger":{"event":"Stop"},"command":"true"}`)
+	writeSpec(t, dir, "bad", `{not json`)
+	writeSpec(t, dir, "invalid", `{"id":"invalid","trigger":{"event":"Nope"},"command":"true"}`)
+	// A subdir without a hook.json and a top-level file are both ignored.
+	os.MkdirAll(filepath.Join(dir, "not-a-hook"), 0o755)
+	os.WriteFile(filepath.Join(dir, "not-a-hook", "script.sh"), []byte("echo hi"), 0o644)
+	os.WriteFile(filepath.Join(dir, "ignore.txt"), []byte("not a spec"), 0o644)
 
 	st := NewStore(dir)
 	specs, invalid := st.LoadSpecs()
@@ -29,16 +36,16 @@ func TestStoreLoadSpecs(t *testing.T) {
 		ids[s.ID] = true
 	}
 	if !ids["ok"] || !ids["noid"] {
-		t.Fatalf("expected ok+noid (id from filename), got %v", ids)
+		t.Fatalf("expected ok+noid (id from directory name), got %v", ids)
 	}
 	if len(specs) != 2 {
 		t.Fatalf("expected 2 valid specs, got %d", len(specs))
 	}
 	if _, ok := invalid["bad"]; !ok {
-		t.Errorf("expected bad.json reported invalid: %v", invalid)
+		t.Errorf("expected bad hook reported invalid: %v", invalid)
 	}
 	if _, ok := invalid["invalid"]; !ok {
-		t.Errorf("expected invalid.json reported invalid: %v", invalid)
+		t.Errorf("expected invalid hook reported invalid: %v", invalid)
 	}
 }
 
@@ -51,10 +58,10 @@ func TestStoreEmptyDir(t *testing.T) {
 
 func TestRegistryMatchAndReload(t *testing.T) {
 	dir := t.TempDir()
-	writeSpec(t, dir, "sync.json", `{"id":"sync","enabled":true,"mode":"sync","blocking":true,"trigger":{"event":"PreToolUse","matcher":"write_file"},"command":"true"}`)
-	writeSpec(t, dir, "async.json", `{"id":"async","enabled":true,"mode":"async","trigger":{"event":"PreToolUse"},"command":"true"}`)
-	writeSpec(t, dir, "disabled.json", `{"id":"disabled","enabled":false,"trigger":{"event":"PreToolUse"},"command":"true"}`)
-	writeSpec(t, dir, "stop.json", `{"id":"stop","enabled":true,"trigger":{"event":"Stop"},"command":"true"}`)
+	writeSpec(t, dir, "sync", `{"id":"sync","enabled":true,"mode":"sync","blocking":true,"trigger":{"event":"PreToolUse","matcher":"write_file"},"command":"true"}`)
+	writeSpec(t, dir, "async", `{"id":"async","enabled":true,"mode":"async","trigger":{"event":"PreToolUse"},"command":"true"}`)
+	writeSpec(t, dir, "disabled", `{"id":"disabled","enabled":false,"trigger":{"event":"PreToolUse"},"command":"true"}`)
+	writeSpec(t, dir, "stop", `{"id":"stop","enabled":true,"trigger":{"event":"Stop"},"command":"true"}`)
 
 	r := NewRegistry(NewStore(dir))
 
@@ -83,9 +90,28 @@ func TestRegistryMatchAndReload(t *testing.T) {
 	}
 
 	// Hot reload: drop a new hook on disk and reload.
-	writeSpec(t, dir, "prompt.json", `{"id":"p","enabled":true,"trigger":{"event":"UserPromptSubmit"},"command":"true"}`)
+	writeSpec(t, dir, "prompt", `{"id":"p","enabled":true,"trigger":{"event":"UserPromptSubmit"},"command":"true"}`)
 	r.Reload()
 	if !r.Has(EventUserPromptSubmit) {
 		t.Fatal("reload should pick up the new UserPromptSubmit hook")
+	}
+}
+
+func TestRegistrySpecByID(t *testing.T) {
+	dir := t.TempDir()
+	writeSpec(t, dir, "on", `{"id":"on","enabled":true,"trigger":{"event":"Stop"},"command":"true"}`)
+	writeSpec(t, dir, "off", `{"id":"off","enabled":false,"trigger":{"event":"Stop"},"command":"true"}`)
+
+	r := NewRegistry(NewStore(dir))
+
+	if s, ok := r.SpecByID("on"); !ok || s.ID != "on" {
+		t.Fatalf("SpecByID(on) = %+v, %v; want the enabled hook", s, ok)
+	}
+	// Disabled hooks are still addressable by id (manual trigger overrides).
+	if s, ok := r.SpecByID("off"); !ok || s.ID != "off" || s.Enabled {
+		t.Fatalf("SpecByID(off) = %+v, %v; want the disabled hook", s, ok)
+	}
+	if _, ok := r.SpecByID("ghost"); ok {
+		t.Fatal("SpecByID(ghost) should miss")
 	}
 }

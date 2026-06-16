@@ -15,9 +15,10 @@ import (
 func TestSeedDefaultFeedbackHook(t *testing.T) {
 	dir := t.TempDir()
 	seedDefaultFeedbackHook(dir)
+	hookDir := filepath.Join(dir, feedbackHookID)
 
 	// Spec: present, valid, and wired to SessionStart/startup async.
-	raw, err := os.ReadFile(filepath.Join(dir, feedbackHookID+".json"))
+	raw, err := os.ReadFile(filepath.Join(hookDir, "hook.json"))
 	if err != nil {
 		t.Fatalf("spec not written: %v", err)
 	}
@@ -34,12 +35,12 @@ func TestSeedDefaultFeedbackHook(t *testing.T) {
 	if spec.EffectiveMode() != hooks.ModeAsync {
 		t.Errorf("mode = %q, want async", spec.EffectiveMode())
 	}
-	if !strings.Contains(spec.Command, feedbackHookID+".sh") {
+	if !strings.Contains(spec.Command, filepath.Join(feedbackHookID, "script.sh")) {
 		t.Errorf("command %q does not reference the script", spec.Command)
 	}
 
 	// Script: executable and a shell script.
-	scriptPath := filepath.Join(dir, feedbackHookID+".sh")
+	scriptPath := filepath.Join(hookDir, "script.sh")
 	fi, err := os.Stat(scriptPath)
 	if err != nil {
 		t.Fatalf("script not written: %v", err)
@@ -53,7 +54,7 @@ func TestSeedDefaultFeedbackHook(t *testing.T) {
 	}
 
 	// message.md: present and carries the feedback form link.
-	msg, err := os.ReadFile(filepath.Join(dir, "message.md"))
+	msg, err := os.ReadFile(filepath.Join(hookDir, "message.md"))
 	if err != nil {
 		t.Fatalf("message.md not written: %v", err)
 	}
@@ -68,11 +69,11 @@ func TestSeedDefaultFeedbackHook(t *testing.T) {
 
 	// Re-seeding must not clobber a user's edited/disabled artifacts.
 	edited := []byte(`{"id":"feedback-at-10","enabled":false}`)
-	if err := os.WriteFile(filepath.Join(dir, feedbackHookID+".json"), edited, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(hookDir, "hook.json"), edited, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	seedDefaultFeedbackHook(dir)
-	if got, _ := os.ReadFile(filepath.Join(dir, feedbackHookID+".json")); string(got) != string(edited) {
+	if got, _ := os.ReadFile(filepath.Join(hookDir, "hook.json")); string(got) != string(edited) {
 		t.Errorf("re-seed clobbered edited spec: got %s", got)
 	}
 }
@@ -168,8 +169,8 @@ func TestFeedbackScriptCountsAndFiresOnce(t *testing.T) {
 	}
 	scriptPath, fakeVix, callLog := writeFeedbackFixtures(t)
 	home := t.TempDir()
-	// State now lives next to the script (the hook's own feedback/ dir).
-	feedbackDir := filepath.Join(filepath.Dir(scriptPath), "feedback")
+	// State now lives directly in the script's own dir (the hook dir).
+	feedbackDir := filepath.Dir(scriptPath)
 
 	// Runs 1..9: below threshold, nothing delivered.
 	for i := 1; i <= 9; i++ {
@@ -207,7 +208,7 @@ func TestFeedbackScriptConcurrentFiresOnce(t *testing.T) {
 	}
 	scriptPath, fakeVix, callLog := writeFeedbackFixtures(t)
 	home := t.TempDir()
-	feedbackDir := filepath.Join(filepath.Dir(scriptPath), "feedback")
+	feedbackDir := filepath.Dir(scriptPath)
 	if err := os.MkdirAll(feedbackDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

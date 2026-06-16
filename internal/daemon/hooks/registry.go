@@ -85,6 +85,21 @@ func (r *Registry) Has(event string) bool {
 	return len(r.byEvent[event]) > 0
 }
 
+// SpecByID returns the hook spec with the given id, including disabled ones, so
+// callers (e.g. an on-demand `vix hook trigger <id>`) can fire a hook by id
+// regardless of whether it is currently enabled. The second result is false
+// when no spec carries that id.
+func (r *Registry) SpecByID(id string) (Spec, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, s := range r.all {
+		if s.ID == id {
+			return s, true
+		}
+	}
+	return Spec{}, false
+}
+
 // Invalid returns the most recent validation errors keyed by id, for surfacing
 // in a /hooks browser or logs.
 func (r *Registry) Invalid() map[string]string {

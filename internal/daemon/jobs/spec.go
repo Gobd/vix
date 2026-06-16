@@ -1,5 +1,5 @@
 // Package jobs implements vixd's scheduled-jobs engine: user-authored job
-// specs (~/.vix/jobs/<id>.json) fired by a single timer loop, each run
+// specs (~/.vix/jobs/<id>/job.json) fired by a single timer loop, each run
 // executing a prompt — optionally through a workflow — in an isolated session.
 //
 // The package owns scheduling, persistence, and policy (catch-up, backoff,
@@ -46,9 +46,9 @@ type Permissions struct {
 	AutoDirs  *bool `json:"auto_dirs,omitempty"`
 }
 
-// Spec is a user-authored job definition, one JSON file per job under
-// ~/.vix/jobs/. Mutable runtime state lives separately (State) so these files
-// never churn.
+// Spec is a user-authored job definition, one job.json per job under
+// ~/.vix/jobs/<id>/. Mutable runtime state lives separately (State) so these
+// files never churn.
 type Spec struct {
 	ID      string  `json:"id"`
 	Name    string  `json:"name,omitempty"`

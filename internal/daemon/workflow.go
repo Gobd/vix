@@ -1298,6 +1298,7 @@ func (s *Session) executeParallelSteps(
 
 				vars := envVars(s.cwd, s.model)
 				vars["workflow.prompt"] = prompt
+				vars["workflow.dir"] = s.jobDir
 				mu.Lock()
 				for k, v := range buildStepVars(exec.StepResults) {
 					vars[k] = v
@@ -1541,6 +1542,9 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 	// Base vars: workflow.prompt is the magic variable
 	baseVars := envVars(s.cwd, s.model)
 	baseVars["workflow.prompt"] = prompt
+	// workflow.dir is the run's job directory (~/.vix/jobs/<id>) for scheduled
+	// runs, empty otherwise. Always present so the token never leaks unresolved.
+	baseVars["workflow.dir"] = s.jobDir
 	baseVars["session.id"] = s.id
 
 	// Resolve entry point params — or, on resume, pick up at the saved cursor.
@@ -2022,6 +2026,7 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 			} else {
 				vars := envVars(s.cwd, s.model)
 				vars["workflow.prompt"] = prompt
+				vars["workflow.dir"] = s.jobDir
 				for k, v := range buildStepVars(exec.StepResults) {
 					vars[k] = v
 				}

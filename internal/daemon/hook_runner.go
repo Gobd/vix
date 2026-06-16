@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/get-vix/vix/internal/daemon/hooks"
 	"github.com/get-vix/vix/internal/protocol"
@@ -19,36 +21,100 @@ import (
 // downgraded to context so it stays observational.
 func (s *Server) runSyncHook(ctx context.Context, spec hooks.Spec, base map[string]any) hooks.Decision {
 	cwd := hookCWD(spec, base)
+	fireID := newFireID()
+	s.logHookFired(fireID, spec, false, base)
+	start := time.Now()
 	var dec hooks.Decision
 	if spec.Command != "" {
 		stdin, _ := json.Marshal(base)
 		code, out, errOut := runHookCommand(ctx, spec, cwd, stdin)
+		if code < 0 {
+			s.logHookError(fireID, spec, "command_exec", strings.TrimSpace(errOut), code)
+		}
 		dec = hooks.ParseCommandDecision(code, out, errOut)
 	} else {
-		final, _ := s.runHookSession(ctx, spec, hookSessionText(spec, base), cwd, false)
+		final, hadErr := s.runHookSession(ctx, spec, hookSessionText(spec, base), cwd, false, "")
+		if hadErr {
+			s.logHookError(fireID, spec, "agent", "hook session errored", 0)
+		}
 		dec = hooks.ParseTextDecision(final)
 	}
-	return downgradeIfNonBlocking(spec, dec)
+	dec = downgradeIfNonBlocking(spec, dec)
+	s.logHookFinished(fireID, spec, dec.Behavior, time.Since(start))
+	return dec
 }
 
 // fireAsyncHook runs a hook fire-and-forget, decoupled from the triggering turn
 // (it derives from the server context so it can outlive the tool call).
 func (s *Server) fireAsyncHook(spec hooks.Spec, base map[string]any) {
+	s.fireHookAsync(spec, base, "")
+}
+
+// fireHookAsync runs a hook fire-and-forget, decoupled from any triggering turn
+// (it derives from the server context so it can outlive the caller). For
+// workflow/prompt hooks the run executes in an isolated session whose id is
+// runID (empty = mint a fresh one); command hooks have no session and ignore
+// it. Returns the session id (empty for command hooks) and the fire id, so an
+// on-demand trigger can surface them immediately.
+func (s *Server) fireHookAsync(spec hooks.Spec, base map[string]any, runID string) (string, string) {
 	parent := s.serverCtx
 	if parent == nil {
 		parent = context.Background()
 	}
+	fireID := newFireID()
+	isCommand := spec.Command != ""
+	if !isCommand && runID == "" {
+		runID = generateSessionID()
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(parent, spec.TimeoutDuration())
 		defer cancel()
+		s.logHookFired(fireID, spec, true, base)
+		start := time.Now()
 		cwd := hookCWD(spec, base)
-		if spec.Command != "" {
+		status := "done"
+		if isCommand {
 			stdin, _ := json.Marshal(base)
-			runHookCommand(ctx, spec, cwd, stdin)
-			return
+			code, _, errOut := runHookCommand(ctx, spec, cwd, stdin)
+			if code < 0 {
+				s.logHookError(fireID, spec, "command_exec", strings.TrimSpace(errOut), code)
+				status = "error"
+			}
+		} else {
+			_, hadErr := s.runHookSession(ctx, spec, hookSessionText(spec, base), cwd, true, runID)
+			if hadErr {
+				s.logHookError(fireID, spec, "agent", "hook session errored", 0)
+				status = "error"
+			}
 		}
-		s.runHookSession(ctx, spec, hookSessionText(spec, base), cwd, true)
+		s.logHookFinished(fireID, spec, status, time.Since(start))
 	}()
+	if isCommand {
+		return "", fireID
+	}
+	return runID, fireID
+}
+
+// TriggerHook fires the hook with the given id immediately, out of band from its
+// event (backs `vix hook trigger <id>`). A manual trigger has no triggering
+// action to veto, so it always runs fire-and-forget regardless of the hook's
+// mode, even when the hook is disabled. It synthesizes a minimal context
+// envelope and returns the run's session id (empty for command hooks) and the
+// fire id. Errors surface synchronously for an unknown id or a disabled engine.
+func (s *Server) TriggerHook(id string) (string, string, error) {
+	if s.hookRegistry == nil {
+		return "", "", fmt.Errorf("hooks engine is disabled")
+	}
+	spec, ok := s.hookRegistry.SpecByID(id)
+	if !ok {
+		return "", "", fmt.Errorf("hook %q not found", id)
+	}
+	base := map[string]any{"event": spec.Trigger.Event, "manual": true}
+	if spec.CWD != "" {
+		base["cwd"] = spec.CWD
+	}
+	sessionID, fireID := s.fireHookAsync(spec, base, "")
+	return sessionID, fireID, nil
 }
 
 // downgradeIfNonBlocking strips a non-blocking hook's veto powers: a deny is
@@ -105,8 +171,12 @@ func runHookCommand(ctx context.Context, spec hooks.Spec, cwd string, stdin []by
 // concatenated assistant text and whether an error occurred. When persist is
 // true the run is registered/persisted so it appears in the Sessions tab under
 // "Vix-initiated"; sync veto runs pass false to avoid a record per tool call.
-func (s *Server) runHookSession(ctx context.Context, spec hooks.Spec, text, cwd string, persist bool) (string, bool) {
-	runID := generateSessionID()
+// runID seeds the session id (empty = mint a fresh one) so callers that need it
+// up front can pre-generate it.
+func (s *Server) runHookSession(ctx context.Context, spec hooks.Spec, text, cwd string, persist bool, runID string) (string, bool) {
+	if runID == "" {
+		runID = generateSessionID()
+	}
 	session := NewSession(runID, s, nil, s.model, cwd, "", false,
 		spec.AutoWrite(), spec.AutoDirs(), true /*headless*/, ctx)
 	session.origin = "vix"
