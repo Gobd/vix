@@ -22,9 +22,12 @@ import (
 //
 // The `plan` step also maintains a memory file at $(workflow.dir)/memory.md — the
 // run's own job directory (~/.vix/jobs/<id>) surfaced to the workflow as the
-// daemon-resolved $(workflow.dir) variable. The model reads it, plans each open
-// item exactly once (skipping numbers already recorded), appends newly planned
-// numbers, and trims numbers that have dropped off the open list (closed/merged).
+// daemon-resolved $(workflow.dir) variable. The model reads it, claims EXACTLY
+// ONE not-yet-addressed open item per run (marking it before it starts), drafts
+// a plan for that single item, marks it addressed when done, and trims numbers
+// that have dropped off the open list (closed/merged). The planning
+// instructions are baked into the plan step itself (the job's prompt is only a
+// label), so the run does not depend on a user-supplied prompt.
 //
 // Skipped: scheduled-job runs execute in the daemon's scheduler, not through the
 // TUI, and the harness has no job-run primitive (no /api/jobs driver, no way to
@@ -44,10 +47,10 @@ func TestGithubPlanJobAccessBranches(t *testing.T) {
 	meta := harness.Meta{
 		Category:    "jobs",
 		Subcategory: "jobs.github_plan",
-		Description: "the GitHub plan job picks gh/API/none, shows the plan in its session, and tracks planned items in $(workflow.dir)/memory.md",
+		Description: "the GitHub plan job picks gh/API/none, shows its framed findings in a per-item-titled session, and tracks planned items in $(workflow.dir)/memory.md",
 		Wire:        harness.WireMessages,
 	}
-	harness.SkipScenario(t, meta, "no job-run harness primitive yet; branch logic covered by jobWorkflows vitest + engine Go tests")
+	harness.SkipScenario(t, meta, "branch matrix needs the frontend-generated githubIssuePlanWorkflow JSON + gh/curl shims; the daemon-side title/transcript/chat-mode are covered live by jobs.plan_session (jobs_plan_session_test.go)")
 
 	// "no access" shim: gh absent (not installed) and curl always fails — the
 	// detect step must resolve to `none` and route to `deny`.
@@ -62,16 +65,25 @@ func TestGithubPlanJobAccessBranches(t *testing.T) {
 
 	h.UI.WaitStable(400 * time.Millisecond)
 
-	// The plan step (only reached on the gh/api branches) streams the drafted
-	// plan; deny never reaches the model.
-	h.Mock.Enqueue(harness.Text("Drafted a step-by-step plan for each open item."))
+	// The plan step (only reached on the gh/api branches) streams the framed
+	// findings, which open with the deterministic header the daemon parses to
+	// title the session.
+	h.Mock.Enqueue(harness.Text("Hi, I investigated issue #29 — ANTHROPIC_BASE_URL not resolved from .env files — on GitHub. Here are my findings:\n\nhttps://github.com/get-vix/vix/issues/29\n\n**Summary**\nThe base URL isn't read from .env.\n\n**My take**\nLegit, actionable bug.\n\n**Plan**\n1. Resolve ANTHROPIC_BASE_URL in config loading."))
 
 	// TODO(jobs-harness): create the job (inline githubIssuePlanWorkflow) and
-	// fire its trigger, then assert the resulting Vix-initiated session shows
-	// the deny error ("can't reach GitHub") for the no-access shims above, and
-	// the nag + plan for an api shim, and the plan only for a gh shim. Also
-	// assert that after a run the memory file at ~/.vix/jobs/<id>/memory.md
-	// records the planned item numbers, and that a second run with a closed item
-	// trims that number from the file.
+	// fire its trigger, then assert the resulting Vix-initiated session:
+	//   - for the no-access shims above, shows the deny error ("can't reach
+	//     GitHub"); for an api shim, the nag + framed findings; for a gh shim,
+	//     the framed findings only;
+	//   - is titled after the picked item, e.g.
+	//     "[Plan GitHub issues (get-vix/vix)] Addressing issue #29 — ANTHROPIC_BASE_URL not resolved from .env files"
+	//     (parsed from the findings' deterministic header line);
+	//   - keeps the FULL working transcript — the plan-step prompt, the agent's
+	//     tool_use/tool_result turns, and the final findings — not a text-only
+	//     summary, so a follow-up turn is grounded in the real tool calls.
+	// Also assert that after a run the memory file at ~/.vix/jobs/<id>/memory.md
+	// records exactly the one item the run claimed, that a second run claims a
+	// different open item, and that a closed item's number is trimmed from the
+	// file.
 	_ = h.UI.Snapshot()
 }

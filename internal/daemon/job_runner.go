@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -182,6 +183,17 @@ consume:
 	// Every other finished run lands in open/: visible in the Vix-initiated
 	// sessions group until the user dismisses it (or retention sweeps it).
 	session.jobStatus = res.Status
+	// Successful GitHub-plan runs open their findings with a deterministic
+	// header line naming the item they picked; turn that into a per-item session
+	// title (e.g. "[Plan GitHub issues (get-vix/vix)] Addressing issue #29 — …").
+	// Other jobs (and the "nothing new"/error branches) keep the static title.
+	if res.Status == jobs.StatusOK {
+		if title, ok := issuePlanTitle(spec, finalText.String()); ok {
+			session.mu.Lock()
+			session.title = title
+			session.mu.Unlock()
+		}
+	}
 	session.persist()
 	sweepJobRunRecords(session.paths, spec.ID)
 
@@ -201,6 +213,37 @@ func jobRunTitle(spec jobs.Spec, t time.Time) string {
 		name = spec.ID
 	}
 	return name + " - " + t.Format(jobTitleTimeFormat)
+}
+
+// issuePlanHeaderRe matches the deterministic first line of a GitHub-plan run's
+// findings (built by the plan step in githubIssuePlanWorkflow):
+//
+//	Hi, I investigated <issue|pull request> #<n> — <item title> — on GitHub. …
+//
+// The title is non-greedy and anchored on " — on GitHub." so item titles that
+// themselves contain dashes survive. `.` never spans newlines, so the match
+// stays on the header line.
+var issuePlanHeaderRe = regexp.MustCompile(`Hi, I investigated (issue|pull request) #(\d+) — (.+?) — on GitHub\.`)
+
+// issuePlanTitle derives a per-item session title from a GitHub-plan run's
+// final text, e.g. "[Plan GitHub issues (get-vix/vix)] Addressing issue #29 — …".
+// Returns ok=false when the deterministic header is absent (any non-plan job, or
+// the "nothing new to plan"/error branches), so the caller keeps the static
+// jobRunTitle.
+func issuePlanTitle(spec jobs.Spec, finalText string) (string, bool) {
+	m := issuePlanHeaderRe.FindStringSubmatch(finalText)
+	if m == nil {
+		return "", false
+	}
+	kind, number, itemTitle := m[1], m[2], strings.TrimSpace(m[3])
+	if itemTitle == "" {
+		return "", false
+	}
+	name := spec.Name
+	if name == "" {
+		name = spec.ID
+	}
+	return fmt.Sprintf("[%s] Addressing %s #%s — %s", name, kind, number, itemTitle), true
 }
 
 // pushCommand feeds a command to the session loop, giving up when either

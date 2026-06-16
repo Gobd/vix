@@ -46,6 +46,34 @@ func TestHandleWorkflowCommand_InlineRegistersAndRuns(t *testing.T) {
 	}
 }
 
+// TestHandleWorkflowCommand_FinishedInlineRunResetsToChat verifies a finished
+// inline (transient) workflow run drops back to chat mode and clears the active
+// workflow, so reopening the persisted run never warns that the unpersisted
+// workflow "no longer exists".
+func TestHandleWorkflowCommand_FinishedInlineRunResetsToChat(t *testing.T) {
+	s := newWorkflowTestSession(t)
+	def := &WorkflowDef{
+		Name:       "plan-issues-get-vix-vix",
+		EntryPoint: StepRef{ID: "poll"},
+		Steps: map[string]WorkflowStepDef{
+			"poll": {Type: "bash", Command: "echo done"},
+		},
+	}
+	raw, err := json.Marshal(def)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.handleWorkflowCommand("", "objective", raw)
+
+	if s.sessionMode != "chat" {
+		t.Errorf("sessionMode = %q, want %q after a finished inline run", s.sessionMode, "chat")
+	}
+	if s.activeWorkflow != "" {
+		t.Errorf("activeWorkflow = %q, want empty after a finished inline run", s.activeWorkflow)
+	}
+}
+
 // TestHandleWorkflowCommand_InvalidInlineErrors verifies a structurally invalid
 // inline definition is rejected before any registration or execution.
 func TestHandleWorkflowCommand_InvalidInlineErrors(t *testing.T) {

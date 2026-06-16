@@ -163,6 +163,35 @@ func appendSignalTool(tools []llm.ToolParam) []llm.ToolParam {
 	return append(tools, WorkflowSignalToolSchema())
 }
 
+// appendSkillTool adds the `skill` tool schema to an agent's tool list
+// (idempotent), so a workflow step can invoke loaded skills.
+func appendSkillTool(tools []llm.ToolParam) []llm.ToolParam {
+	for _, t := range tools {
+		if t.Name == "skill" {
+			return tools
+		}
+	}
+	return append(tools, SkillToolSchema())
+}
+
+// ensureWorkflowAgentContext augments a workflow step's agent, exactly once,
+// with the session's project-context system blocks (CLAUDE.md/AGENTS.md + skills
+// metadata) and — when skills are loaded — the `skill` tool. This gives
+// workflow and scheduled-job runs the same project instructions and skill
+// catalog a chat turn gets, instead of only the bare sub-agent system prompt.
+// The contextInjected guard keeps a step's repeated Send calls from duplicating
+// the blocks; Clone preserves the flag so forks aren't re-injected.
+func (s *Session) ensureWorkflowAgentContext(a *AgentRunner) {
+	if a == nil || a.contextInjected {
+		return
+	}
+	a.contextInjected = true
+	a.System = append(a.System, s.contextSystemBlocks()...)
+	if s.skills != nil && s.skills.Count() > 0 {
+		a.Tools = appendSkillTool(a.Tools)
+	}
+}
+
 // setWorkflowRunState publishes (or clears, with nil) the session's persisted
 // workflow run snapshot. Snapshots are immutable after publication: the
 // engine mutates its own live state and re-publishes copies, so buildRecord

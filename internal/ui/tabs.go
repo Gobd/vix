@@ -228,7 +228,10 @@ func renderSessionsView(userSessions []*SessionState, vixRows []vixDisplayRow, w
 		rows = append(rows, sessionColumnHeaderStyle.Render(header), headerRule)
 
 		// vixCols formats the three shared columns of a vix-initiated row from
-		// its record summary (id, "<job> · <status>  <first message>", ran ago).
+		// its record summary (id, Title, ran ago). A titled record shows the
+		// bare title (e.g. the per-item GitHub-plan title), with a ⚠️ marker when
+		// the run failed; an untitled record (a raw alert) falls back to the
+		// "<job> · <status>  <first message>" form.
 		vixCols := func(sum protocol.SessionSummary) string {
 			idCol := sum.ID
 			if dash := strings.Index(idCol, "-"); dash >= 0 {
@@ -237,29 +240,35 @@ func renderSessionsView(userSessions []*SessionState, vixRows []vixDisplayRow, w
 				idCol = idCol[:colSession]
 			}
 
-			badge := ""
-			if sum.Trigger != nil && sum.Trigger.Ref != "" {
-				badge = sum.Trigger.Ref
-			}
-			status := sum.JobStatus
-			if status == "" {
-				status = "alert"
-			}
-			msgCol := badge + " · " + status
+			var msgCol string
 			if sum.Title != "" {
-				msgCol += "  " + sum.Title
-			} else if sum.FirstMessage != "" {
-				msgCol += "  " + sum.FirstMessage
+				msgCol = vixRowTitle(sum)
+			} else {
+				badge := ""
+				if sum.Trigger != nil && sum.Trigger.Ref != "" {
+					badge = sum.Trigger.Ref
+				}
+				status := sum.JobStatus
+				if status == "" {
+					status = "alert"
+				}
+				msgCol = badge + " · " + status
+				if sum.FirstMessage != "" {
+					msgCol += "  " + sum.FirstMessage
+				}
 			}
-			if len(msgCol) > colMessage {
-				msgCol = msgCol[:colMessage-1] + "…"
+			// Rune-aware truncate, then pad to the column's display width so the
+			// Running column stays aligned even when a wide glyph (⚠️) is present.
+			msgCol = truncateLabel(msgCol, colMessage)
+			if pad := colMessage - lipgloss.Width(msgCol); pad > 0 {
+				msgCol += strings.Repeat(" ", pad)
 			}
 
 			ranCol := "—"
 			if t, err := time.Parse(time.RFC3339, sum.StartedAt); err == nil {
 				ranCol = formatRunningTime(renderSince(t)) + " ago"
 			}
-			return fmt.Sprintf("%-*s  %-*s  %-*s", colSession, idCol, colMessage, msgCol, colRunning, ranCol)
+			return fmt.Sprintf("%-*s  %s  %-*s", colSession, idCol, msgCol, colRunning, ranCol)
 		}
 
 		for _, row := range vixRows {
@@ -303,6 +312,16 @@ func renderSessionsView(userSessions []*SessionState, vixRows []vixDisplayRow, w
 
 	content := strings.Join(rows, "\n")
 	return s.ViewportFocusedStyle.Width(width).Height(height).Render(content)
+}
+
+// vixRowTitle returns the Title-column text for a titled vix-initiated row: the
+// bare session title, prefixed with a ⚠️ marker when the run failed (error or
+// timeout). Callers handle the untitled (raw-alert) fallback separately.
+func vixRowTitle(sum protocol.SessionSummary) string {
+	if st := sum.JobStatus; st == "error" || st == "timeout" {
+		return "⚠️  " + sum.Title
+	}
+	return sum.Title
 }
 
 // truncateLabel shortens s to fit within w display columns, appending an

@@ -68,6 +68,12 @@ type Session struct {
 	// goroutine (hot reload) while the session loop reads it.
 	workflowsMu sync.RWMutex
 	workflows   []*WorkflowDef
+	// inlineWorkflows names workflows registered transiently for this session
+	// (job/hook runs carrying a self-contained def), not loaded from config.
+	// A finished inline run drops back to chat mode so reopening it doesn't
+	// warn that the (unpersisted) workflow "no longer exists". Guarded by
+	// workflowsMu.
+	inlineWorkflows map[string]bool
 
 	// Skills registry
 	skills *agent.SkillRegistry
@@ -926,6 +932,10 @@ func (s *Session) setWorkflows(wfs []*WorkflowDef) {
 func (s *Session) registerInlineWorkflow(def *WorkflowDef) {
 	s.workflowsMu.Lock()
 	defer s.workflowsMu.Unlock()
+	if s.inlineWorkflows == nil {
+		s.inlineWorkflows = make(map[string]bool)
+	}
+	s.inlineWorkflows[def.Name] = true
 	for i, w := range s.workflows {
 		if w.Name == def.Name {
 			s.workflows[i] = def
@@ -933,6 +943,14 @@ func (s *Session) registerInlineWorkflow(def *WorkflowDef) {
 		}
 	}
 	s.workflows = append(s.workflows, def)
+}
+
+// isInlineWorkflow reports whether name was registered transiently for this
+// session (via registerInlineWorkflow) rather than loaded from config.
+func (s *Session) isInlineWorkflow(name string) bool {
+	s.workflowsMu.RLock()
+	defer s.workflowsMu.RUnlock()
+	return s.inlineWorkflows[name]
 }
 
 // ReloadWorkflows swaps in a freshly-loaded workflow list and re-emits
@@ -1035,7 +1053,23 @@ func (s *Session) buildSystemPrompt() []llm.SystemBlock {
 		blocks = append(blocks, llm.SystemBlock{Text: filesText})
 	}
 
-	// Inject project instruction files (CLAUDE.md, AGENTS.md)
+	// Inject the shared project-context blocks (CLAUDE.md/AGENTS.md + skills
+	// metadata), the same set workflow agent steps receive via
+	// ensureWorkflowAgentContext.
+	blocks = append(blocks, s.contextSystemBlocks()...)
+
+	return blocks
+}
+
+// contextSystemBlocks returns the project-context system blocks shared by chat
+// turns and workflow agent steps: the project instruction files
+// (CLAUDE.md/AGENTS.md, each gated by its feature flag) and the available-skills
+// metadata (level 1 of progressive disclosure — names + descriptions only).
+// Empty when none apply.
+func (s *Session) contextSystemBlocks() []llm.SystemBlock {
+	var blocks []llm.SystemBlock
+
+	// Project instruction files (CLAUDE.md, AGENTS.md).
 	if instrFiles := s.discoverInstructionFiles(); len(instrFiles) > 0 {
 		for _, f := range instrFiles {
 			text := fmt.Sprintf("<system-reminder>\nContents of %s (project instructions):\n\n%s\n</system-reminder>", f.Path, f.Content)
@@ -1044,8 +1078,7 @@ func (s *Session) buildSystemPrompt() []llm.SystemBlock {
 		log.Printf("[session] loaded %d instruction file(s)", len(instrFiles))
 	}
 
-	// Inject available-skills metadata (level 1 of progressive disclosure):
-	// just names + descriptions, so the model knows what it can load via the
+	// Available-skills metadata, so the model knows what it can load via the
 	// `skill` tool without paying for the full bodies up front.
 	if s.skills != nil && s.skills.Count() > 0 {
 		if block := s.skills.FormatForSystemPrompt(); block != "" {

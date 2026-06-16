@@ -57,6 +57,57 @@ func TestJobRunTitle(t *testing.T) {
 	}
 }
 
+func TestIssuePlanTitle(t *testing.T) {
+	spec := jobs.Spec{ID: "plan-github-issues-get-vix-vix", Name: "Plan GitHub issues (get-vix/vix)"}
+	cases := []struct {
+		name      string
+		finalText string
+		want      string
+		ok        bool
+	}{
+		{
+			name:      "issue header",
+			finalText: "Hi, I investigated issue #29 — ANTHROPIC_BASE_URL not resolved from .env files — on GitHub. Here are my findings:\n\nhttps://github.com/get-vix/vix/issues/29",
+			want:      "[Plan GitHub issues (get-vix/vix)] Addressing issue #29 — ANTHROPIC_BASE_URL not resolved from .env files",
+			ok:        true,
+		},
+		{
+			name:      "header preceded by an H1 title line",
+			finalText: "# [Plan GitHub issues (get-vix/vix)] Addressing issue #29 — ANTHROPIC_BASE_URL not resolved from .env files\n\nHi, I investigated issue #29 — ANTHROPIC_BASE_URL not resolved from .env files — on GitHub. Here are my findings:",
+			want:      "[Plan GitHub issues (get-vix/vix)] Addressing issue #29 — ANTHROPIC_BASE_URL not resolved from .env files",
+			ok:        true,
+		},
+		{
+			name:      "pull request header, preceded by other streamed text",
+			finalText: "Note: the GitHub CLI wasn't available.\nHi, I investigated pull request #7 — Fix the thing — on GitHub. Here are my findings:",
+			want:      "[Plan GitHub issues (get-vix/vix)] Addressing pull request #7 — Fix the thing",
+			ok:        true,
+		},
+		{
+			name:      "item title containing dashes survives",
+			finalText: "Hi, I investigated issue #3 — feat: add a — b — c support — on GitHub. Here are my findings:",
+			want:      "[Plan GitHub issues (get-vix/vix)] Addressing issue #3 — feat: add a — b — c support",
+			ok:        true,
+		},
+		{
+			name:      "no header (nothing new to plan) falls back",
+			finalText: "Every open item is already recorded — there is nothing new to plan.",
+			ok:        false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := issuePlanTitle(spec, c.finalText)
+			if ok != c.ok {
+				t.Fatalf("ok = %v, want %v", ok, c.ok)
+			}
+			if ok && got != c.want {
+				t.Errorf("title = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestTitleTranscriptSkipsToolBlocksAndCaps(t *testing.T) {
 	msgs := []llm.MessageParam{
 		llm.NewUserMessage(llm.NewTextBlock("question")),

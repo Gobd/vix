@@ -81,6 +81,12 @@ type AgentRunner struct {
 	// with the same request overrides as the original runner.
 	plugins PluginSource
 
+	// contextInjected guards the one-time injection (by
+	// Session.ensureWorkflowAgentContext) of the session's project-context
+	// system blocks (CLAUDE.md/AGENTS.md + skills metadata) and the `skill`
+	// tool, so a step that calls Send more than once doesn't duplicate them.
+	contextInjected bool
+
 	// Per-Send() accumulated usage (reset at start of each Send call)
 	LastInputTokens         int64
 	LastOutputTokens        int64
@@ -95,6 +101,137 @@ type WorkflowRun struct {
 	StepAgents  map[string]*AgentRunner // step_id -> runner used
 	StepResults map[string]*StepResult  // step_id -> result
 	State       *WorkflowRunState       // live persisted position/accounting for this run
+
+	// transcript accumulates the user-visible output of agent steps in
+	// execution order so it can be mirrored into the session's chat transcript
+	// (s.messages) when the run finalizes — letting a finished run replay and a
+	// follow-up chat turn pick up with real context. Guarded by transcriptMu
+	// because parallel steps append concurrently.
+	transcriptMu sync.Mutex
+	transcript   []workflowTranscriptEntry
+}
+
+// workflowTranscriptEntry is one visible agent step's output captured for the
+// chat transcript.
+type workflowTranscriptEntry struct {
+	StepID      string
+	Explanation string
+	Output      string
+}
+
+// recordTranscriptEntry captures a visible agent step's output for later mirror
+// into the session transcript. No-op for empty output.
+func (r *WorkflowRun) recordTranscriptEntry(step WorkflowStepDef, stepID, output string) {
+	if step.Type != "agent" || step.Silent || !step.IsStreamVisible() {
+		return
+	}
+	if strings.TrimSpace(output) == "" {
+		return
+	}
+	r.transcriptMu.Lock()
+	r.transcript = append(r.transcript, workflowTranscriptEntry{
+		StepID:      stepID,
+		Explanation: step.Explanation,
+		Output:      output,
+	})
+	r.transcriptMu.Unlock()
+}
+
+// snapshotTranscript returns a copy of the accumulated transcript entries.
+func (r *WorkflowRun) snapshotTranscript() []workflowTranscriptEntry {
+	r.transcriptMu.Lock()
+	defer r.transcriptMu.Unlock()
+	return append([]workflowTranscriptEntry(nil), r.transcript...)
+}
+
+// appendWorkflowTranscript mirrors a run's agent output into the chat transcript
+// (s.messages) so a finished workflow replays in a freshly attached TUI and a
+// follow-up chat message picks up with real context. For each visible agent step
+// (in execution order, deduplicated by step id) it splices the step agent's FULL
+// working history — the resolved prompt, every tool_use and tool_result, and the
+// final text — so the persisted conversation reflects what the agent actually
+// did. A follow-up turn is then grounded in those real tool calls rather than a
+// lossy summary. Thinking blocks are dropped (their signatures can't be
+// revalidated once re-sent under the session's own system prompt). A visible
+// agent step without an agent instance falls back to a user(anchor)→assistant
+// (text) pair. No-op when nothing visible was produced.
+func (s *Session) appendWorkflowTranscript(anchor string, exec *WorkflowRun) {
+	entries := exec.snapshotTranscript()
+	if len(entries) == 0 {
+		return
+	}
+	if strings.TrimSpace(anchor) == "" {
+		anchor = "Workflow run"
+	}
+	var msgs []llm.MessageParam
+	seen := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if seen[e.StepID] {
+			continue
+		}
+		seen[e.StepID] = true
+		if agent := exec.StepAgents[e.StepID]; agent != nil && len(agent.Messages) > 0 {
+			msgs = append(msgs, stripThinkingMessages(agent.Messages)...)
+			continue
+		}
+		// No agent instance (shouldn't happen for a visible agent step): keep the
+		// step's text behind a kickoff anchor so nothing is lost.
+		msgs = append(msgs,
+			llm.NewUserMessage(llm.NewTextBlock(anchor)),
+			llm.NewAssistantMessage(llm.NewTextBlock(strings.TrimRight(e.Output, "\n"))),
+		)
+	}
+	if len(msgs) == 0 {
+		return
+	}
+	msgs = coalesceRoles(msgs)
+	s.mu.Lock()
+	s.appendMessages(msgs...)
+	s.mu.Unlock()
+}
+
+// stripThinkingMessages copies msgs, dropping BlockThinking blocks. Messages
+// left with no content after the strip are omitted so the result stays
+// well-formed. Inputs are not mutated.
+func stripThinkingMessages(msgs []llm.MessageParam) []llm.MessageParam {
+	out := make([]llm.MessageParam, 0, len(msgs))
+	for _, m := range msgs {
+		blocks := make([]llm.ContentBlock, 0, len(m.Content))
+		for _, b := range m.Content {
+			if b.Type == llm.BlockThinking {
+				continue
+			}
+			blocks = append(blocks, b)
+		}
+		if len(blocks) == 0 {
+			continue
+		}
+		cp := m
+		cp.Content = blocks
+		out = append(out, cp)
+	}
+	return out
+}
+
+// coalesceRoles merges consecutive messages that share a role into one, keeping
+// user/assistant alternation valid when several step histories are concatenated
+// back-to-back (e.g. one step ending on a tool_result user turn followed by the
+// next step's user prompt). Block order is preserved; content is copied so the
+// inputs are not mutated.
+func coalesceRoles(msgs []llm.MessageParam) []llm.MessageParam {
+	out := make([]llm.MessageParam, 0, len(msgs))
+	for _, m := range msgs {
+		if n := len(out); n > 0 && out[n-1].Role == m.Role {
+			merged := append([]llm.ContentBlock(nil), out[n-1].Content...)
+			out[n-1].Content = append(merged, m.Content...)
+			if out[n-1].Timestamp.IsZero() {
+				out[n-1].Timestamp = m.Timestamp
+			}
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // FeatureToolOrchestrator is the feature flag name for the tool orchestrator mode.
@@ -629,14 +766,15 @@ func (a *AgentRunner) Clone(cred config.Credential) (*AgentRunner, error) {
 	}
 
 	return &AgentRunner{
-		Config:       a.Config,
-		LLM:          clonedClient,
-		Messages:     msgs,
-		System:       sys,
-		Tools:        tools,
-		MaxTurns:     a.MaxTurns,
-		ToolTimeouts: a.ToolTimeouts,
-		plugins:      a.plugins,
+		Config:          a.Config,
+		LLM:             clonedClient,
+		Messages:        msgs,
+		System:          sys,
+		Tools:           tools,
+		MaxTurns:        a.MaxTurns,
+		ToolTimeouts:    a.ToolTimeouts,
+		plugins:         a.plugins,
+		contextInjected: a.contextInjected,
 	}, nil
 }
 
@@ -1342,6 +1480,7 @@ func (s *Session) executeParallelSteps(
 					}
 				}
 
+				s.ensureWorkflowAgentContext(agent)
 				output, err := agent.Send(stepCtx, resolvedMessage, stepExecuteTool, streamCb, s.cwd, stepHooks)
 				stepElapsed := time.Since(stepStart).Milliseconds()
 
@@ -1382,6 +1521,7 @@ func (s *Session) executeParallelSteps(
 				s.emitIfVisible(silent, "event.workflow_step_done", protocol.EventWorkflowStepDone{
 					StepID: stepID, StepIdx: myLogicalStep, Success: true, DurationMs: stepElapsed,
 				})
+				exec.recordTranscriptEntry(step, stepID, output)
 
 			case "tool":
 				toolVars := make(map[string]string, len(baseVars))
@@ -1577,8 +1717,22 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 	finished := false
 	defer func() {
 		s.unread = true
+		// Mirror the run's visible agent output into the chat transcript before
+		// persisting, on every exit path (completed, paused, blocked, timed
+		// out) so the run replays in a fresh TUI and a follow-up chat turn has
+		// the output as context. No-op when nothing visible was produced.
+		s.appendWorkflowTranscript(prompt, exec)
 		if finished {
 			s.setWorkflowRunState(nil)
+			// A finished inline (transient) workflow run — e.g. a scheduled job
+			// — has nothing left to resume, and its definition was never
+			// persisted. Leaving the session in "workflow" mode would make a
+			// later reopen warn that the workflow "no longer exists" and switch
+			// to chat. Drop straight to chat mode here so that never happens.
+			if s.isInlineWorkflow(pf.Name) {
+				s.sessionMode = "chat"
+				s.activeWorkflow = ""
+			}
 			s.persist()
 			return
 		}
@@ -2102,6 +2256,7 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 				OnBeforeStream: baseHooks.OnBeforeStream,
 			}
 
+			s.ensureWorkflowAgentContext(agent)
 			output, err := agent.Send(stepCtx, resolvedMessage, stepExecuteTool, streamCb, s.cwd, stepHooks)
 
 			// If the user enqueued a message during this step, inject it into the agent
@@ -2221,6 +2376,7 @@ func (s *Session) executeWorkflow(ctx context.Context, pf *WorkflowDef, prompt s
 				Parsed: parsed,
 				Params: stepParams,
 			}
+			exec.recordTranscriptEntry(step, stepID, output)
 
 			displayText := extractStepSummary(output, step.DisplayKey)
 			if step.DisplayKey != "" && !step.Silent {
