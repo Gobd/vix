@@ -225,6 +225,38 @@ func TestBootstrap_DevToDevDoesNotRefresh(t *testing.T) {
 	}
 }
 
+// TestBootstrap_DevToDevRefreshesAgentsAndPrompts guards against the bug
+// where a locally-built binary (version always "dev") could never pick up
+// source changes to the shipped agents/prompts after its first run, because
+// the marker comparison in BootstrapHomeVixDir never sees a version change.
+// settings.json (user-owned) must still be left untouched — only the
+// vix-managed agents/prompts trees refresh.
+func TestBootstrap_DevToDevRefreshesAgentsAndPrompts(t *testing.T) {
+	dir := t.TempDir()
+	if err := BootstrapHomeVixDir(dir, "dev"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	agentPath := filepath.Join(dir, "agents", "general.md")
+	stale := readFileT(t, agentPath) + "\nmodel: anthropic/claude-sonnet-4-6\n"
+	os.WriteFile(agentPath, []byte(stale), 0o644)
+
+	settingsPath := filepath.Join(dir, "settings.json")
+	custom := `{"version":1,"custom":"mine"}`
+	os.WriteFile(settingsPath, []byte(custom), 0o644)
+
+	if err := BootstrapHomeVixDir(dir, "dev"); err != nil {
+		t.Fatalf("rerun: %v", err)
+	}
+
+	if got := readFileT(t, agentPath); got == stale {
+		t.Error("dev -> dev restart should refresh the stale agents tree file")
+	}
+	if got := readFileT(t, settingsPath); got != custom {
+		t.Error("dev -> dev restart must not refresh settings.json even when refreshing the agents tree")
+	}
+}
+
 func TestBootstrap_BakIsReplacedOnNextVersionChange(t *testing.T) {
 	dir := t.TempDir()
 	if err := BootstrapHomeVixDir(dir, "v1"); err != nil {
