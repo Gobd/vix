@@ -3,7 +3,10 @@ package daemon
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/get-vix/vix/internal/protocol"
 )
 
 func TestIsCommandApproved(t *testing.T) {
@@ -112,3 +115,62 @@ func TestHeadlessWebFetchGate_HardFailsWhenNotApproved(t *testing.T) {
 		t.Errorf("expected 'Permission denied' in output, got %q", res.Output)
 	}
 }
+
+// TestResolveConfirm_RoutesByRequestID is the regression test for the
+// confirm-request race: two concurrent confirmations (e.g. spawn_agent
+// alongside another confirm-needing tool call in the same turn) must each
+// resolve with their own answer, never the other's — even when the reply
+// for the second request arrives before the reply for the first.
+func TestResolveConfirm_RoutesByRequestID(t *testing.T) {
+	s := &Session{}
+
+	chA := s.registerConfirm("req-a")
+	chB := s.registerConfirm("req-b")
+
+	var gotA, gotB protocol.SessionConfirmData
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		gotA = <-chA
+	}()
+	go func() {
+		defer wg.Done()
+		gotB = <-chB
+	}()
+
+	// Resolve out of order: B's answer arrives first.
+	if !s.resolveConfirm("req-b", protocol.SessionConfirmData{RequestID: "req-b", Approved: false}) {
+		t.Fatal("expected resolveConfirm to find a waiter for req-b")
+	}
+	if !s.resolveConfirm("req-a", protocol.SessionConfirmData{RequestID: "req-a", Approved: true}) {
+		t.Fatal("expected resolveConfirm to find a waiter for req-a")
+	}
+	wg.Wait()
+
+	if !gotA.Approved {
+		t.Error("req-a's waiter should have received req-a's approval, not req-b's denial")
+	}
+	if gotB.Approved {
+		t.Error("req-b's waiter should have received req-b's denial, not req-a's approval")
+	}
+}
+
+// TestResolveConfirm_UnknownRequestIDIsNoop mirrors the daemon's safety
+// bias: an unrecognized or already-resolved request ID resolves nothing
+// rather than falling back to broadcasting to some other pending waiter.
+func TestResolveConfirm_UnknownRequestIDIsNoop(t *testing.T) {
+	s := &Session{}
+	ch := s.registerConfirm("req-a")
+
+	if s.resolveConfirm("req-unknown", protocol.SessionConfirmData{Approved: true}) {
+		t.Error("expected resolveConfirm to report no waiter for an unknown request ID")
+	}
+
+	select {
+	case <-ch:
+		t.Fatal("req-a's waiter should not have been resolved by an unrelated request ID")
+	default:
+	}
+}
+

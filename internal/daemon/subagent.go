@@ -61,7 +61,7 @@ type TurnHooks struct {
 	OnThinkingStall func(elapsedMs int64, summaryChars int)
 	// ConfirmFn, when non-nil, is called when a tool requires user confirmation.
 	// Signature matches dispatchOptions.confirmFn. Nil means deny immediately.
-	ConfirmFn func(ctx context.Context, name string, input map[string]any) (approved, cancelled bool)
+	ConfirmFn func(ctx context.Context, name string, input map[string]any, requestID string) (approved, cancelled bool)
 }
 
 // BackgroundTask tracks an in-flight or completed background subagent.

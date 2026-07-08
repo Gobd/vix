@@ -1034,10 +1034,10 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if sess.agentState == StateConfirmPending {
 					if sess.autoApproveAll {
 						if sess.client != nil {
-							sess.client.SendConfirm(true, false, "", "", "")
+							sess.client.SendConfirm(sess.confirmRequestID, true, false, "", "", "")
 						}
 						sess.questionPanel.Close()
-						sess.agentState = StateToolExecuting
+						m.popNextQueuedConfirm(sess)
 						return m, sess.thinkingAnim.Start()
 					}
 					approved := answer == "Yes, allow" || answer == "Allow once" || strings.HasPrefix(answer, "Always allow")
@@ -1066,10 +1066,10 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 					pairs := []QAPair{{Category: "Permission", Question: question, Answer: displayAnswer}}
 					sess.chatMessages = append(sess.chatMessages, renderQuestionAnswer(pairs, m.styles))
 					if sess.client != nil {
-						sess.client.SendConfirm(approved, persistDirs, persistWriteDir, persistBashPattern, persistURLPattern)
+						sess.client.SendConfirm(sess.confirmRequestID, approved, persistDirs, persistWriteDir, persistBashPattern, persistURLPattern)
 					}
 					sess.questionPanel.Close()
-					sess.agentState = StateToolExecuting
+					m.popNextQueuedConfirm(sess)
 					return m, sess.thinkingAnim.Start()
 				}
 				if batchAnswers != nil {
@@ -1099,10 +1099,10 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 					pairs := []QAPair{{Category: "Permission", Question: sess.questionPanel.CurrentTab().Question, Answer: "Deny"}}
 					sess.chatMessages = append(sess.chatMessages, renderQuestionAnswer(pairs, m.styles))
 					if sess.client != nil {
-						sess.client.SendConfirm(false, false, "", "", "")
+						sess.client.SendConfirm(sess.confirmRequestID, false, false, "", "", "")
 					}
 					sess.questionPanel.Close()
-					sess.agentState = StateToolExecuting
+					m.popNextQueuedConfirm(sess)
 					return m, sess.thinkingAnim.Start()
 				}
 				if sess.client != nil {
@@ -1166,10 +1166,8 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			result, cmd := m.handleEnter(sess)
 			// Flush any deferred confirm now that input has been sent/cleared.
 			if sess != nil && sess.pendingConfirmEvent != nil && sess.input.Value() == "" {
-				cr := sess.pendingConfirmEvent
-				sess.pendingConfirmEvent = nil
-				sess.questionPanel.OpenConfirmWithPattern(cr.ToolName, cr.Params, cr.RequestedDirs, cr.SuggestedPattern, m.width, m.mdRenderer)
-				sess.focus = FocusEditor
+				cr := *sess.pendingConfirmEvent
+				m.openConfirmPanel(sess, cr)
 			}
 			return result, cmd
 
@@ -2374,6 +2372,39 @@ func (m Model) handleTrimKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// openConfirmPanel makes cr the actively-displayed confirmation: either
+// opening its panel immediately, or deferring it if the user has unsent text
+// in the input (so the confirm overlay doesn't clobber an in-progress edit).
+func (m Model) openConfirmPanel(sess *SessionState, cr protocol.EventConfirmRequest) {
+	if sess.input.Value() != "" {
+		sess.pendingConfirmEvent = &cr
+		return
+	}
+	sess.pendingConfirmEvent = nil
+	sess.confirmToolName = cr.ToolName
+	sess.confirmRequestID = cr.RequestID
+	sess.confirmDetailShown = cr.Detail != ""
+	sess.questionPanel.OpenConfirmWithPattern(cr.ToolName, cr.Params, cr.RequestedDirs, cr.SuggestedPattern, m.width, m.mdRenderer)
+	sess.focus = FocusEditor
+}
+
+// popNextQueuedConfirm opens the next queued confirmation panel (if any)
+// after the current one has been answered or dismissed. Concurrent
+// confirm-needing tool calls in the same turn only ever show one panel at a
+// time; this advances to the next once the visible one is resolved. When the
+// queue is empty, it falls through to StateToolExecuting like a lone confirm
+// always did.
+func (m Model) popNextQueuedConfirm(sess *SessionState) {
+	if len(sess.queuedConfirms) == 0 {
+		sess.agentState = StateToolExecuting
+		return
+	}
+	cr := sess.queuedConfirms[0]
+	sess.queuedConfirms = sess.queuedConfirms[1:]
+	sess.agentState = StateConfirmPending
+	m.openConfirmPanel(sess, cr)
+}
+
 // handleEnter handles the Enter key in the Chat tab.
 func (m Model) handleEnter(sess *SessionState) (tea.Model, tea.Cmd) {
 	// A deferred confirm (panel suppressed while the user had queued input)
@@ -2386,9 +2417,10 @@ func (m Model) handleEnter(sess *SessionState) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if sess.client != nil {
-			sess.client.SendConfirm(true, false, "", "", "")
+			sess.client.SendConfirm(sess.confirmRequestID, true, false, "", "", "")
 		}
-		sess.agentState = StateToolExecuting
+		sess.questionPanel.Close()
+		m.popNextQueuedConfirm(sess)
 		return m, sess.thinkingAnim.Start()
 	}
 
@@ -2724,13 +2756,10 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 		data := marshalData(event.Data)
 		var cr protocol.EventConfirmRequest
 		json.Unmarshal(data, &cr)
-		sess.confirmToolName = cr.ToolName
-		sess.confirmDetailShown = false
 		sess.thinkingAnim.Stop()
 		if cr.Detail != "" {
 			sess.chatMessages = append(sess.chatMessages,
 				renderToolResultWithContext(cr.ToolName, "", false, false, cr.Detail, m.styles, m.mdRenderer, m.mdRenderer.width))
-			sess.confirmDetailShown = true
 		}
 		question := buildConfirmQuestion(cr.ToolName, cr.Params)
 		if len(cr.RequestedDirs) > 0 {
@@ -2738,14 +2767,18 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 		}
 		sess.chatMessages = append(sess.chatMessages,
 			renderQuestionMessage("Permission", question, m.mdRenderer.width+4, m.mdRenderer))
-		if sess.input.Value() != "" {
-			// Defer the panel until the input is cleared so an in-progress edit
-			// isn't clobbered by the confirm overlay.
-			sess.pendingConfirmEvent = &cr
+		if sess.autoApproveAll {
+			if sess.client != nil {
+				sess.client.SendConfirm(cr.RequestID, true, false, "", "", "")
+			}
+		} else if sess.pendingConfirmEvent != nil || sess.questionPanel.IsVisible() {
+			// A confirm is already being shown or deferred (e.g. spawn_agent
+			// alongside another confirm-needing tool in the same turn) — queue
+			// this one rather than clobbering it; it's popped once the earlier
+			// one is answered or dismissed.
+			sess.queuedConfirms = append(sess.queuedConfirms, cr)
 		} else {
-			sess.pendingConfirmEvent = nil
-			sess.questionPanel.OpenConfirmWithPattern(cr.ToolName, cr.Params, cr.RequestedDirs, cr.SuggestedPattern, m.width, m.mdRenderer)
-			sess.focus = FocusEditor
+			m.openConfirmPanel(sess, cr)
 		}
 
 	case "event.user_question":

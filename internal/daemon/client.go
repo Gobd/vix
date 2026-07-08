@@ -576,9 +576,11 @@ func (sc *SessionClient) SendWorkflowMessage(text string) error {
 	})
 }
 
-// SendConfirm sends tool approval/denial.
-func (sc *SessionClient) SendConfirm(approved bool, persistDirs bool, persistWriteDir string, persistBashPattern string, persistURLPattern string) error {
+// SendConfirm sends tool approval/denial. requestID must match the
+// RequestID of the EventConfirmRequest being answered.
+func (sc *SessionClient) SendConfirm(requestID string, approved bool, persistDirs bool, persistWriteDir string, persistBashPattern string, persistURLPattern string) error {
 	data, _ := json.Marshal(protocol.SessionConfirmData{
+		RequestID:          requestID,
 		Approved:           approved,
 		PersistDirs:        persistDirs,
 		PersistWriteDir:    persistWriteDir,

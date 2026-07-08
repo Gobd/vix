@@ -49,6 +49,15 @@ type Session struct {
 	ctx                            context.Context
 	cancel                         context.CancelFunc
 
+	// pendingConfirms holds one buffered channel per in-flight confirmation
+	// request, keyed by request ID (the LLM tool_use ID of the call awaiting
+	// approval). Concurrent tool calls (e.g. spawn_agent alongside another
+	// confirm-needing tool) can each be waiting on their own entry at once;
+	// routing by ID rather than by command type keeps their answers from
+	// crossing. Populated by registerConfirm, drained by resolveConfirm.
+	pendingConfirmsMu sync.Mutex
+	pendingConfirms   map[string]chan protocol.SessionConfirmData
+
 	// Agent state
 	messages []llm.MessageParam
 	tools    []llm.ToolParam
@@ -222,6 +231,7 @@ func NewSession(id string, server *Server, llmClient LLM, model, cwd, configDir 
 		headless:                       headless,
 		eventChan:                      make(chan protocol.SessionEvent, 256),
 		commandChan:                    make(chan protocol.SessionCommand, 16),
+		pendingConfirms:                make(map[string]chan protocol.SessionConfirmData),
 		workflowMsgChan:                make(chan string, 1),
 		ctx:                            ctx,
 		cancel:                         cancel,
@@ -664,6 +674,52 @@ func (s *Session) waitForCommand(ctx context.Context, types ...string) (protocol
 			return protocol.SessionCommand{}, false
 		}
 	}
+}
+
+// registerConfirm creates and stores a buffered channel for the given
+// confirmation request ID. The caller must eventually either receive from
+// the returned channel or call resolveConfirm-adjacent cleanup via
+// unregisterConfirm (done automatically once resolveConfirm delivers, but
+// must be done explicitly by the caller on cancellation/timeout to avoid
+// leaking the map entry).
+func (s *Session) registerConfirm(id string) chan protocol.SessionConfirmData {
+	ch := make(chan protocol.SessionConfirmData, 1)
+	s.pendingConfirmsMu.Lock()
+	if s.pendingConfirms == nil {
+		s.pendingConfirms = make(map[string]chan protocol.SessionConfirmData)
+	}
+	s.pendingConfirms[id] = ch
+	s.pendingConfirmsMu.Unlock()
+	return ch
+}
+
+// unregisterConfirm removes a pending confirmation entry without resolving
+// it. Used when the waiter gives up (context cancelled) before an answer
+// arrives, so the map doesn't accumulate dead entries.
+func (s *Session) unregisterConfirm(id string) {
+	s.pendingConfirmsMu.Lock()
+	delete(s.pendingConfirms, id)
+	s.pendingConfirmsMu.Unlock()
+}
+
+// resolveConfirm delivers data to the pending confirmation registered under
+// id, if any, and removes it from the registry. Returns false if no waiter
+// was registered under that ID (unknown or already-resolved request) — the
+// caller should treat this as "nothing to do", not an error, since it can
+// legitimately happen if the UI double-sends or the request already timed
+// out.
+func (s *Session) resolveConfirm(id string, data protocol.SessionConfirmData) bool {
+	s.pendingConfirmsMu.Lock()
+	ch, ok := s.pendingConfirms[id]
+	if ok {
+		delete(s.pendingConfirms, id)
+	}
+	s.pendingConfirmsMu.Unlock()
+	if !ok {
+		return false
+	}
+	ch <- data
+	return true
 }
 
 // Run is the main session loop. It initializes the brain, then waits for input.
@@ -1366,18 +1422,26 @@ func denyOutsideDirsError(name string, dirs []string) *ToolResult {
 // the user's response. On approval, it adds the dirs to the session's allowed
 // set (and persists them if the user chose "remember").
 func (s *Session) promptDirAccess(ctx context.Context, name string, params map[string]any, dirs []string) (approved, cancelled bool) {
+	// This gate runs outside the toolTask/dispatchOptions.confirmFn path (it's
+	// an inline check inside tool execution, with no tool_use ID in scope), so
+	// it mints its own request ID to correlate this wait with its reply —
+	// still unique enough to keep concurrent dir-access prompts from crossing.
+	requestID := nextTaskID()
+	ch := s.registerConfirm(requestID)
 	s.emit("event.confirm_request", protocol.EventConfirmRequest{
+		RequestID:     requestID,
 		ToolName:      name,
 		Params:        snapshotInput(params),
 		RequestedDirs: dirs,
 		Detail:        buildConfirmDetail(s.cwd, name, params),
 	})
-	cmd, ok := s.waitForCommand(ctx, "session.confirm")
-	if !ok {
+	var confirmData protocol.SessionConfirmData
+	select {
+	case confirmData = <-ch:
+	case <-ctx.Done():
+		s.unregisterConfirm(requestID)
 		return false, true
 	}
-	var confirmData protocol.SessionConfirmData
-	json.Unmarshal(cmd.Data, &confirmData)
 	if confirmData.Approved {
 		for _, dir := range dirs {
 			s.addAllowedDir(dir)
@@ -2363,9 +2427,12 @@ type dispatchOptions struct {
 	// (nil, false) when it doesn't recognise it.
 	handleSpecial func(ctx context.Context, name string, input map[string]any) (*ToolResult, bool)
 	// confirmFn is called when executeTool returns NeedsConfirmation=true.
-	// Returns approved=true to proceed, or cancelled=true to abort.
-	// When nil, NeedsConfirmation results are treated as denied.
-	confirmFn func(ctx context.Context, name string, input map[string]any) (approved, cancelled bool)
+	// requestID is the calling tool_use's ID, used to correlate the eventual
+	// session.confirm reply to this specific request when multiple
+	// confirmations are in flight concurrently. Returns approved=true to
+	// proceed, or cancelled=true to abort. When nil, NeedsConfirmation
+	// results are treated as denied.
+	confirmFn func(ctx context.Context, name string, input map[string]any, requestID string) (approved, cancelled bool)
 	// emitToolCall is called once per tool, before execution.
 	emitToolCall func(ev protocol.EventToolCall)
 	// emitToolResult is called after each tool completes.
@@ -2704,7 +2771,7 @@ func resolveConfirmation(ctx context.Context, t *toolTask, opts dispatchOptions)
 	if t.result != nil && t.result.SuggestedPattern != "" {
 		t.input["_suggested_pattern"] = t.result.SuggestedPattern
 	}
-	approved, cancelled := opts.confirmFn(ctx, t.toolUse.Name, t.input)
+	approved, cancelled := opts.confirmFn(ctx, t.toolUse.Name, t.input, t.toolUse.ID)
 	if cancelled {
 		return &ToolResult{Output: "Cancelled", IsError: true}
 	}
@@ -2722,8 +2789,8 @@ func resolveConfirmation(ctx context.Context, t *toolTask, opts dispatchOptions)
 
 // buildConfirmFn returns the confirmation closure used both by
 // sessionDispatchToolCalls and by foreground subagents.
-func (s *Session) buildConfirmFn() func(ctx context.Context, name string, input map[string]any) (approved, cancelled bool) {
-	return func(ctx context.Context, name string, input map[string]any) (approved, cancelled bool) {
+func (s *Session) buildConfirmFn() func(ctx context.Context, name string, input map[string]any, requestID string) (approved, cancelled bool) {
+	return func(ctx context.Context, name string, input map[string]any, requestID string) (approved, cancelled bool) {
 		// Extract requested directories for directory-access confirmations.
 		var requestedDirs []string
 		if rd, ok := input["_requested_dirs"].([]string); ok {
@@ -2731,19 +2798,22 @@ func (s *Session) buildConfirmFn() func(ctx context.Context, name string, input 
 		}
 		// Extract suggested pattern for bash/URL confirmations.
 		suggestedPattern, _ := input["_suggested_pattern"].(string)
+		ch := s.registerConfirm(requestID)
 		s.emit("event.confirm_request", protocol.EventConfirmRequest{
+			RequestID:        requestID,
 			ToolName:         name,
 			Params:           snapshotInput(input),
 			RequestedDirs:    requestedDirs,
 			Detail:           buildConfirmDetail(s.cwd, name, input),
 			SuggestedPattern: suggestedPattern,
 		})
-		cmd, ok := s.waitForCommand(s.ctx, "session.confirm")
-		if !ok {
+		var confirmData protocol.SessionConfirmData
+		select {
+		case confirmData = <-ch:
+		case <-s.ctx.Done():
+			s.unregisterConfirm(requestID)
 			return false, true
 		}
-		var confirmData protocol.SessionConfirmData
-		json.Unmarshal(cmd.Data, &confirmData)
 		// If approved and directories were requested, add them to the session.
 		if confirmData.Approved && len(requestedDirs) > 0 {
 			for _, dir := range requestedDirs {

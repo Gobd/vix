@@ -234,7 +234,7 @@ func minimalToolUseMessage(toolName string, input map[string]any) *llm.Message {
 func TestSubagentDispatchToolCalls_ConfirmFnCalled(t *testing.T) {
 	called := false
 	hooks := &TurnHooks{
-		ConfirmFn: func(ctx context.Context, name string, input map[string]any) (approved, cancelled bool) {
+		ConfirmFn: func(ctx context.Context, name string, input map[string]any, requestID string) (approved, cancelled bool) {
 			called = true
 			return true, false
 		},

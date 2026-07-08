@@ -833,6 +833,23 @@ func (s *Server) handleSession(conn net.Conn, scanner *bufio.Scanner, startCmd p
 				return
 			}
 
+			if cmd.Type == "session.confirm" {
+				// Route by request ID instead of forwarding to commandChan:
+				// multiple confirmations (e.g. spawn_agent alongside another
+				// confirm-needing tool) can be in flight at once, each with
+				// its own waiter registered under a distinct request ID.
+				// Forwarding to the shared commandChan would let whichever
+				// waiter happened to read next steal an answer meant for a
+				// different tool call.
+				var confirmData protocol.SessionConfirmData
+				if err := json.Unmarshal(cmd.Data, &confirmData); err != nil {
+					LogError("Session %s: invalid session.confirm data: %v", sessionID, err)
+				} else {
+					session.resolveConfirm(confirmData.RequestID, confirmData)
+				}
+				continue
+			}
+
 			select {
 			case session.commandChan <- cmd:
 			case <-session.ctx.Done():

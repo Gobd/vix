@@ -87,12 +87,19 @@ type SessionState struct {
 
 	// Confirm / question state
 	confirmToolName    string
+	confirmRequestID   string // RequestID of the confirm currently shown/deferred; threaded back on SendConfirm
 	confirmDetailShown bool
 
 	// pendingConfirmEvent holds a confirm request that arrived while the user
 	// had unsent text in the input; the panel is deferred until the input is
 	// cleared (e.g. on the next Enter) to avoid clobbering an in-progress edit.
 	pendingConfirmEvent *protocol.EventConfirmRequest
+	// queuedConfirms holds confirm requests that arrived while another one was
+	// already being shown or deferred. Concurrent tool calls (e.g. spawn_agent
+	// alongside another confirm-needing tool) can each need approval in the
+	// same turn; only one is ever shown at a time, so later ones queue here
+	// and are popped in order as earlier ones are answered/dismissed.
+	queuedConfirms []protocol.EventConfirmRequest
 	// autoApproveAll, toggled with ctrl+a, approves every tool confirmation in
 	// this session without prompting.
 	autoApproveAll bool
