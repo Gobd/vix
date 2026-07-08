@@ -14,6 +14,7 @@ import (
 func RegisterBuiltinHandlers(s *Server) {
 	RegisterCredentialHandlers(s)
 	RegisterLocalProviderHandlers(s)
+	RegisterAnthropicModelHandlers(s)
 
 	s.RegisterHandler("ping", func(data map[string]any) (map[string]any, error) {
 		return map[string]any{"status": "ok", "message": "pong", "version": s.version}, nil

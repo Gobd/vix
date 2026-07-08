@@ -31,7 +31,7 @@ func Load(forceInit bool, workdir, configDir, socketPath string) (*Config, error
 	// frontmatter (resolved per-session in the daemon). The Config.Model
 	// field is left as a final fallback only — see session.go for the
 	// resolution chain.
-	const model = "anthropic/claude-sonnet-4-6"
+	const model = "anthropic/claude-sonnet-5"
 
 	cwd, err := os.Getwd()
 	if err != nil {

@@ -23,6 +23,7 @@ var pricingByProvider = map[string][]modelPricing{
 		{"claude-opus-4-6", 5.00, 25.00, 6.25, 0.50},
 		{"claude-opus-4-5", 5.00, 25.00, 6.25, 0.50},
 		{"claude-opus-4", 15.00, 75.00, 18.75, 1.50},
+		{"claude-sonnet-5", 3.00, 15.00, 3.75, 0.30},
 		{"claude-sonnet-4", 3.00, 15.00, 3.75, 0.30},
 		{"claude-haiku-4-6", 1.00, 5.00, 1.25, 0.10},
 		{"claude-haiku-4-5", 1.00, 5.00, 1.25, 0.10},

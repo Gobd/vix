@@ -1457,6 +1457,21 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case anthropicModelsMsg:
+		if m.modelsLocalUI == nil {
+			m.modelsLocalUI = map[string]LocalProviderUI{}
+		}
+		if msg.overridden {
+			m.modelsLocalUI["anthropic"] = localProviderUIFromState(msg.state)
+		} else {
+			delete(m.modelsLocalUI, "anthropic")
+		}
+		if m.activeTab == TabKindModels && m.modelsSelectedProvider() == "anthropic" && m.modelsFocus != modelsFocusModels {
+			m.modelsModelSel = m.modelIndexForActive("anthropic", m.activeModelSpec())
+			m.clampModelsScroll()
+		}
+		return m, nil
+
 	case vixSessionsMsg:
 		m.vixSessions = msg.sums
 		// One-shot launch seeding: unread job runs/alerts that accumulated
@@ -1651,7 +1666,7 @@ func (m *Model) switchTab(k TabKind) tea.Cmd {
 		}
 	case TabKindModels:
 		m.enterModelsTab()
-		return fetchLocalProviders(m.socketPath, m.authToken)
+		return tea.Batch(fetchLocalProviders(m.socketPath, m.authToken), fetchAnthropicModels(m.socketPath, m.authToken))
 	case TabKindJobs:
 		m.clampJobsSelected()
 		return tea.Batch(
@@ -1792,10 +1807,11 @@ func (m *Model) providerFlatIndex(provider string) int {
 }
 
 // displayModelsForProvider returns the models shown in the grid for a
-// provider: the live-discovered list for local providers (empty until the
-// daemon probe answers), the static catalogue otherwise.
+// provider: the live-discovered list for local providers and for anthropic
+// when its base URL is overridden (empty until the daemon probe answers), the
+// static catalogue otherwise.
 func (m *Model) displayModelsForProvider(provider string) []ModelInfo {
-	if IsLocalProvider(provider) {
+	if _, ok := m.modelsLocalUI[provider]; ok {
 		return m.modelsLocalUI[provider].Models
 	}
 	return DisplayModelsForProvider(provider)
@@ -1972,6 +1988,8 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.modelsLoginStatus = ""
 				if IsLocalProvider(m.modelsSelectedProvider()) {
 					cmds = append(cmds, fetchLocalProviders(m.socketPath, m.authToken))
+				} else if m.modelsSelectedProvider() == "anthropic" {
+					cmds = append(cmds, fetchAnthropicModels(m.socketPath, m.authToken))
 				}
 			}
 		case "down", "j":
@@ -1985,6 +2003,8 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.modelsLoginStatus = ""
 				if IsLocalProvider(m.modelsSelectedProvider()) {
 					cmds = append(cmds, fetchLocalProviders(m.socketPath, m.authToken))
+				} else if m.modelsSelectedProvider() == "anthropic" {
+					cmds = append(cmds, fetchAnthropicModels(m.socketPath, m.authToken))
 				}
 			}
 		case "right", "l", "enter", "tab":
@@ -2086,7 +2106,8 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 func (m *Model) clampModelsScroll() {
 	provider := m.modelsSelectedProvider()
 	st := m.modelsStatus[provider]
-	gridRows := modelsGridRows(m.modelsViewportHeight(), st, m.modelsLoginStatus, IsLocalProvider(provider))
+	_, providerIsLocal := m.modelsLocalUI[provider]
+	gridRows := modelsGridRows(m.modelsViewportHeight(), st, m.modelsLoginStatus, providerIsLocal || IsLocalProvider(provider))
 	selRow := m.modelsModelSel / modelGridCols
 	if selRow < m.modelsModelScroll {
 		m.modelsModelScroll = selRow

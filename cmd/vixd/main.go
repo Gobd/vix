@@ -108,7 +108,7 @@ func main() {
 	// frontmatter (see session.go). The daemon keeps a fallback string so
 	// the plugin loader and pre-session bootstrap have a stable identifier
 	// to log against; it does NOT determine the actual session model.
-	const model = "anthropic/claude-sonnet-4-5-20250929"
+	const model = "anthropic/claude-sonnet-5"
 	daemonConfig, err := config.LoadDaemonConfig(Version)
 	if err != nil {
 		log.Printf("WARNING: Failed to load daemon config: %v", err)
