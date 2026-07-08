@@ -542,6 +542,109 @@ func TestSessionsVixInitiated(t *testing.T) {
 	h.UI.Shot("vix-initiated")
 }
 
+// vixAlignErrorRecord and vixAlignOkRecord are two persisted Vix-initiated run
+// records seeded into open/: a failed run (job_status "error" → the ⚠ marker in
+// the Title column) and a successful one (no marker). They guard the Sessions-tab
+// column alignment fix — the warning marker is exactly one display cell wide, so
+// the Running column must line up across both rows. {{WORKDIR}} is the per-test
+// cwd so session.list returns them.
+const vixAlignErrorRecord = `{
+  "schema_version": 1,
+  "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+  "cwd": "{{WORKDIR}}",
+  "session_mode": "chat",
+  "origin": "vix",
+  "trigger": {"type": "cron", "ref": "align-job"},
+  "job_status": "error",
+  "title": "ALIGN-ERR-ROW",
+  "started_at": "2024-01-01T00:00:00Z",
+  "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "err run"}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "boom"}]}
+  ]
+}`
+
+const vixAlignOkRecord = `{
+  "schema_version": 1,
+  "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+  "cwd": "{{WORKDIR}}",
+  "session_mode": "chat",
+  "origin": "vix",
+  "trigger": {"type": "cron", "ref": "align-job"},
+  "job_status": "ok",
+  "title": "ALIGN-OK-ROW",
+  "started_at": "2024-01-02T00:00:00Z",
+  "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "ok run"}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "fine"}]}
+  ]
+}`
+
+// runeCol returns the display column (rune offset) at which sub first appears in
+// line, or -1. The Sessions-list rows it inspects contain only width-1 glyphs
+// (ASCII plus the one-cell ⚠ marker), so a rune offset equals the screen column.
+func runeCol(line, sub string) int {
+	i := strings.Index(line, sub)
+	if i < 0 {
+		return -1
+	}
+	return len([]rune(line[:i]))
+}
+
+// TestSessionsVixInitiatedAlignment guards the Sessions-tab column alignment: a
+// failed Vix-initiated run is flagged with a ⚠ marker in the Title column, and
+// the marker must not shift the Running column relative to an unflagged row. The
+// marker is the plain warning sign (U+26A0, no U+FE0F): one display cell that
+// lipgloss and the terminal agree on. The emoji-presentation "⚠️" measures two
+// cells in lipgloss but renders as one here, which used to push the Running
+// column left on flagged rows.
+func TestSessionsVixInitiatedAlignment(t *testing.T) {
+	h := harness.Start(t, sessionsMeta("the ⚠ marker keeps the Running column aligned across failed and successful Vix-initiated rows"),
+		harness.WithHomeFile(".vix/sessions/open/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.json", vixAlignErrorRecord),
+		harness.WithHomeFile(".vix/sessions/open/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.json", vixAlignOkRecord),
+	)
+
+	h.UI.WaitStable(500 * time.Millisecond)
+	h.UI.Key("f1")
+	h.UI.WaitFor("Vix-initiated")
+
+	var errLine, okLine string
+	if !pollUntil(8*time.Second, func() bool {
+		errLine, okLine = "", ""
+		for _, ln := range strings.Split(h.UI.Snapshot(), "\n") {
+			if strings.Contains(ln, "ALIGN-ERR-ROW") {
+				errLine = ln
+			}
+			if strings.Contains(ln, "ALIGN-OK-ROW") {
+				okLine = ln
+			}
+		}
+		return errLine != "" && okLine != ""
+	}) {
+		t.Fatalf("both Vix-initiated rows not listed; screen:\n%s", h.UI.Snapshot())
+	}
+	h.UI.Shot("vix-initiated-alignment")
+
+	// Only the failed row carries the warning marker.
+	if !strings.Contains(errLine, "⚠") {
+		t.Fatalf("failed row missing the ⚠ marker: %q", errLine)
+	}
+	if strings.Contains(okLine, "⚠") {
+		t.Fatalf("successful row should not carry the ⚠ marker: %q", okLine)
+	}
+
+	// The Running column ("0s ago", frozen by VIX_TEST_RENDER) must start at the
+	// same screen column on both rows — the regression under test.
+	errCol := runeCol(errLine, "0s ago")
+	okCol := runeCol(okLine, "0s ago")
+	if errCol < 0 || okCol < 0 {
+		t.Fatalf("Running column not found (err=%d ok=%d):\nERR %q\nOK  %q", errCol, okCol, errLine, okLine)
+	}
+	if errCol != okCol {
+		t.Fatalf("Running column misaligned: ⚠ row at col %d, clean row at col %d\nERR %q\nOK  %q", errCol, okCol, errLine, okLine)
+	}
+}
+
 // inlineWorkflowJobSpec is a one-shot job that runs a self-contained inline
 // workflow (no entry in config/workflow.json). The single agent step streams a
 // reply through the mock, so the run produces a persisted Vix-initiated session

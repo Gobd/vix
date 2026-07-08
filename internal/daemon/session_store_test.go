@@ -250,7 +250,7 @@ func TestBuildReplayMessages(t *testing.T) {
 		llm.NewUserMessage(llm.NewToolResultBlock("t1", "out", false)),
 		llm.NewAssistantMessage(), // no blocks -> whole message skipped
 	}
-	out := buildReplayMessages(msgs)
+	out := buildReplayMessages(msgs, nil)
 	if len(out) != 3 {
 		t.Fatalf("replay messages = %d, want 3", len(out))
 	}
@@ -269,13 +269,59 @@ func TestBuildReplayMessages(t *testing.T) {
 	}
 }
 
+func TestBuildReplayMessagesInterleavesRetryNotices(t *testing.T) {
+	msgs := []llm.MessageParam{
+		llm.NewUserMessage(llm.NewTextBlock("hi")),
+		llm.NewAssistantMessage(llm.NewTextBlock("working")),
+	}
+	notices := []retryNoticeRecord{
+		{AfterIdx: -1, Reason: "API overloaded", Attempt: 1, MaxRetries: 10, WaitSecs: 1},
+		{AfterIdx: 1, Reason: "API overloaded", Attempt: 7, MaxRetries: 10, WaitSecs: 32},
+	}
+	out := buildReplayMessages(msgs, notices)
+	// -1 notice, user, assistant, idx-1 notice = 4 entries.
+	if len(out) != 4 {
+		t.Fatalf("replay messages = %d, want 4: %+v", len(out), out)
+	}
+	if out[0].Role != "system" || len(out[0].Blocks) != 1 || out[0].Blocks[0].Kind != "retry" {
+		t.Fatalf("leading retry notice wrong: %+v", out[0])
+	}
+	if out[0].Blocks[0].Attempt != 1 || out[0].Blocks[0].Text != "API overloaded" {
+		t.Errorf("leading retry fields wrong: %+v", out[0].Blocks[0])
+	}
+	if out[1].Role != "user" || out[2].Role != "assistant" {
+		t.Errorf("message order wrong: %+v", out)
+	}
+	last := out[3]
+	if last.Role != "system" || last.Blocks[0].Kind != "retry" || last.Blocks[0].Attempt != 7 || last.Blocks[0].WaitSecs != 32 {
+		t.Errorf("trailing retry notice wrong: %+v", last)
+	}
+}
+
+func TestBuildReplayMessagesNoticeAfterSkippedMessage(t *testing.T) {
+	// An empty assistant message is skipped from output, but a notice anchored
+	// to it must still be emitted (the failed agent produced no final text).
+	msgs := []llm.MessageParam{
+		llm.NewUserMessage(llm.NewTextBlock("go")),
+		llm.NewAssistantMessage(), // no blocks -> skipped
+	}
+	notices := []retryNoticeRecord{{AfterIdx: 1, Reason: "API overloaded", Attempt: 10, MaxRetries: 10}}
+	out := buildReplayMessages(msgs, notices)
+	if len(out) != 2 {
+		t.Fatalf("replay messages = %d, want 2 (user + notice): %+v", len(out), out)
+	}
+	if out[1].Blocks[0].Kind != "retry" || out[1].Blocks[0].Attempt != 10 {
+		t.Errorf("notice anchored to skipped message lost: %+v", out)
+	}
+}
+
 func TestBuildReplayMessagesTimestamp(t *testing.T) {
 	ts := time.Date(2021, 3, 4, 5, 6, 7, 0, time.UTC)
 	stamped := llm.NewUserMessage(llm.NewTextBlock("hi"))
 	stamped.Timestamp = ts
 	legacy := llm.NewAssistantMessage(llm.NewTextBlock("answer")) // zero timestamp
 
-	out := buildReplayMessages([]llm.MessageParam{stamped, legacy})
+	out := buildReplayMessages([]llm.MessageParam{stamped, legacy}, nil)
 	if len(out) != 2 {
 		t.Fatalf("replay messages = %d, want 2", len(out))
 	}

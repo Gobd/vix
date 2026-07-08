@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/tidwall/sjson"
 )
 
 // Run statuses recorded in State.LastStatus.
@@ -184,6 +186,45 @@ func (st *Store) SpecExists(id string) bool {
 	}
 	_, err := os.Stat(filepath.Join(st.specsDir, id, "job.json"))
 	return err == nil
+}
+
+// SetEnabled surgically rewrites the `enabled` field of <id>/job.json in place,
+// preserving every other key, its order, and the file's formatting (unlike
+// SaveSpec, which re-serializes the whole struct). The edited bytes are written
+// atomically (temp file + rename). Errors when the spec directory or id is
+// unavailable, or when the job.json cannot be read/patched.
+func (st *Store) SetEnabled(id string, enabled bool) error {
+	if st.specsDir == "" {
+		return fmt.Errorf("jobs store has no spec directory")
+	}
+	if id == "" {
+		return fmt.Errorf("cannot set enabled on empty id")
+	}
+	jobDir := filepath.Join(st.specsDir, id)
+	specPath := filepath.Join(jobDir, "job.json")
+	data, err := os.ReadFile(specPath)
+	if err != nil {
+		return err
+	}
+	patched, err := sjson.SetBytes(data, "enabled", enabled)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(jobDir, "job.*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(patched); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, specPath)
 }
 
 // LoadState reads every job's state file (<id>/state.json) under the spec

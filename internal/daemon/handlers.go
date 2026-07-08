@@ -164,4 +164,47 @@ func RegisterBuiltinHandlers(s *Server) {
 		}
 		return map[string]any{"status": "ok", "session_id": sessionID, "fire_id": fireID}, nil
 	})
+
+	// job.list returns the scheduled jobs (enabled and disabled), powering the
+	// TUI's Jobs & Triggers tab. Jobs are daemon-global (~/.vix/jobs), so the
+	// list is not cwd-filtered.
+	s.RegisterHandler("job.list", func(data map[string]any) (map[string]any, error) {
+		return map[string]any{"status": "ok", "jobs": s.JobSummaries()}, nil
+	})
+
+	// hook.list returns the lifecycle hooks (enabled and disabled), powering the
+	// TUI's Jobs & Triggers tab.
+	s.RegisterHandler("hook.list", func(data map[string]any) (map[string]any, error) {
+		return map[string]any{"status": "ok", "hooks": s.HookSummaries()}, nil
+	})
+
+	// job.set_enabled toggles a job's `enabled` field (surgical in-place edit of
+	// its job.json) and reschedules. Backs the Space toggle in the Jobs &
+	// Triggers tab.
+	s.RegisterHandler("job.set_enabled", func(data map[string]any) (map[string]any, error) {
+		id, _ := data["id"].(string)
+		if id == "" {
+			return map[string]any{"status": "error", "message": "missing 'id'"}, nil
+		}
+		enabled, _ := data["enabled"].(bool)
+		if err := s.SetJobEnabled(id, enabled); err != nil {
+			return map[string]any{"status": "error", "message": err.Error()}, nil
+		}
+		return map[string]any{"status": "ok"}, nil
+	})
+
+	// hook.set_enabled toggles a hook's `enabled` field (surgical in-place edit
+	// of its hook.json) and reloads. Backs the Space toggle in the Jobs &
+	// Triggers tab.
+	s.RegisterHandler("hook.set_enabled", func(data map[string]any) (map[string]any, error) {
+		id, _ := data["id"].(string)
+		if id == "" {
+			return map[string]any{"status": "error", "message": "missing 'id'"}, nil
+		}
+		enabled, _ := data["enabled"].(bool)
+		if err := s.SetHookEnabled(id, enabled); err != nil {
+			return map[string]any{"status": "error", "message": err.Error()}, nil
+		}
+		return map[string]any{"status": "ok"}, nil
+	})
 }

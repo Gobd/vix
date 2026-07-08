@@ -47,6 +47,12 @@ type sessionRecord struct {
 	TodoList   []protocol.TodoItem `json:"todo_list,omitempty"`
 	ActivePlan *protocol.Plan      `json:"active_plan,omitempty"`
 
+	// RetryNotices are transient-error retry notices (overload, rate limit, …)
+	// captured during a workflow run, persisted so a reopened session replays
+	// the same lines an interactive run shows live. Each is anchored to the
+	// message it follows in Messages (AfterIdx; -1 = before all messages).
+	RetryNotices []retryNoticeRecord `json:"retry_notices,omitempty"`
+
 	StartedAt     time.Time `json:"started_at"`
 	LastRequestAt time.Time `json:"last_request_at,omitempty"`
 
@@ -66,6 +72,19 @@ type sessionRecord struct {
 	TotalOutputTokens int64 `json:"total_output_tokens,omitempty"`
 	TotalCacheRead    int64 `json:"total_cache_read,omitempty"`
 	TotalCacheWrite   int64 `json:"total_cache_write,omitempty"`
+}
+
+// retryNoticeRecord is one persisted transient-error retry notice, projected
+// into event.replay as a "retry" block so a reopened workflow run shows the
+// same "API overloaded — retrying …" line an interactive run renders live.
+type retryNoticeRecord struct {
+	// AfterIdx is the index in sessionRecord.Messages this notice renders
+	// after (-1 = before all messages).
+	AfterIdx   int    `json:"after_idx"`
+	Reason     string `json:"reason"`
+	Attempt    int    `json:"attempt"`
+	MaxRetries int    `json:"max_retries"`
+	WaitSecs   int    `json:"wait_secs"`
 }
 
 // sessionRecordPath returns the path of a record within dir, or "" when dir is
@@ -390,6 +409,8 @@ func (s *Session) buildRecord() sessionRecord {
 	s.mu.Lock()
 	msgs := make([]llm.MessageParam, len(s.messages))
 	copy(msgs, s.messages)
+	notices := make([]retryNoticeRecord, len(s.retryNotices))
+	copy(notices, s.retryNotices)
 	plan := s.activePlan
 	workflowRun := s.workflowRunState
 	title := s.title
@@ -413,6 +434,7 @@ func (s *Session) buildRecord() sessionRecord {
 		Messages:          msgs,
 		TodoList:          todos,
 		ActivePlan:        plan,
+		RetryNotices:      notices,
 		StartedAt:         s.startTime,
 		LastRequestAt:     s.lastRequestAt,
 		Origin:            s.origin,
@@ -445,6 +467,7 @@ func (s *Session) persist() {
 // mismatch in emitReplay.
 func (s *Session) seedFromRecord(rec *sessionRecord) {
 	s.messages = append([]llm.MessageParam(nil), rec.Messages...)
+	s.retryNotices = append([]retryNoticeRecord(nil), rec.RetryNotices...)
 	s.todoList = append([]protocol.TodoItem(nil), rec.TodoList...)
 	s.activePlan = rec.ActivePlan
 	s.title = rec.Title
@@ -527,6 +550,8 @@ func (s *Session) emitReplay() {
 	s.mu.Lock()
 	msgs := make([]llm.MessageParam, len(s.messages))
 	copy(msgs, s.messages)
+	notices := make([]retryNoticeRecord, len(s.retryNotices))
+	copy(notices, s.retryNotices)
 	plan := s.activePlan
 	title := s.title
 	s.mu.Unlock()
@@ -537,7 +562,7 @@ func (s *Session) emitReplay() {
 	s.todoMu.RUnlock()
 
 	s.emit("event.replay", protocol.EventReplay{
-		Messages:       buildReplayMessages(msgs),
+		Messages:       buildReplayMessages(msgs, notices),
 		Todos:          todos,
 		ActivePlan:     plan,
 		Model:          s.model,
@@ -551,11 +576,32 @@ func (s *Session) emitReplay() {
 	s.persist()
 }
 
-// buildReplayMessages projects llm history into the wire-stable replay shape.
-// Empty assistant/user messages (no renderable blocks) are skipped.
-func buildReplayMessages(msgs []llm.MessageParam) []protocol.ReplayMessage {
-	out := make([]protocol.ReplayMessage, 0, len(msgs))
-	for _, m := range msgs {
+// buildReplayMessages projects llm history into the wire-stable replay shape,
+// interleaving any retry notices at the position they were anchored to (so a
+// reopened workflow run shows the same "API overloaded — retrying …" lines an
+// interactive run renders live). Empty assistant/user messages (no renderable
+// blocks) are skipped, but notices anchored to them are still emitted.
+func buildReplayMessages(msgs []llm.MessageParam, notices []retryNoticeRecord) []protocol.ReplayMessage {
+	out := make([]protocol.ReplayMessage, 0, len(msgs)+len(notices))
+	emitNotices := func(afterIdx int) {
+		for _, n := range notices {
+			if n.AfterIdx != afterIdx {
+				continue
+			}
+			out = append(out, protocol.ReplayMessage{
+				Role: "system",
+				Blocks: []protocol.ReplayBlock{{
+					Kind:       "retry",
+					Text:       n.Reason,
+					Attempt:    n.Attempt,
+					MaxRetries: n.MaxRetries,
+					WaitSecs:   n.WaitSecs,
+				}},
+			})
+		}
+	}
+	emitNotices(-1) // notices anchored before any message
+	for i, m := range msgs {
 		rm := protocol.ReplayMessage{Role: string(m.Role)}
 		if !m.Timestamp.IsZero() {
 			rm.Timestamp = m.Timestamp.Format(time.RFC3339)
@@ -591,6 +637,7 @@ func buildReplayMessages(msgs []llm.MessageParam) []protocol.ReplayMessage {
 		if len(rm.Blocks) > 0 {
 			out = append(out, rm)
 		}
+		emitNotices(i)
 	}
 	return out
 }

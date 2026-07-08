@@ -297,10 +297,14 @@ if [[ -n "$DISCORD_WEBHOOK_URL" ]]; then
 
 **Changelog**
 ${CHANGELOG}"
-  # Discord content limit is 2000 chars
-  if (( ${#DISCORD_MSG} > 1950 )); then
-    DISCORD_MSG="${DISCORD_MSG:0:1950}
+  # Discord content limit is 2000 chars. When truncating, reserve room for the
+  # suffix so the final message stays under the limit (budget + suffix <= 2000).
+  DISCORD_LIMIT=2000
+  DISCORD_SUFFIX="
 ... (truncated, see ${RELEASE_URL})"
+  if (( ${#DISCORD_MSG} > DISCORD_LIMIT )); then
+    DISCORD_BUDGET=$(( DISCORD_LIMIT - ${#DISCORD_SUFFIX} ))
+    DISCORD_MSG="${DISCORD_MSG:0:DISCORD_BUDGET}${DISCORD_SUFFIX}"
   fi
   DISCORD_PAYLOAD=$(CONTENT="$DISCORD_MSG" python3 -c 'import json, os; print(json.dumps({"content": os.environ["CONTENT"]}))')
   if curl -fsS -X POST -H "Content-Type: application/json" -d "$DISCORD_PAYLOAD" "$DISCORD_WEBHOOK_URL" >/dev/null; then

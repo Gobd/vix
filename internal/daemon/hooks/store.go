@@ -2,8 +2,11 @@ package hooks
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/tidwall/sjson"
 )
 
 // Store reads hook specs from a directory and round-trips per-hook state files.
@@ -152,4 +155,42 @@ func (st *Store) DeleteState(id string) error {
 		return err
 	}
 	return nil
+}
+
+// SetEnabled surgically rewrites the `enabled` field of <id>/hook.json in place,
+// preserving every other key, its order, and the file's formatting. The edited
+// bytes are written atomically (temp file + rename). Errors when the spec
+// directory or id is unavailable, or when the hook.json cannot be read/patched.
+func (st *Store) SetEnabled(id string, enabled bool) error {
+	if st.specsDir == "" {
+		return fmt.Errorf("hooks store has no spec directory")
+	}
+	if id == "" {
+		return fmt.Errorf("cannot set enabled on empty id")
+	}
+	hookDir := filepath.Join(st.specsDir, id)
+	specPath := filepath.Join(hookDir, "hook.json")
+	data, err := os.ReadFile(specPath)
+	if err != nil {
+		return err
+	}
+	patched, err := sjson.SetBytes(data, "enabled", enabled)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(hookDir, "hook.*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(patched); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, specPath)
 }

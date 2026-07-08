@@ -385,17 +385,57 @@ loop:
 		}
 	}
 
-	out := &Message{
-		TextContent: textBuf.String(),
+	out := &Message{}
+
+	appendText := func(text string) {
+		if text == "" {
+			return
+		}
+		out.Content = append(out.Content, ContentBlock{Type: BlockText, Text: text})
+		out.TextContent += text
+	}
+
+	appendToolCall := func(id, name, args string) {
+		var input map[string]any
+		if args != "" {
+			if err := json.Unmarshal([]byte(args), &input); err != nil {
+				log.Printf("[llm openai] function args parse failed for %s: %v", name, err)
+				input = map[string]any{}
+			}
+		} else {
+			input = map[string]any{}
+		}
+		out.Content = append(out.Content, ContentBlock{
+			Type:  BlockToolUse,
+			ID:    id,
+			Name:  name,
+			Input: input,
+		})
+		out.ToolCalls = append(out.ToolCalls, ToolCall{ID: id, Name: name, Input: input})
+	}
+
+	appendStreamToolCalls := func(seen map[string]bool) {
+		for _, idx := range fnOrder {
+			st := fnByIdx[idx]
+			if st == nil {
+				continue
+			}
+			if seen != nil && seen[st.id] {
+				continue
+			}
+			appendToolCall(st.id, st.name, st.args.String())
+		}
 	}
 
 	if finalResponse != nil {
 		// Authoritative path: walk finalResponse.Output to get items in
 		// their original order, including reasoning items with their
 		// encrypted_content needed for next-turn round-trip. Stream-
-		// accumulated text/tool buffers are ignored here because
-		// finalResponse.Output carries the same data plus the reasoning
-		// items the stream events don't expose.
+		// accumulated text/tool buffers are used only as a fallback because
+		// the Codex backend can stream deltas while omitting those items from
+		// response.completed.output.
+		sawText := false
+		seenToolCalls := map[string]bool{}
 		for _, item := range finalResponse.Output {
 			switch item.Type {
 			case "message":
@@ -407,25 +447,12 @@ loop:
 					}
 				}
 				if msgText.Len() > 0 {
-					out.Content = append(out.Content, ContentBlock{Type: BlockText, Text: msgText.String()})
+					appendText(msgText.String())
+					sawText = true
 				}
 			case "function_call":
-				var input map[string]any
-				if item.Arguments != "" {
-					if err := json.Unmarshal([]byte(item.Arguments), &input); err != nil {
-						log.Printf("[llm openai] function args parse failed for %s: %v", item.Name, err)
-						input = map[string]any{}
-					}
-				} else {
-					input = map[string]any{}
-				}
-				out.Content = append(out.Content, ContentBlock{
-					Type:  BlockToolUse,
-					ID:    item.CallID,
-					Name:  item.Name,
-					Input: input,
-				})
-				out.ToolCalls = append(out.ToolCalls, ToolCall{ID: item.CallID, Name: item.Name, Input: input})
+				appendToolCall(item.CallID, item.Name, item.Arguments)
+				seenToolCalls[item.CallID] = true
 			case "reasoning":
 				// Capture the reasoning item for stateless round-trip on
 				// the next turn. ID + EncryptedContent together let the
@@ -446,6 +473,12 @@ loop:
 				})
 			}
 		}
+		if !sawText && textBuf.Len() > 0 {
+			appendText(textBuf.String())
+		}
+		if len(fnOrder) > 0 {
+			appendStreamToolCalls(seenToolCalls)
+		}
 		out.StopReason = mapResponsesStopReason(finalResponse.Status, finalResponse.IncompleteDetails.Reason, len(out.ToolCalls) > 0)
 		out.Usage = Usage{
 			InputTokens:     finalResponse.Usage.InputTokens,
@@ -461,27 +494,9 @@ loop:
 		// finalResponse.Output). A partial reasoning block isn't
 		// re-feedable anyway, so dropping it is correct.
 		if textBuf.Len() > 0 {
-			out.Content = append(out.Content, ContentBlock{Type: BlockText, Text: textBuf.String()})
+			appendText(textBuf.String())
 		}
-		for _, idx := range fnOrder {
-			st := fnByIdx[idx]
-			var input map[string]any
-			if st.args.Len() > 0 {
-				if err := json.Unmarshal([]byte(st.args.String()), &input); err != nil {
-					log.Printf("[llm openai] function args parse failed for %s: %v", st.name, err)
-					input = map[string]any{}
-				}
-			} else {
-				input = map[string]any{}
-			}
-			out.Content = append(out.Content, ContentBlock{
-				Type:  BlockToolUse,
-				ID:    st.id,
-				Name:  st.name,
-				Input: input,
-			})
-			out.ToolCalls = append(out.ToolCalls, ToolCall{ID: st.id, Name: st.name, Input: input})
-		}
+		appendStreamToolCalls(nil)
 		if len(out.ToolCalls) > 0 {
 			out.StopReason = StopToolUse
 		} else {

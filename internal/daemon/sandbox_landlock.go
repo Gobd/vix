@@ -136,7 +136,7 @@ func landlockBashCmd(ctx context.Context, command, cwd string, extraDirs []strin
 	// as-is so the helper just needs to syscall.Exec(argv[0], argv).
 	cmd := exec.CommandContext(ctx, self, "landlock-exec", resolveBashPath(), "-c", command)
 	cmd.Dir = cwd
-	cmd.Env = append(os.Environ(), envLandlockRules+"="+string(rulesJSON))
+	cmd.Env = append(sanitizedBashEnv(), envLandlockRules+"="+string(rulesJSON))
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Cancel = func() error {
@@ -367,6 +367,7 @@ func applyLandlockRuleset(rules landlockRules) error {
 func unsandboxedBashCmd(ctx context.Context, command, cwd string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
 	cmd.Dir = cwd
+	cmd.Env = sanitizedBashEnv()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Cancel = func() error {

@@ -74,6 +74,37 @@ func TestHandleWorkflowCommand_FinishedInlineRunResetsToChat(t *testing.T) {
 	}
 }
 
+// TestHandleWorkflowCommand_FailedInlineRunResetsToChat verifies that a
+// *failed* inline run (terminal step error, not a cancellation) also drops back
+// to chat mode and clears its run state — so reopening a failed scheduled run
+// replays its transcript instead of warning the workflow "no longer exists".
+func TestHandleWorkflowCommand_FailedInlineRunResetsToChat(t *testing.T) {
+	s := newWorkflowTestSession(t)
+	def := &WorkflowDef{
+		Name:       "plan-issues-get-vix-vix",
+		EntryPoint: StepRef{ID: "boom"},
+		Steps: map[string]WorkflowStepDef{
+			"boom": {Type: "bash", Command: "exit 1"},
+		},
+	}
+	raw, err := json.Marshal(def)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.handleWorkflowCommand("", "objective", raw)
+
+	if s.sessionMode != "chat" {
+		t.Errorf("sessionMode = %q, want %q after a failed inline run", s.sessionMode, "chat")
+	}
+	if s.activeWorkflow != "" {
+		t.Errorf("activeWorkflow = %q, want empty after a failed inline run", s.activeWorkflow)
+	}
+	if st := s.snapshotWorkflowRunState(); st != nil {
+		t.Errorf("workflow run state = %+v, want nil (a failed inline run is not resumable)", st)
+	}
+}
+
 // TestHandleWorkflowCommand_InvalidInlineErrors verifies a structurally invalid
 // inline definition is rejected before any registration or execution.
 func TestHandleWorkflowCommand_InvalidInlineErrors(t *testing.T) {

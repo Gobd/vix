@@ -80,11 +80,11 @@ func TestAuthButtonsFor(t *testing.T) {
 	}
 }
 
-// TestTabBarHasModelsAndSettings verifies the tab bar shows the Models [F3] and
-// Settings [F4] tabs after the remap.
+// TestTabBarHasModelsAndSettings verifies the tab bar shows the tabs in their
+// remapped F-key order, including the Jobs & Triggers [F4] tab and Settings [F5].
 func TestTabBarHasModelsAndSettings(t *testing.T) {
-	bar := renderTabBar(TabKindModels, 120, NewStyles(false), true, false, false, false, false)
-	for _, want := range []string{"Models [F3]", "Settings [F4]", "Sessions [F1]", "Workspace [F2]"} {
+	bar := renderTabBar(TabKindModels, 140, NewStyles(false), true, false, false, false, false)
+	for _, want := range []string{"Sessions [F1]", "Workspace [F2]", "Models [F3]", "Jobs & Triggers [F4]", "Settings [F5]"} {
 		if !strings.Contains(bar, want) {
 			t.Errorf("tab bar missing %q\n%s", want, bar)
 		}

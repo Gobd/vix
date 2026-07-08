@@ -208,6 +208,72 @@ func TestAppendWorkflowTranscript_EmptyNoop(t *testing.T) {
 	}
 }
 
+// ── failed runs replay like successful ones ──
+
+func TestRecordFailedAgentStep_Gating(t *testing.T) {
+	exec := &WorkflowRun{}
+	exec.recordFailedAgentStep(WorkflowStepDef{Type: "bash"}, "b")
+	if len(exec.snapshotTranscript()) != 0 {
+		t.Fatal("non-agent step should not be recorded on failure")
+	}
+	// A failed agent step is recorded even with no output, so its partial
+	// working history still mirrors into the transcript.
+	exec.recordFailedAgentStep(WorkflowStepDef{Type: "agent"}, "a")
+	if len(exec.snapshotTranscript()) != 1 {
+		t.Fatal("failed agent step should be recorded even with no output")
+	}
+}
+
+func TestAppendWorkflowTranscript_FailedStepSplicesPartialHistoryAndRetries(t *testing.T) {
+	s := newWorkflowTestSession(t)
+	exec := &WorkflowRun{StepAgents: map[string]*AgentRunner{}}
+	// Failed step: recorded via recordFailedAgentStep (no final text), but its
+	// agent produced a tool_use/tool_result before dying, plus retry notices.
+	exec.recordFailedAgentStep(WorkflowStepDef{Type: "agent"}, "plan")
+	exec.recordRetry("plan", "API overloaded", 7, 10, 32)
+	exec.StepAgents["plan"] = &AgentRunner{Messages: []llm.MessageParam{
+		llm.NewUserMessage(llm.NewTextBlock("plan prompt")),
+		llm.NewAssistantMessage(llm.NewToolUseBlock("t1", "read_file", map[string]any{"path": "/x"})),
+		llm.NewUserMessage(llm.NewToolResultBlock("t1", "contents", false)),
+	}}
+
+	s.appendWorkflowTranscript("anchor", exec)
+
+	if len(s.messages) != 3 {
+		t.Fatalf("expected the failed step's partial history (3 msgs), got %d", len(s.messages))
+	}
+	if !hasBlock(s.messages, llm.BlockToolUse) || !hasBlock(s.messages, llm.BlockToolResult) {
+		t.Error("failed step's tool_use/tool_result should be preserved")
+	}
+	if len(s.retryNotices) != 1 {
+		t.Fatalf("expected 1 retry notice captured, got %d", len(s.retryNotices))
+	}
+	n := s.retryNotices[0]
+	if n.AfterIdx != len(s.messages)-1 {
+		t.Errorf("retry AfterIdx = %d, want %d (end of transcript)", n.AfterIdx, len(s.messages)-1)
+	}
+	if n.Attempt != 7 || n.MaxRetries != 10 || n.WaitSecs != 32 || n.Reason != "API overloaded" {
+		t.Errorf("retry notice fields wrong: %+v", n)
+	}
+}
+
+func TestAppendWorkflowTranscript_RetryNoticesWithoutMessages(t *testing.T) {
+	s := newWorkflowTestSession(t)
+	exec := &WorkflowRun{StepAgents: map[string]*AgentRunner{}}
+	// A run that failed before producing any agent message still records its
+	// retries, anchored before everything (-1).
+	exec.recordRetry("plan", "API overloaded", 1, 10, 1)
+
+	s.appendWorkflowTranscript("anchor", exec)
+
+	if len(s.messages) != 0 {
+		t.Fatalf("expected no messages, got %d", len(s.messages))
+	}
+	if len(s.retryNotices) != 1 || s.retryNotices[0].AfterIdx != -1 {
+		t.Fatalf("expected one retry notice anchored at -1, got %+v", s.retryNotices)
+	}
+}
+
 // ── integration: a bash-only run records nothing ──
 
 func TestExecuteWorkflow_BashOnlyLeavesTranscriptEmpty(t *testing.T) {

@@ -1,6 +1,7 @@
 package hooks
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -96,6 +97,21 @@ func (r *Registry) Reload() {
 		}
 	}
 	r.stateMu.Unlock()
+}
+
+// SetEnabled flips a hook spec's `enabled` field on disk and reloads the index.
+// The edit is surgical (only the enabled value is rewritten via the store), so
+// the rest of the user's hook.json is preserved. Returns an error when the id is
+// unknown or the file cannot be patched.
+func (r *Registry) SetEnabled(id string, enabled bool) error {
+	if _, ok := r.SpecByID(id); !ok {
+		return fmt.Errorf("hook %q not found", id)
+	}
+	if err := r.store.SetEnabled(id, enabled); err != nil {
+		return err
+	}
+	r.Reload()
+	return nil
 }
 
 // RecordRun appends one fire to the hook's recent-run history, updates the

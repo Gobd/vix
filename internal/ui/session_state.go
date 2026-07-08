@@ -93,6 +93,7 @@ type SessionState struct {
 	pendingInput      *pendingMsg
 	pendingPlanAction *pendingPlanAction
 	pendingTools      map[string]int
+	cancelAckPending  bool
 
 	// Panels
 	rightPanel         RightPanel

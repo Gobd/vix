@@ -1,6 +1,7 @@
 package scenarios
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -57,7 +58,43 @@ func TestLocalProviderDetectedFromEnv(t *testing.T) {
 	h.UI.Shot("local-model-listed")
 }
 
-// TestModelSwitchWithValidCredential is a staged acceptance spec for issue #26
+// TestLocalLANHTTPBoots is the regression guard for the reported init-time
+// panic: with LLAMACPP_BASE_URL pointing at a non-loopback host over plain HTTP
+// (a self-hosted llama.cpp box on the LAN), vix used to panic at startup —
+// `providers: embedded providers.json invalid: provider "llamacpp" base_url:
+// non-HTTPS URL "http://freyr.local:8080"` — before main() could run. Local
+// providers may now use plain HTTP on any host, and the embedded-defaults load
+// no longer interpolates the environment, so the daemon boots and a normal turn
+// runs on the default model. The LAN endpoint is unreachable under
+// `--network none`; reachability is irrelevant here because the original crash
+// was at config validation, not at probe time.
+//
+// T · asserts the daemon boots clean (no panic in the vixd log) and a turn
+// completes over the wire.
+func TestLocalLANHTTPBoots(t *testing.T) {
+	meta := harness.Meta{
+		Category:    "providers",
+		Subcategory: "providers.local_lan_http",
+		Description: "vixd boots and runs a turn with a non-loopback plain-HTTP LLAMACPP_BASE_URL (no startup panic)",
+		Wire:        harness.WireMessages,
+	}
+
+	h := harness.Start(t, meta, harness.WithEnv("LLAMACPP_BASE_URL", "http://freyr.local:8080/v1"))
+
+	h.UI.WaitStable(500 * time.Millisecond)
+	h.UI.Shot("booted-with-lan-llamacpp")
+
+	if log := h.Daemon.LogTail(200); strings.Contains(log, "panic:") {
+		t.Fatalf("vixd panicked at startup with a LAN llama.cpp base URL; log:\n%s", log)
+	}
+
+	h.Mock.Enqueue(harness.Text("Booted fine with a LAN llama.cpp endpoint."))
+	h.UI.Type("are you up?")
+	h.UI.Enter()
+	h.UI.WaitFor("Booted fine with a LAN llama.cpp endpoint.")
+	h.UI.Shot("turn-completed")
+}
+
 // (a valid credential is wrongly reported missing on switch). The harness
 // injects OpenAI creds (key + base URL → mock) by default, so a switch to an
 // OpenAI model should succeed. Skipped because #26 is open and the F3 picker

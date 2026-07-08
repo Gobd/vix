@@ -48,6 +48,16 @@ func TestRerenderUserMessagePreservesTimestamp(t *testing.T) {
 	}
 }
 
+func TestWrapLineSkipsLongSpaceRunsWithoutPanic(t *testing.T) {
+	line := strings.Repeat("a", 36) + " " + strings.Repeat(" ", 50) + "b"
+
+	wrapped := wrapLine(line, 37)
+
+	if got := wrapped[len(wrapped)-1]; got != "b" {
+		t.Fatalf("last wrapped line = %q, want %q (all wrapped lines: %#v)", got, "b", wrapped)
+	}
+}
+
 func TestExtractFilePathFromSummary(t *testing.T) {
 	tests := []struct {
 		toolName string
