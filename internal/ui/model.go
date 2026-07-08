@@ -1807,10 +1807,11 @@ func (m *Model) providerFlatIndex(provider string) int {
 }
 
 // displayModelsForProvider returns the models shown in the grid for a
-// provider: the live-discovered list for local providers (empty until the
-// daemon probe answers), the static catalogue otherwise.
+// provider: the live-discovered list for local providers and for anthropic
+// when its base URL is overridden (empty until the daemon probe answers), the
+// static catalogue otherwise.
 func (m *Model) displayModelsForProvider(provider string) []ModelInfo {
-	if IsLocalProvider(provider) {
+	if _, ok := m.modelsLocalUI[provider]; ok {
 		return m.modelsLocalUI[provider].Models
 	}
 	return DisplayModelsForProvider(provider)
@@ -2105,7 +2106,8 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 func (m *Model) clampModelsScroll() {
 	provider := m.modelsSelectedProvider()
 	st := m.modelsStatus[provider]
-	gridRows := modelsGridRows(m.modelsViewportHeight(), st, m.modelsLoginStatus, IsLocalProvider(provider))
+	_, providerIsLocal := m.modelsLocalUI[provider]
+	gridRows := modelsGridRows(m.modelsViewportHeight(), st, m.modelsLoginStatus, providerIsLocal || IsLocalProvider(provider))
 	selRow := m.modelsModelSel / modelGridCols
 	if selRow < m.modelsModelScroll {
 		m.modelsModelScroll = selRow
