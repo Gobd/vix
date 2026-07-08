@@ -105,6 +105,10 @@ func TestWriteThenLs(t *testing.T) {
 Handles: `h.Mock` (act as the model), `h.UI` (keys + screen + `Shot`),
 `h.FS` (inspect the workdir), `h.Daemon` (sandbox mode, vixd log).
 
+> Tip: the `write-e2e-test` skill (`.vix/skills/write-e2e-test/SKILL.md`, invoke
+> with `/write-e2e-test`) automates this workflow — it reads this README, mirrors
+> the closest existing scenario, and runs the suite to verify.
+
 ## Local dev (without Docker)
 
 You can iterate on a single scenario with prebuilt binaries on your machine

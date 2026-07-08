@@ -487,6 +487,97 @@ func TestOpenAI_StreamMessage_FunctionCallReassembly(t *testing.T) {
 	}
 }
 
+// TestOpenAI_StreamMessage_KeepsStreamedTextWhenCompletedOutputEmpty captures
+// the Codex backend shape where text is streamed but response.completed.output
+// is empty. The adapter must not persist an empty assistant message.
+func TestOpenAI_StreamMessage_KeepsStreamedTextWhenCompletedOutputEmpty(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sseHeader(w)
+		sseSend(w, "response.output_text.delta", `{"type":"response.output_text.delta","sequence_number":1,"output_index":0,"content_index":0,"item_id":"msg_1","delta":"I'll inspect."}`)
+		sseSend(w, "response.completed", `{"type":"response.completed","sequence_number":2,"response":{"id":"r","object":"response","created_at":1,"status":"completed","model":"gpt-5.5","output":[],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}},"parallel_tool_calls":false,"tool_choice":"auto","tools":[]}}`)
+	}))
+	defer srv.Close()
+
+	client, err := NewOpenAI(Config{
+		Credential: config.Credential{Value: "test-key"},
+		Model:      "gpt-5.5",
+		MaxTokens:  1024,
+		BaseURL:    srv.URL,
+		StreamIdle: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAI: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	msg, _, err := client.StreamMessage(ctx, nil, []MessageParam{
+		NewUserMessage(NewTextBlock("inspect")),
+	}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("StreamMessage: %v", err)
+	}
+
+	if msg.TextContent != "I'll inspect." {
+		t.Fatalf("TextContent = %q, want %q", msg.TextContent, "I'll inspect.")
+	}
+	if len(msg.Content) != 1 || msg.Content[0].Type != BlockText || msg.Content[0].Text != "I'll inspect." {
+		t.Fatalf("Content = %+v, want one streamed text block", msg.Content)
+	}
+	if msg.StopReason != StopEndTurn {
+		t.Errorf("StopReason = %s, want %s", msg.StopReason, StopEndTurn)
+	}
+}
+
+// TestOpenAI_StreamMessage_KeepsStreamedToolCallWhenCompletedOutputEmpty
+// captures the same Codex backend omission for function calls. Losing this
+// stream state makes the daemon treat a tool-producing turn as a final answer.
+func TestOpenAI_StreamMessage_KeepsStreamedToolCallWhenCompletedOutputEmpty(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sseHeader(w)
+		sseSend(w, "response.output_item.added", `{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"function_call","id":"item_1","call_id":"call_abc","name":"bash","arguments":"","status":"in_progress"}}`)
+		sseSend(w, "response.function_call_arguments.delta", `{"type":"response.function_call_arguments.delta","sequence_number":2,"output_index":0,"item_id":"item_1","delta":"{\"command\":\"ls\"}"}`)
+		sseSend(w, "response.completed", `{"type":"response.completed","sequence_number":3,"response":{"id":"r","object":"response","created_at":1,"status":"completed","model":"gpt-5.5","output":[],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}},"parallel_tool_calls":false,"tool_choice":"auto","tools":[]}}`)
+	}))
+	defer srv.Close()
+
+	client, err := NewOpenAI(Config{
+		Credential: config.Credential{Value: "test-key"},
+		Model:      "gpt-5.5",
+		MaxTokens:  1024,
+		BaseURL:    srv.URL,
+		StreamIdle: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAI: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	msg, _, err := client.StreamMessage(ctx, nil, []MessageParam{
+		NewUserMessage(NewTextBlock("list files")),
+	}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("StreamMessage: %v", err)
+	}
+
+	if msg.StopReason != StopToolUse {
+		t.Errorf("StopReason = %s, want %s", msg.StopReason, StopToolUse)
+	}
+	if len(msg.ToolCalls) != 1 {
+		t.Fatalf("ToolCalls len = %d, want 1", len(msg.ToolCalls))
+	}
+	tc := msg.ToolCalls[0]
+	if tc.ID != "call_abc" || tc.Name != "bash" {
+		t.Fatalf("ToolCall = %+v, want call_abc bash", tc)
+	}
+	if got := tc.Input["command"]; got != "ls" {
+		t.Errorf("ToolCall.Input[command] = %v, want %q", got, "ls")
+	}
+}
+
 // TestOpenAI_StopReasonMapping table-tests the canonical paths from
 // Responses API (status, incomplete_reason, hasToolCalls) into the
 // neutral StopReason enum.

@@ -190,6 +190,78 @@ func (c *Client) TriggerHook(id string) (sessionID, fireID string, err error) {
 	return sessionID, fireID, nil
 }
 
+// ListJobs returns the scheduled jobs (enabled and disabled) for the Jobs &
+// Triggers tab. Jobs are daemon-global, so no cwd filter is applied.
+func (c *Client) ListJobs() ([]protocol.JobSummary, error) {
+	resp, err := c.sendRequest(map[string]any{"command": "job.list"})
+	if err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(resp["jobs"])
+	if err != nil {
+		return nil, err
+	}
+	var out []protocol.JobSummary
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListHooks returns the lifecycle hooks (enabled and disabled) for the Jobs &
+// Triggers tab.
+func (c *Client) ListHooks() ([]protocol.HookSummary, error) {
+	resp, err := c.sendRequest(map[string]any{"command": "hook.list"})
+	if err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(resp["hooks"])
+	if err != nil {
+		return nil, err
+	}
+	var out []protocol.HookSummary
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SetJobEnabled enables or disables a scheduled job by id (Space toggle in the
+// Jobs & Triggers tab).
+func (c *Client) SetJobEnabled(id string, enabled bool) error {
+	resp, err := c.sendRequest(map[string]any{
+		"command": "job.set_enabled",
+		"id":      id,
+		"enabled": enabled,
+	})
+	if err != nil {
+		return err
+	}
+	if resp["status"] != "ok" {
+		msg, _ := resp["message"].(string)
+		return fmt.Errorf("job.set_enabled failed: %s", msg)
+	}
+	return nil
+}
+
+// SetHookEnabled enables or disables a lifecycle hook by id (Space toggle in the
+// Jobs & Triggers tab).
+func (c *Client) SetHookEnabled(id string, enabled bool) error {
+	resp, err := c.sendRequest(map[string]any{
+		"command": "hook.set_enabled",
+		"id":      id,
+		"enabled": enabled,
+	})
+	if err != nil {
+		return err
+	}
+	if resp["status"] != "ok" {
+		msg, _ := resp["message"].(string)
+		return fmt.Errorf("hook.set_enabled failed: %s", msg)
+	}
+	return nil
+}
+
 // ListSessions returns the persisted open sessions for cwd, so the TUI can
 // reopen them on launch. Sessions are stored globally (~/.vix/sessions) and
 // filtered by cwd daemon-side.

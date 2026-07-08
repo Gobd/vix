@@ -1,7 +1,6 @@
 package scenarios
 
 import (
-	"strings"
 	"testing"
 	"time"
 
@@ -145,29 +144,34 @@ func TestEditFile(t *testing.T) {
 	})
 }
 
-// TestEditMinified proves the minified-edit path formats valid source back.
-// files.edit_minified
+// TestEditMinified proves the projected minified-edit path: the model matches a
+// token in the minified view and the rename is spliced into the unminified
+// source in place, preserving the original formatting byte-for-byte (no
+// whole-file reformat). files.edit_minified
 func TestEditMinified(t *testing.T) {
 	h := harness.Start(t, harness.Meta{
 		Category: "files", Subcategory: "files.edit_minified",
-		Description: "edit_minified_file replaces a token and writes valid source back",
+		Description: "edit_minified_file splices a minified-matched rename into the unminified source",
 		Wire:        harness.WireMessages,
-	})
-	mustSeed(t, h, "mod.go", "package main\n\nfunc OldName() {}\n")
+	}, harness.WithHomeFile(".vix/config/languages.json",
+		`{"languages":[{"name":"go","extensions":[".go"],"vfs":{"enable":true,"keep_comments":true}}]}`))
+	mustSeed(t, h, "mod.go", "package main\n\n// OldName does nothing.\nfunc OldName() {}\n")
 	h.UI.WaitStable(400 * time.Millisecond)
 
 	h.Mock.Enqueue(
-		harness.ToolUse("read_file", `{"path":"mod.go"}`),
-		harness.ToolUse("edit_minified_file", `{"path":"mod.go","old_string":"OldName","new_string":"NewName"}`),
+		harness.ToolUse("read_minified_file", `{"path":"mod.go"}`),
+		harness.ToolUse("edit_minified_file", `{"path":"mod.go","old_string":"func OldName(","new_string":"func NewName("}`),
 		harness.Text("Renamed the function."),
 	)
-	h.UI.Type("read mod.go then rename OldName to NewName")
+	h.UI.Type("read mod.go minified then rename OldName to NewName")
 	h.UI.Enter()
 	h.UI.ResolveToolPrompts("Renamed the function.")
 
-	got := string(h.FS.Read("mod.go"))
-	if !strings.Contains(got, "NewName") || strings.Contains(got, "OldName") {
-		t.Fatalf("mod.go not renamed via minified edit: %q", got)
+	// The splice changes only the matched span; the blank line and the comment
+	// are preserved exactly because the file is never reformatted.
+	want := "package main\n\n// OldName does nothing.\nfunc NewName() {}\n"
+	if got := string(h.FS.Read("mod.go")); got != want {
+		t.Fatalf("mod.go = %q, want %q", got, want)
 	}
 }
 

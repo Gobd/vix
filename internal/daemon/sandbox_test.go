@@ -413,3 +413,45 @@ func TestSandboxedBashCmd_WaitDelay_BackgroundChild(t *testing.T) {
 		t.Fatal("cmd.Wait() blocked for >5s — WaitDelay is not working")
 	}
 }
+
+// TestSanitizedBashEnv_StripsGODEBUG verifies that the daemon-only GODEBUG
+// debug knob is removed from the env handed to bash steps, while unrelated
+// variables pass through untouched.
+func TestSanitizedBashEnv_StripsGODEBUG(t *testing.T) {
+	t.Setenv("GODEBUG", "schedtrace=5000")
+	t.Setenv("VIX_TEST_SENTINEL", "keepme")
+
+	env := sanitizedBashEnv()
+
+	var sawSentinel bool
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GODEBUG=") {
+			t.Errorf("GODEBUG leaked into sanitized env: %q", kv)
+		}
+		if kv == "VIX_TEST_SENTINEL=keepme" {
+			sawSentinel = true
+		}
+	}
+	if !sawSentinel {
+		t.Error("sanitizedBashEnv dropped an unrelated variable (VIX_TEST_SENTINEL)")
+	}
+}
+
+// TestRunBashWithContext_DoesNotLeakGODEBUG proves the end-to-end effect: a
+// bash step spawned by the workflow/job runner does not inherit GODEBUG, so a
+// Go child binary it invokes won't emit "SCHED ..." trace lines that would
+// contaminate the captured output.
+func TestRunBashWithContext_DoesNotLeakGODEBUG(t *testing.T) {
+	t.Setenv("GODEBUG", "schedtrace=5000")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	out, err := runBashWithContext(ctx, `echo "GODEBUG=[${GODEBUG:-unset}]"`, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("runBashWithContext failed: %v", err)
+	}
+	if !strings.Contains(out, "GODEBUG=[unset]") {
+		t.Errorf("expected GODEBUG to be unset in the bash step, got: %q", out)
+	}
+}

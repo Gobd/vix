@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -850,6 +851,7 @@ func daemonServicePaths() (path, content string, activate, deactivate []string, 
 	if err != nil {
 		return "", "", nil, nil, err
 	}
+	pathEnv := daemonServiceSearchPath(home)
 	switch runtime.GOOS {
 	case "darwin":
 		path = filepath.Join(home, "Library", "LaunchAgents", "com.getvix.vixd.plist")
@@ -862,13 +864,17 @@ func daemonServicePaths() (path, content string, activate, deactivate []string, 
 	<array>
 		<string>%s</string>
 	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key><string>%s</string>
+	</dict>
 	<key>RunAtLoad</key><true/>
 	<key>KeepAlive</key><true/>
 	<key>StandardOutPath</key><string>%s</string>
 	<key>StandardErrorPath</key><string>%s</string>
 </dict>
 </plist>
-`, daemonPath, filepath.Join(os.TempDir(), "vixd.log"), filepath.Join(os.TempDir(), "vixd.log"))
+`, xmlEscape(daemonPath), xmlEscape(pathEnv), xmlEscape(filepath.Join(os.TempDir(), "vixd.log")), xmlEscape(filepath.Join(os.TempDir(), "vixd.log")))
 		activate = []string{"launchctl", "load", "-w", path}
 		deactivate = []string{"launchctl", "unload", "-w", path}
 		return path, content, activate, deactivate, nil
@@ -879,11 +885,12 @@ Description=vix daemon
 
 [Service]
 ExecStart=%s
+Environment="%s"
 Restart=on-failure
 
 [Install]
 WantedBy=default.target
-`, daemonPath)
+`, daemonPath, systemdEscapeQuotedEnv("PATH="+pathEnv))
 		activate = []string{"systemctl", "--user", "enable", "--now", "vixd.service"}
 		deactivate = []string{"systemctl", "--user", "disable", "--now", "vixd.service"}
 		return path, content, activate, deactivate, nil
@@ -976,6 +983,114 @@ func findDaemon() (string, error) {
 	return "", fmt.Errorf("vixd not found next to the vix binary or in $PATH")
 }
 
+// daemonSearchPath builds a stable PATH for the daemon and any MCP/tool
+// subprocesses it launches. GUI/login-service starts often inherit a stripped
+// environment, so relying on the parent PATH makes node/npx, rg, and fd
+// disappear even when they are installed for the user.
+func daemonSearchPath() string {
+	home, _ := os.UserHomeDir()
+	return buildDaemonPath(os.Getenv("PATH"), home)
+}
+
+func daemonServiceSearchPath(home string) string {
+	return buildDaemonPath("", home)
+}
+
+func buildDaemonPath(existingPath, home string) string {
+	entries := append([]string{}, splitPathList(existingPath)...)
+
+	if runtime.GOOS == "darwin" {
+		entries = append(entries,
+			"/opt/homebrew/bin",
+			"/opt/homebrew/sbin",
+			"/usr/local/bin",
+		)
+	}
+
+	if home != "" {
+		if matches, err := filepath.Glob(filepath.Join(home, ".nvm", "versions", "node", "*", "bin")); err == nil {
+			sort.Sort(sort.Reverse(sort.StringSlice(matches)))
+			entries = append(entries, matches...)
+		}
+		for _, p := range []string{
+			filepath.Join(home, "go", "bin"),
+			filepath.Join(home, ".cargo", "bin"),
+			filepath.Join(home, ".local", "bin"),
+		} {
+			if isDir(p) {
+				entries = append(entries, p)
+			}
+		}
+	}
+
+	entries = append(entries, "/usr/bin", "/bin", "/usr/sbin", "/sbin")
+	return strings.Join(dedupeStrings(entries), string(os.PathListSeparator))
+}
+
+func splitPathList(pathValue string) []string {
+	var entries []string
+	for _, entry := range filepath.SplitList(pathValue) {
+		if entry != "" {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
+}
+
+func dedupeStrings(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	var out []string
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func isDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func daemonEnv(apiKey string) []string {
+	env := upsertEnv(os.Environ(), "PATH", daemonSearchPath())
+	if apiKey != "" {
+		env = upsertEnv(env, "ANTHROPIC_API_KEY", apiKey)
+	}
+	return env
+}
+
+func upsertEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return append(out, prefix+value)
+}
+
+func xmlEscape(s string) string {
+	return strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+		`"`, "&quot;",
+		"'", "&apos;",
+	).Replace(s)
+}
+
+func systemdEscapeQuotedEnv(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return s
+}
+
 // startDaemon spawns the daemon process, detached, for `vix daemon start`.
 // If apiKey is non-empty, it is injected into the subprocess environment.
 // The daemon's stdout and stderr are redirected to <logDir>/vixd.log so
@@ -1010,9 +1125,7 @@ func startDaemon(apiKey, logDir, socketPath, authTokenPath string) (*exec.Cmd, e
 	// group). The daemon is a shared, long-lived process that runs until
 	// signalled or stopped via `vix daemon stop`.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if apiKey != "" {
-		cmd.Env = append(os.Environ(), "ANTHROPIC_API_KEY="+apiKey)
-	}
+	cmd.Env = daemonEnv(apiKey)
 	logFileDir := logDir
 	if logFileDir == "" {
 		logFileDir = os.TempDir()

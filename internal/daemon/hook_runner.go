@@ -152,6 +152,8 @@ func (s *Server) recordHookRun(spec hooks.Spec, rec hooks.RunRecord) {
 		return
 	}
 	s.hookRegistry.RecordRun(spec.ID, rec)
+	// Surface the updated last-fired state to the Jobs & Triggers tab live.
+	s.broadcastJobsChanged()
 }
 
 // downgradeIfNonBlocking strips a non-blocking hook's veto powers: a deny is

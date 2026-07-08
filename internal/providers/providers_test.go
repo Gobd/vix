@@ -363,19 +363,20 @@ func TestValidationRejections(t *testing.T) {
 		return f
 	}
 	for _, name := range []string{"wire", "scheme", "http", "newver", "authhost"} {
-		if err := validate(base(name)); err == nil {
+		if err := validate(base(name), interpolate); err == nil {
 			t.Errorf("validate(%s): expected error, got nil", name)
 		}
 	}
 	// Sanity: the unmodified base validates.
-	if err := validate(base("")); err != nil {
+	if err := validate(base(""), interpolate); err != nil {
 		t.Errorf("validate(ok): unexpected error %v", err)
 	}
 }
 
-// TestLocalProviderValidation covers the local-provider relaxations: loopback
-// HTTP base URLs and keyless ("none") credential methods are allowed only
-// within their constraints.
+// TestLocalProviderValidation covers the local-provider relaxations: a local
+// provider may use a plain-HTTP base URL on any host (loopback or a LAN box),
+// and keyless ("none") credential methods are allowed only within their
+// constraints. Non-local providers still require HTTPS.
 func TestLocalProviderValidation(t *testing.T) {
 	mk := func(local bool, baseURL string, cred []CredentialMethod) File {
 		return File{
@@ -398,8 +399,10 @@ func TestLocalProviderValidation(t *testing.T) {
 		{"local loopback http ok", mk(true, "http://localhost:11434/v1", noneCred), false},
 		{"local 127.0.0.1 http ok", mk(true, "http://127.0.0.1:8080/v1", noneCred), false},
 		{"local https ok", mk(true, "https://ollama.example/v1", noneCred), false},
-		{"local non-loopback http rejected", mk(true, "http://192.168.1.10:11434/v1", noneCred), true},
+		{"local LAN hostname http ok", mk(true, "http://freyr.local:8080/v1", noneCred), false},
+		{"local LAN ip http ok", mk(true, "http://192.168.1.10:11434/v1", noneCred), false},
 		{"non-local loopback http rejected", mk(false, "http://localhost:11434/v1", keyCred), true},
+		{"non-local LAN http rejected", mk(false, "http://192.168.1.10:11434/v1", keyCred), true},
 		{"none with env_var rejected", mk(true, "http://localhost:11434/v1",
 			[]CredentialMethod{{Kind: CredNone, EnvVar: "X"}}), true},
 		{"none with keyring rejected", mk(true, "http://localhost:11434/v1",
@@ -408,7 +411,7 @@ func TestLocalProviderValidation(t *testing.T) {
 			[]CredentialMethod{{Kind: CredAPIKey, EnvVar: "X"}, {Kind: CredNone}}), false},
 	}
 	for _, c := range cases {
-		err := validate(c.f)
+		err := validate(c.f, interpolate)
 		if c.wantErr && err == nil {
 			t.Errorf("%s: expected error, got nil", c.name)
 		}
@@ -466,4 +469,47 @@ func resetDefault() {
 	defaultMu.Lock()
 	defaultReg = nil
 	defaultMu.Unlock()
+}
+
+// TestEmbeddedLoadIgnoresEnv asserts the embedded load path — which panics on
+// error in production via Default() — validates the shipped file against its
+// built-in defaults, ignoring the process environment. A runtime override of a
+// local provider's base URL, even a malformed one, must never break it. This is
+// the regression guard for the init-time panic reported when LLAMACPP_BASE_URL
+// pointed at a non-loopback host.
+func TestEmbeddedLoadIgnoresEnv(t *testing.T) {
+	for _, val := range []string{"http://freyr.local:8080/v1", "ftp://nope", "not a url"} {
+		t.Setenv("LLAMACPP_BASE_URL", val)
+		if _, err := loadEmbedded(); err != nil {
+			t.Errorf("LLAMACPP_BASE_URL=%q: loadEmbedded must ignore env, got %v", val, err)
+		}
+	}
+}
+
+// TestConfigureValidatesEffectiveURLs covers the Configure path, which resolves
+// ${env:...} against the real environment and reports problems gracefully (a
+// returned error, never a panic). A LAN host over plain HTTP is accepted for a
+// local provider; a malformed override is rejected.
+func TestConfigureValidatesEffectiveURLs(t *testing.T) {
+	t.Run("LAN host accepted", func(t *testing.T) {
+		t.Setenv("LLAMACPP_BASE_URL", "http://freyr.local:8080/v1")
+		t.Cleanup(resetDefault)
+		if err := Configure(nil); err != nil {
+			t.Fatalf("Configure with LAN llamacpp base URL: %v", err)
+		}
+		p, ok := Default().Lookup("llamacpp")
+		if !ok {
+			t.Fatal("llamacpp missing after Configure")
+		}
+		if got := p.Inference.Resolve().BaseURL; got != "http://freyr.local:8080/v1" {
+			t.Errorf("resolved base URL = %q, want LAN host", got)
+		}
+	})
+	t.Run("malformed override rejected gracefully", func(t *testing.T) {
+		t.Setenv("LLAMACPP_BASE_URL", "ftp://nope")
+		t.Cleanup(resetDefault)
+		if err := Configure(nil); err == nil {
+			t.Error("Configure: expected error for non-HTTP(S) base URL, got nil")
+		}
+	})
 }

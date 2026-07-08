@@ -273,6 +273,14 @@ func (s *Server) broadcastSessionsChanged() {
 	s.notifySubscribers()
 }
 
+// broadcastJobsChanged tells attached clients (and web UI subscribers) the jobs
+// or hooks list changed — a run started/finished, a spec was enabled/disabled,
+// or the spec directory was reloaded — so the Jobs & Triggers tab re-fetches.
+func (s *Server) broadcastJobsChanged() {
+	s.BroadcastEvent(protocol.SessionEvent{Type: "event.jobs_changed", Data: protocol.EventJobsChanged{}})
+	s.notifySubscribers()
+}
+
 // writeJobAlertSession persists a synthetic one-message session explaining a
 // failed job run. Zero tokens: the text is canned. It lands in open/ so the
 // next TUI launch lists it under Vix-initiated sessions.

@@ -71,6 +71,11 @@ type planRunRecord struct {
 			Type string `json:"type"`
 		} `json:"content"`
 	} `json:"messages"`
+	RetryNotices []struct {
+		Attempt    int    `json:"attempt"`
+		MaxRetries int    `json:"max_retries"`
+		Reason     string `json:"reason"`
+	} `json:"retry_notices"`
 }
 
 func planRunFor(h *harness.Harness, ref string) (planRunRecord, bool) {
@@ -175,4 +180,108 @@ func TestJobPlanSessionShape(t *testing.T) {
 	h.UI.Key("f1")
 	h.UI.WaitStable(500 * time.Millisecond)
 	h.UI.Shot("plan-session")
+}
+
+// planFailJobSpec is a single-agent inline-workflow job whose agent step is
+// driven into a terminal API failure (after retryable overloads) by the mock.
+const planFailJobSpec = `{
+  "id": "e2e-plan-fail",
+  "name": "Plan GitHub issues (get-vix/vix)",
+  "enabled": true,
+  "trigger": {"type": "at", "time": "2099-01-01T00:00:00Z"},
+  "prompt": "Plan open GitHub issues and pull requests for get-vix/vix.",
+  "cwd": "{{WORKDIR}}",
+  "created_by": "web",
+  "permissions": {"auto_write": true, "auto_dirs": true},
+  "workflow": {
+    "name": "e2e-plan-issues",
+    "entry_point": {"id": "plan"},
+    "steps": {
+      "plan": {
+        "type": "agent",
+        "agent": "general",
+        "prompt": "Investigate one open issue and report your findings."
+      }
+    }
+  }
+}`
+
+// TestJobPlanSessionFailureReplaysRetries drives the plan job's agent step into
+// a terminal API failure after two retryable overloads. It proves a *failed*
+// scheduled run behaves like a successful one for the reader: the full
+// transcript (the agent's tool_use/tool_result before it died) plus the retry
+// notices are persisted, the session drops to chat mode (so reopening never
+// warns the inline workflow "no longer exists"), and opening it replays the
+// conversation mid-flight — the same "API overloaded — retrying … (attempt
+// N/10)" lines an interactive workflow shows live.
+func TestJobPlanSessionFailureReplaysRetries(t *testing.T) {
+	h := harness.Start(t, harness.Meta{
+		Category:    "jobs",
+		Subcategory: "jobs.plan_session_failure",
+		Description: "a failed plan job keeps its full transcript + retry notices, reopens in chat mode, and replays the mid-flight conversation",
+		Wire:        harness.WireMessages,
+	},
+		harness.WithEnv("VIX_DISABLE_JOBS", "0"),
+		harness.WithHomeFile(".vix/jobs/e2e-plan-fail/job.json", planFailJobSpec),
+	)
+
+	// Turn 1: a real tool call (partial work). Turn 2: two retryable 529s (each
+	// surfaces a retry notice), then a non-retryable 400 → terminal failure.
+	h.Mock.Enqueue(
+		harness.ToolUse("bash", `{"command":"echo MIDFLIGHT-PROBE"}`),
+		harness.HTTPError(529, "overloaded, try again"),
+		harness.HTTPError(529, "overloaded, try again"),
+		harness.HTTPError(400, "bad request"),
+	)
+	h.UI.WaitStable(500 * time.Millisecond)
+
+	out, err := h.RunCLI("job", "run", "e2e-plan-fail")
+	if err != nil {
+		t.Fatalf("vix job run failed: %v\n%s", err, out)
+	}
+
+	var rec planRunRecord
+	if !pollUntil(60*time.Second, func() bool {
+		r, ok := planRunFor(h, "e2e-plan-fail")
+		if ok && r.JobStatus != "" {
+			rec = r
+			return true
+		}
+		return false
+	}) {
+		t.Fatalf("failed plan run not persisted; stdout=%q\n%s", out, h.Daemon.LogTail(120))
+	}
+
+	if rec.JobStatus != "error" {
+		t.Fatalf("job status = %q, want error\n%s", rec.JobStatus, h.Daemon.LogTail(120))
+	}
+	// A failed inline run still drops to chat mode — no "no longer exists".
+	if rec.SessionMode != "chat" {
+		t.Errorf("session_mode = %q, want chat after a failed inline run", rec.SessionMode)
+	}
+	if rec.ActiveWorkflow != "" {
+		t.Errorf("active_workflow = %q, want empty after a failed inline run", rec.ActiveWorkflow)
+	}
+	// The full transcript is kept: the agent's tool_use/tool_result from before
+	// the failure (not a text-only summary, not an empty conversation).
+	if !rec.hasToolBlocks() {
+		t.Errorf("expected the failed step's tool transcript; messages=%+v", rec.Messages)
+	}
+	// The two overload retries are persisted for replay.
+	if len(rec.RetryNotices) < 2 {
+		t.Fatalf("expected >=2 persisted retry notices, got %d (%+v)", len(rec.RetryNotices), rec.RetryNotices)
+	}
+
+	// Open the failed run in the TUI. Its replay shows the agent's partial work
+	// and the retry notices — the failed conversation, mid-flight.
+	h.UI.Key("f1")
+	h.UI.WaitFor("Vix-initiated")
+	for i := 0; i < 12; i++ {
+		h.UI.Key("down") // clamp the selection onto the (last) vix-initiated run
+	}
+	h.UI.Enter()
+	if !pollUntil(10*time.Second, func() bool { return h.UI.Contains("attempt 1/10") }) {
+		t.Fatalf("failed run replay did not show retry notices; screen:\n%s", h.UI.Snapshot())
+	}
+	h.UI.Shot("failed-workflow-midflight")
 }

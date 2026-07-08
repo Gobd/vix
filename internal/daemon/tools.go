@@ -672,6 +672,7 @@ func bashImpl(ctx context.Context, server *Server, command, cwd string, extraDir
 func runBashWithContext(ctx context.Context, command, cwd, input string, onLine func(string)) (string, error) {
 	cmd := exec.Command("bash", "-c", command)
 	cmd.Dir = cwd
+	cmd.Env = sanitizedBashEnv()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if input != "" {
 		cmd.Stdin = strings.NewReader(input)
@@ -1212,10 +1213,17 @@ func RegisterToolHandlers(s *Server) {
 		var output string
 		var lineOffset int
 		var err error
-		extMap, formatters, vfsConfigs := loadFormatterConfigs(defaultLanguagesPaths(s.homeVixDir))
+		extMap, _, vfsConfigs := loadFormatterConfigs(defaultLanguagesPaths(s.homeVixDir))
 		keepComments := keepCommentsForPath(extMap, vfsConfigs, path)
-		if vfsEnabledForPath(extMap, formatters, vfsConfigs, path) {
+		// The projected splice needs no formatter, so editing only requires
+		// vfs.enable (symmetric with read_minified_file). Fall back to a literal
+		// edit when VFS is off or the file can't be minified.
+		if vfsReadEnabledForPath(extMap, vfsConfigs, path) {
 			output, lineOffset, err = VfsEdit(cwd, allowedDirs, s.homeVixDir, path, oldString, newString, keepComments)
+			if err == errVFSUnsupported {
+				LogInfo("[vfs] edit_minified_file: %s not minifiable, falling back to edit_file", path)
+				output, lineOffset, err = editFileImpl(cwd, allowedDirs, path, oldString, newString, 0)
+			}
 		} else {
 			LogInfo("[vfs] edit_minified_file: VFS disabled for %s, falling back to edit_file", path)
 			output, lineOffset, err = editFileImpl(cwd, allowedDirs, path, oldString, newString, 0)

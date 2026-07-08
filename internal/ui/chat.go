@@ -133,6 +133,9 @@ func wrapLine(line string, maxWidth int) []string {
 	lastSpace := -1
 
 	for i, r := range runes {
+		if i < start {
+			continue
+		}
 		w := 1
 		if r >= 0x1100 { // rough check for wide chars
 			w = 2

@@ -257,18 +257,25 @@ func handleCallAgent(s *Server) http.HandlerFunc {
 		}
 
 		id := r.PathValue("id")
-		sess := s.getSession(id)
-		if sess == nil {
-			http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-			return
-		}
-
 		var body struct {
 			Agent  string `json:"agent"`
 			Prompt string `json:"prompt"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Agent == "" || body.Prompt == "" {
 			http.Error(w, `{"error":"agent and prompt are required"}`, http.StatusBadRequest)
+			return
+		}
+
+		sess, cleanup, err := s.sessionForWebCall(id)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+		if sess == nil {
+			http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
 			return
 		}
 

@@ -20,6 +20,7 @@ const (
 	TabKindSessions TabKind = iota // sessions list overview
 	TabKindChat                    // chat display for the selected session
 	TabKindModels                  // model + authentication management
+	TabKindJobs                    // scheduled jobs + lifecycle triggers
 	TabKindSettings                // global settings
 )
 
@@ -42,9 +43,10 @@ func formatRunningTime(d time.Duration) string {
 var waitingBadge = lipgloss.NewStyle().Background(colorSecondary).Foreground(lipgloss.Color("0")).Bold(true).Render(" Waiting for input ")
 
 // sessionGroupHeaderStyle styles the "User-initiated" / "Vix-initiated" group
-// headers in the Sessions tab: white text. The title itself is not
-// underlined — a short purple rule is drawn on the line below it instead.
-var sessionGroupHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+// headers in the Sessions tab (and the "Jobs" / "Triggers" headers in the Jobs
+// & Triggers tab): a purple-background title block mirroring the markdown H1
+// look (bold cream text on a violet background, one cell of padding each side).
+var sessionGroupHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("228")).Background(lipgloss.Color("63")).Padding(0, 1)
 
 // sessionColumnHeaderStyle styles the column header row ("Session", "Title",
 // "Running") of the Sessions tab.
@@ -105,12 +107,12 @@ func renderSessionsView(userSessions []*SessionState, vixRows []vixDisplayRow, w
 
 	header := fmt.Sprintf("  %-*s  %-*s  %-*s%-*s", colSession, "Session", colMessage, "Title", colRunning, "Running", badgeVisible, "")
 	headerRule := "  " + sessionHeaderRuleStyle.Render(strings.Repeat("─", colSession+colMessage+colRunning+4))
-	// groupHeader renders a group title with a short purple underline rule and
-	// a blank line below it, separating the title from the table below.
+	// groupHeader renders a group title as a purple-background block (matching
+	// the markdown H1 look) followed by a blank line separating it from the
+	// table below.
 	groupHeader := func(title string) []string {
 		return []string{
 			"  " + sessionGroupHeaderStyle.Render(title),
-			"  " + sessionHeaderRuleStyle.Render(strings.Repeat("─", 5)),
 			"",
 		}
 	}
@@ -229,7 +231,7 @@ func renderSessionsView(userSessions []*SessionState, vixRows []vixDisplayRow, w
 
 		// vixCols formats the three shared columns of a vix-initiated row from
 		// its record summary (id, Title, ran ago). A titled record shows the
-		// bare title (e.g. the per-item GitHub-plan title), with a ⚠️ marker when
+		// bare title (e.g. the per-item GitHub-plan title), with a ⚠ marker when
 		// the run failed; an untitled record (a raw alert) falls back to the
 		// "<job> · <status>  <first message>" form.
 		vixCols := func(sum protocol.SessionSummary) string {
@@ -258,7 +260,7 @@ func renderSessionsView(userSessions []*SessionState, vixRows []vixDisplayRow, w
 				}
 			}
 			// Rune-aware truncate, then pad to the column's display width so the
-			// Running column stays aligned even when a wide glyph (⚠️) is present.
+			// Running column stays aligned even when a wide glyph (⚠) is present.
 			msgCol = truncateLabel(msgCol, colMessage)
 			if pad := colMessage - lipgloss.Width(msgCol); pad > 0 {
 				msgCol += strings.Repeat(" ", pad)
@@ -315,11 +317,17 @@ func renderSessionsView(userSessions []*SessionState, vixRows []vixDisplayRow, w
 }
 
 // vixRowTitle returns the Title-column text for a titled vix-initiated row: the
-// bare session title, prefixed with a ⚠️ marker when the run failed (error or
+// bare session title, prefixed with a ⚠ marker when the run failed (error or
 // timeout). Callers handle the untitled (raw-alert) fallback separately.
+//
+// The marker is the plain warning sign U+26A0 (no U+FE0F variation selector):
+// lipgloss and terminals agree it is one cell wide, so the padded Title column
+// keeps the Running column aligned. The emoji-presentation "⚠️" measures as two
+// cells in lipgloss but renders as one in many terminals, which shifts the
+// Running column left on flagged rows.
 func vixRowTitle(sum protocol.SessionSummary) string {
 	if st := sum.JobStatus; st == "error" || st == "timeout" {
-		return "⚠️  " + sum.Title
+		return "⚠ " + sum.Title
 	}
 	return sum.Title
 }
@@ -338,6 +346,185 @@ func truncateLabel(s string, w int) string {
 		return "…"
 	}
 	return string(r[:w-1]) + "…"
+}
+
+// jobsTabDocURL is the documentation anchor advertised in the Jobs & Triggers
+// tab header so users can jump to the guide.
+const jobsTabDocURL = "https://getvix.dev/docs#guide-jobs"
+
+// nextRunLabel renders an RFC3339 future time as "in 12m" relative to now, or
+// "—" when empty/past/unparseable.
+func nextRunLabel(rfc string) string {
+	if rfc == "" {
+		return "—"
+	}
+	t, err := time.Parse(time.RFC3339, rfc)
+	if err != nil {
+		return "—"
+	}
+	until := time.Until(t)
+	if until <= 0 {
+		return "due"
+	}
+	return "in " + formatRunningTime(until)
+}
+
+// agoLabel renders an RFC3339 past time as "3m ago", or "never" when empty.
+func agoLabel(rfc string) string {
+	if rfc == "" {
+		return "never"
+	}
+	t, err := time.Parse(time.RFC3339, rfc)
+	if err != nil {
+		return "never"
+	}
+	return formatRunningTime(renderSince(t)) + " ago"
+}
+
+// jobsCell truncates s to w display columns and right-pads it so columns stay
+// aligned even with wide glyphs.
+func jobsCell(s string, w int) string {
+	s = truncateLabel(s, w)
+	if pad := w - lipgloss.Width(s); pad > 0 {
+		s += strings.Repeat(" ", pad)
+	}
+	return s
+}
+
+// enabledBox renders the on/off checkbox shown at the start of each Jobs &
+// Triggers row.
+func enabledBox(on bool) string {
+	if on {
+		return "[✓]"
+	}
+	return "[ ]"
+}
+
+// lastStatusLabel renders a last-run/last-fire status, prefixing a ⚠ marker for
+// failures so a problem run stands out in the Last column.
+func lastStatusLabel(when, status string) string {
+	if status == "error" || status == "timeout" || status == "deny" {
+		return "⚠ " + when
+	}
+	return when
+}
+
+// renderJobsView renders the Jobs & Triggers tab: a short header (description,
+// docs link, prompt example) followed by two grouped tables — scheduled Jobs
+// (with a live "running" spinner and next/last run) and lifecycle Triggers
+// (hooks, with their last fire). selectedRow indexes jobs first, then hooks.
+// spinnerFrame is the loading glyph shown for a job that is currently executing
+// (empty when the spinner is inactive); hooks never show a spinner.
+func renderJobsView(jobs []protocol.JobSummary, hooks []protocol.HookSummary, width, height int, s Styles, selectedRow int, spinnerFrame string) string {
+	innerWidth := width - 4
+	if innerWidth < 0 {
+		innerWidth = 0
+	}
+
+	descStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	hintStyle := lipgloss.NewStyle().Italic(true).Foreground(colorSecondary)
+	linkStyle := lipgloss.NewStyle().Foreground(colorPrimary)
+
+	var rows []string
+	rows = append(rows,
+		"",
+		"  "+descStyle.Render("Here is the list of all the scheduled jobs and triggers that vix runs for you."),
+		"  "+descStyle.Render("Press space to enable/disable the selected row."),
+		"  "+descStyle.Render("Docs: ")+linkStyle.Render(jobsTabDocURL),
+		"",
+		"  "+hintStyle.Render(`Tip: ask in chat — "Every weekday at 9am, audit my dependencies and open an issue for anything outdated."`),
+		"",
+	)
+
+	// Column widths: [box] Name  Schedule/Event  When  Last. Name flexes.
+	const colBox = 3
+	const colMid = 22
+	const colWhen = 12
+	const colLast = 16
+	colName := innerWidth - colBox - colMid - colWhen - colLast - 10
+	if colName < 12 {
+		colName = 12
+	}
+
+	header := fmt.Sprintf("    %-*s  %-*s  %-*s  %-*s",
+		colName, "Name", colMid, "Schedule / Event", colWhen, "Next", colLast, "Last")
+	headerRule := "  " + sessionHeaderRuleStyle.Render(strings.Repeat("─", min(colBox+colName+colMid+colWhen+colLast+8, innerWidth)))
+
+	groupHeader := func(title string) {
+		if len(rows) > 0 {
+			rows = append(rows, "")
+		}
+		rows = append(rows,
+			"  "+sessionGroupHeaderStyle.Render(title),
+			"",
+			sessionColumnHeaderStyle.Render(header),
+			headerRule,
+		)
+	}
+
+	rowIdx := 0
+	// appendRow renders one selectable row. running drives the spinner lead
+	// (jobs only). plain is the box+columns text.
+	appendRow := func(plain string, running bool) {
+		switch {
+		case rowIdx == selectedRow:
+			lead, leadStyle := "  ", sessionRowSelectedStyle
+			if running {
+				lead = spinnerFrame + " "
+				leadStyle = leadStyle.Foreground(colorPrimary)
+			}
+			rows = append(rows, leadStyle.Render(lead)+sessionRowSelectedStyle.Render(plain))
+		case running:
+			rows = append(rows, sessionsSpinnerStyle.Render(spinnerFrame)+" "+plain)
+		default:
+			rows = append(rows, "  "+plain)
+		}
+		rowIdx++
+	}
+
+	// --- Jobs group ---
+	groupHeader("Jobs")
+	if len(jobs) == 0 {
+		rows = append(rows, "  "+descStyle.Italic(true).Render("No scheduled jobs yet."))
+	}
+	for _, j := range jobs {
+		running := j.Running && spinnerFrame != ""
+		when := nextRunLabel(j.NextRunAt)
+		if j.Running {
+			when = "running"
+		} else if !j.Enabled {
+			when = "off"
+		}
+		last := lastStatusLabel(agoLabel(j.LastRunAt), j.LastStatus)
+		plain := enabledBox(j.Enabled) + " " +
+			jobsCell(j.Name, colName) + "  " +
+			jobsCell(j.Schedule, colMid) + "  " +
+			jobsCell(when, colWhen) + "  " +
+			jobsCell(last, colLast)
+		appendRow(plain, running)
+	}
+
+	// --- Triggers (hooks) group ---
+	groupHeader("Triggers")
+	if len(hooks) == 0 {
+		rows = append(rows, "  "+descStyle.Italic(true).Render("No lifecycle hooks yet."))
+	}
+	for _, h := range hooks {
+		event := h.Event
+		if h.Matcher != "" && h.Matcher != "*" {
+			event += " · " + h.Matcher
+		}
+		last := lastStatusLabel(agoLabel(h.LastFiredAt), h.LastStatus)
+		plain := enabledBox(h.Enabled) + " " +
+			jobsCell(h.Name, colName) + "  " +
+			jobsCell(event, colMid) + "  " +
+			jobsCell("—", colWhen) + "  " +
+			jobsCell(last, colLast)
+		appendRow(plain, false) // hooks never show a running spinner
+	}
+
+	content := strings.Join(rows, "\n")
+	return s.ViewportFocusedStyle.Width(width).Height(height).Render(content)
 }
 
 // settingsItem identifies a selectable row in the Settings tab. The order here
@@ -1103,7 +1290,8 @@ func renderTabBar(activeTab TabKind, width int, s Styles, viewportFocused bool, 
 		{" Sessions [F1] ", TabKindSessions},
 		{" Workspace [F2] ", TabKindChat},
 		{" Models [F3] ", TabKindModels},
-		{" Settings [F4] ", TabKindSettings},
+		{" Jobs & Triggers [F4] ", TabKindJobs},
+		{" Settings [F5] ", TabKindSettings},
 	}
 
 	var sepStyle lipgloss.Style

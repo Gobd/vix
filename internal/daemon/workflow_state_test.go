@@ -238,6 +238,83 @@ func TestExecuteWorkflow_WorkflowDirResolves(t *testing.T) {
 	}
 }
 
+// TestExecuteWorkflow_BashStepRoutesOnOwnOutput pins that a bash step can branch
+// on its OWN output via execute_if. Regression test: vars used to be snapshotted
+// before the step ran, so `$(step.self)` was left unsubstituted and
+// evaluateExecuteIf ran it as an empty command substitution — making the guard
+// `[[ "$(step.select)" != *NO_TODO* ]]` wrongly true and routing into the
+// follow-up step even when the step emitted NO_TODO.
+func TestExecuteWorkflow_BashStepRoutesOnOwnOutput(t *testing.T) {
+	mkWF := func(selectCmd string) *WorkflowDef {
+		return &WorkflowDef{
+			Name:       "self-route",
+			EntryPoint: StepRef{ID: "select"},
+			Steps: map[string]WorkflowStepDef{
+				"select": {
+					Type:    "bash",
+					Command: selectCmd,
+					NextSteps: []StepRef{
+						{ID: "detail", ExecuteIf: `[[ "$(step.select)" != *NO_TODO* ]]`},
+					},
+				},
+				"detail": {Type: "bash", Command: "echo ran-detail:$(step.select)"},
+			},
+		}
+	}
+
+	// Case A: select emits NO_TODO → guard is false → detail must be skipped.
+	sA := newWorkflowTestSession(t)
+	if err := sA.executeWorkflow(sA.ctx, mkWF("echo NO_TODO"), "obj", nil); err != nil {
+		t.Fatalf("executeWorkflow (skip case): %v", err)
+	}
+	if out := streamedText(drainEvents(sA)); strings.Contains(out, "ran-detail") {
+		t.Errorf("detail must be skipped when select emits NO_TODO, got:\n%s", out)
+	}
+
+	// Case B: select emits a real value → guard is true → detail runs and sees
+	// the step's own output.
+	sB := newWorkflowTestSession(t)
+	if err := sB.executeWorkflow(sB.ctx, mkWF("echo https://example.test/issues/7"), "obj", nil); err != nil {
+		t.Fatalf("executeWorkflow (take case): %v", err)
+	}
+	if out := streamedText(drainEvents(sB)); !strings.Contains(out, "ran-detail:https://example.test/issues/7") {
+		t.Errorf("detail should run and see select's output, got:\n%s", out)
+	}
+}
+
+// TestExecuteWorkflow_BashStepMultiBranchOnOwnOutput pins that when a bash step
+// has multiple next_steps each guarded on its own output, exactly the matching
+// branch runs.
+func TestExecuteWorkflow_BashStepMultiBranchOnOwnOutput(t *testing.T) {
+	wf := &WorkflowDef{
+		Name:       "self-multi",
+		EntryPoint: StepRef{ID: "pick"},
+		Steps: map[string]WorkflowStepDef{
+			"pick": {
+				Type:    "bash",
+				Command: "echo NO_TODO",
+				NextSteps: []StepRef{
+					{ID: "work", ExecuteIf: `[[ "$(step.pick)" != *NO_TODO* ]]`},
+					{ID: "idle", ExecuteIf: `[[ "$(step.pick)" == *NO_TODO* ]]`},
+				},
+			},
+			"work": {Type: "bash", Command: "echo did-work"},
+			"idle": {Type: "bash", Command: "echo went-idle"},
+		},
+	}
+	s := newWorkflowTestSession(t)
+	if err := s.executeWorkflow(s.ctx, wf, "obj", nil); err != nil {
+		t.Fatalf("executeWorkflow: %v", err)
+	}
+	out := streamedText(drainEvents(s))
+	if !strings.Contains(out, "went-idle") {
+		t.Errorf("expected the NO_TODO branch (idle) to run, got:\n%s", out)
+	}
+	if strings.Contains(out, "did-work") {
+		t.Errorf("the non-matching branch (work) must not run, got:\n%s", out)
+	}
+}
+
 // TestSessionJobDirIsAllowed pins that a job directory living outside both cwd
 // and $HOME (e.g. under a --config-dir override) becomes accessible once the job
 // runner marks it allowed — so a run can persist its memory file there.

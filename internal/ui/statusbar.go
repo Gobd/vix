@@ -59,6 +59,11 @@ func renderStatusBar(
 			{"Tab", "Switch focus"},
 			{"Enter", "Select"},
 		}
+	case TabKindJobs:
+		defs = []shortcut{
+			{"↑↓", "navigate"},
+			{"space", "enable/disable"},
+		}
 	case TabKindSettings:
 		defs = []shortcut{
 			{"↑↓", "navigate"},

@@ -22,12 +22,12 @@ import (
 // SubagentConfig defines how a subagent behaves.
 type SubagentConfig struct {
 	Name         string   `json:"name"`
-	Description  string   `json:"description,omitempty"`   // short description for LLM tool listing
-	Model        string   `json:"model,omitempty"`         // empty = inherit parent model
-	Effort       string   `json:"effort,omitempty"`        // "adaptive", "low", "medium", "high", "max", or "" (inherit)
-	Tools        []string `json:"tools,omitempty"`         // tool name filter; nil = all tools
-	MaxTurns     int      `json:"max_turns,omitempty"`     // 0 = default (20)
-	MaxTokens    int      `json:"max_tokens,omitempty"`    // per-LLM-call output token cap; 0 = default (32768)
+	Description  string   `json:"description,omitempty"` // short description for LLM tool listing
+	Model        string   `json:"model,omitempty"`       // empty = inherit parent model
+	Effort       string   `json:"effort,omitempty"`      // "adaptive", "low", "medium", "high", "max", or "" (inherit)
+	Tools        []string `json:"tools,omitempty"`       // tool name filter; nil = all tools
+	MaxTurns     int      `json:"max_turns,omitempty"`   // 0 = default (20)
+	MaxTokens    int      `json:"max_tokens,omitempty"`  // per-LLM-call output token cap; 0 = default (32768)
 	SystemPrompt string   `json:"system_prompt,omitempty"`
 }
 
@@ -156,6 +156,7 @@ func RunSubagent(
 
 	var totalInputTokens, totalOutputTokens, totalCacheCreation, totalCacheRead int64
 	var totalElapsed time.Duration
+	deferredToolNudges := 0
 
 	for turn := 0; turn < maxTurns; turn++ {
 		if ctx.Err() != nil {
@@ -206,6 +207,11 @@ func RunSubagent(
 		messages = append(messages, msg.ToParam())
 
 		if msg.StopReason == llm.StopEndTurn {
+			if deferredToolNudges < maxDeferredToolNudges && shouldNudgeDeferredToolUse(msg, tools) {
+				deferredToolNudges++
+				messages = append(messages, deferredToolUseNudge())
+				continue
+			}
 			text := extractTextFromMessage(msg)
 			return &SubagentResult{
 				Output:              text,

@@ -344,13 +344,19 @@ type EventError struct {
 // into a wire-stable shape owned by this package (so neither protocol nor the
 // TUI needs to import the daemon's llm types).
 type ReplayBlock struct {
-	Kind     string         `json:"kind"` // "text" | "thinking" | "tool_use" | "tool_result"
+	Kind     string         `json:"kind"` // "text" | "thinking" | "tool_use" | "tool_result" | "retry"
 	Text     string         `json:"text,omitempty"`
 	ToolID   string         `json:"tool_id,omitempty"`
 	ToolName string         `json:"tool_name,omitempty"`
 	Input    map[string]any `json:"input,omitempty"`
 	Output   string         `json:"output,omitempty"`
 	IsError  bool           `json:"is_error,omitempty"`
+	// Retry-notice fields (Kind == "retry"): a transient API error that was
+	// retried during a workflow run, persisted so a reopened session replays
+	// the same notice an interactive run shows live. Text carries the reason.
+	Attempt    int `json:"attempt,omitempty"`
+	MaxRetries int `json:"max_retries,omitempty"`
+	WaitSecs   int `json:"wait_secs,omitempty"`
 }
 
 // ReplayMessage is one turn of a replayed conversation.
@@ -470,6 +476,43 @@ type EventJobDone struct {
 // changed outside their own connection (a job run was persisted or swept), so
 // they should re-fetch session.list.
 type EventSessionsChanged struct{}
+
+// EventJobsChanged tells attached clients the scheduled jobs or lifecycle hooks
+// changed — a run started or finished, a spec was enabled/disabled, or the spec
+// directory was hot-reloaded — so the Jobs & Triggers tab should re-fetch
+// job.list and hook.list.
+type EventJobsChanged struct{}
+
+// JobSummary is the lightweight projection of a scheduled job returned by the
+// job.list RPC, carrying just enough to populate the Jobs & Triggers tab.
+type JobSummary struct {
+	ID      string `json:"id"`
+	Name    string `json:"name,omitempty"`
+	Enabled bool   `json:"enabled"`
+	// TriggerType is "cron" or "at". Schedule is a human-readable rendering of
+	// the trigger (the cron expression, or "at <time>" for one-shots).
+	TriggerType string `json:"trigger_type,omitempty"`
+	Schedule    string `json:"schedule,omitempty"`
+	NextRunAt   string `json:"next_run_at,omitempty"` // RFC3339, empty when not scheduled
+	LastRunAt   string `json:"last_run_at,omitempty"` // RFC3339, empty when never run
+	LastStatus  string `json:"last_status,omitempty"` // ok | error | skipped | timeout
+	Running     bool   `json:"running,omitempty"`     // a run is currently in flight
+	CreatedBy   string `json:"created_by,omitempty"`
+}
+
+// HookSummary is the lightweight projection of a lifecycle hook returned by the
+// hook.list RPC, carrying just enough to populate the Jobs & Triggers tab.
+type HookSummary struct {
+	ID          string `json:"id"`
+	Name        string `json:"name,omitempty"`
+	Enabled     bool   `json:"enabled"`
+	Event       string `json:"event,omitempty"` // the lifecycle event it subscribes to
+	Matcher     string `json:"matcher,omitempty"`
+	Mode        string `json:"mode,omitempty"`          // sync | async
+	LastFiredAt string `json:"last_fired_at,omitempty"` // RFC3339, empty when never fired
+	LastStatus  string `json:"last_status,omitempty"`
+	CreatedBy   string `json:"created_by,omitempty"`
+}
 
 // --- Workflow events ---
 

@@ -144,9 +144,12 @@ type JobSnapshot struct {
 
 	// Runtime history, attached from the job's persisted State. LastRunAt is the
 	// zero time when the job has never run; RecentRuns is newest-last, capped at
-	// maxRecentRuns.
+	// maxRecentRuns. NextRunAt is the next scheduled fire (zero when disabled,
+	// completed, or auto-disabled). Running is true while a run is in flight.
+	NextRunAt  time.Time   `json:"next_run_at,omitempty"`
 	LastRunAt  time.Time   `json:"last_run_at,omitempty"`
 	LastStatus string      `json:"last_status,omitempty"`
+	Running    bool        `json:"running,omitempty"`
 	RecentRuns []RunRecord `json:"recent_runs,omitempty"`
 }
 
@@ -176,10 +179,12 @@ func (s *Scheduler) Snapshot() []JobSnapshot {
 			CreatedBy:      spec.CreatedBy,
 		}
 		if st := s.state[id]; st != nil {
+			snap.NextRunAt = st.NextRunAt
 			snap.LastRunAt = st.LastRunAt
 			snap.LastStatus = st.LastStatus
 			snap.RecentRuns = append([]RunRecord(nil), st.RecentRuns...)
 		}
+		snap.Running = s.running[id]
 		out = append(out, snap)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -193,6 +198,20 @@ func (s *Scheduler) Reload() {
 	case s.reloadCh <- struct{}{}:
 	default:
 	}
+}
+
+// SetEnabled flips a job spec's `enabled` field on disk and reschedules. The
+// edit is surgical — only the enabled value is rewritten via the store, so the
+// rest of the user's job.json (field order, formatting, unknown keys) is
+// preserved. Reconcile applies the change to the timer loop synchronously (so a
+// Snapshot right after reflects it) and notifies attached clients.
+func (s *Scheduler) SetEnabled(id string, enabled bool) error {
+	if err := s.store.SetEnabled(id, enabled); err != nil {
+		return err
+	}
+	s.reconcile(time.Now())
+	s.Reload()
+	return nil
 }
 
 // CreateJob validates, persists, and schedules a new job spec. The spec must
@@ -265,6 +284,7 @@ func (s *Scheduler) RunNow(ctx context.Context, id, runID string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	s.notifyJobsChanged()
 	go s.execute(WithRunID(ctx, runID), spec, true)
 	return nil
 }
@@ -454,6 +474,7 @@ func (s *Scheduler) reconcile(now time.Time) {
 
 	s.persistLocked()
 	s.mu.Unlock()
+	s.notifyJobsChanged()
 }
 
 // maybeNudgeLocked emits a one-time event.job_nudge the first time a
@@ -550,6 +571,10 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 		specsByID[id] = s.specs[id]
 	}
 	s.mu.Unlock()
+
+	if len(due) > 0 {
+		s.notifyJobsChanged()
+	}
 
 	for _, id := range due {
 		go s.execute(ctx, specsByID[id], false)
@@ -656,6 +681,7 @@ func (s *Scheduler) applyResult(spec Spec, res RunResult, manual bool, dur time.
 	if manual {
 		s.persistLocked()
 		s.mu.Unlock()
+		s.notifyJobsChanged()
 		if res.Status != StatusSkipped {
 			s.notifyEvent("event.job_done", map[string]any{
 				"job_id":     spec.ID,
@@ -702,6 +728,7 @@ func (s *Scheduler) applyResult(spec Spec, res RunResult, manual bool, dur time.
 	autoDisabled := st.AutoDisabled
 	s.persistLocked()
 	s.mu.Unlock()
+	s.notifyJobsChanged()
 
 	// Skips are silent by design (cheap-poll rule, heartbeat OK, empty
 	// whiteboard): nothing happened, so nobody is notified.
@@ -748,6 +775,13 @@ func (s *Scheduler) notifyEvent(eventType string, data any) {
 	if s.notify != nil {
 		s.notify(eventType, data)
 	}
+}
+
+// notifyJobsChanged tells attached clients the jobs list changed (a run started
+// or finished, a spec was enabled/disabled, or the directory was reloaded) so
+// the Jobs & Triggers tab re-fetches. Best-effort; nil-safe via notifyEvent.
+func (s *Scheduler) notifyJobsChanged() {
+	s.notifyEvent("event.jobs_changed", map[string]any{})
 }
 
 // effectivelyEmpty reports whether resolved prompt text carries no actionable

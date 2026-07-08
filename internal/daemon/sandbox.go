@@ -152,6 +152,35 @@ func seatbeltProfile(cwd string, extraDirs []string) string {
 	return b.String()
 }
 
+// bashEnvBlocklist names environment variables that must not leak from the
+// daemon into the bash commands it spawns (workflow/job steps, the bash tool).
+// GODEBUG in particular is a vixd-only debug knob, but it makes every Go child
+// binary a step invokes (e.g. the GitHub CLI) emit runtime trace lines such as
+// "SCHED 0ms: gomaxprocs=..." on stderr. Those lines then contaminate the
+// captured step output and corrupt downstream parsing (e.g. a URL list).
+var bashEnvBlocklist = map[string]bool{
+	"GODEBUG": true,
+}
+
+// sanitizedBashEnv returns the current process environment with daemon-only
+// debug variables (see bashEnvBlocklist) removed, so the external tools a bash
+// step runs start from a clean slate.
+func sanitizedBashEnv() []string {
+	src := os.Environ()
+	out := make([]string, 0, len(src))
+	for _, kv := range src {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		if bashEnvBlocklist[key] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
 // sandboxedBashCmd builds an exec.Cmd that runs a bash command inside the
 // appropriate sandbox for the current platform. Falls back to a plain bash
 // invocation if no sandbox is available.
@@ -166,6 +195,7 @@ func sandboxedBashCmd(ctx context.Context, command, cwd string, extraDirs []stri
 		profile := seatbeltProfile(cwd, extraDirs)
 		cmd := exec.CommandContext(ctx, "sandbox-exec", "-p", profile, "bash", "-c", command)
 		cmd.Dir = cwd
+		cmd.Env = sanitizedBashEnv()
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		cmd.WaitDelay = 2 * time.Second
 		cmd.Cancel = func() error {
@@ -207,12 +237,13 @@ func sandboxedBashCmd(ctx context.Context, command, cwd string, extraDirs []stri
 			return err
 		}
 		// Propagate env through bwrap
-		cmd.Env = os.Environ()
+		cmd.Env = sanitizedBashEnv()
 		return cmd
 
 	default:
 		cmd := exec.CommandContext(ctx, "bash", "-c", command)
 		cmd.Dir = cwd
+		cmd.Env = sanitizedBashEnv()
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		cmd.WaitDelay = 2 * time.Second
 		cmd.Cancel = func() error {

@@ -11,35 +11,42 @@ import (
 // control "Plan GitHub issues" job (inline workflow githubIssuePlanWorkflow).
 // It pins the runtime GitHub-access contract the workflow must honour:
 //
-//	detect → deny | fetch → nag | plan
+//	detect → deny | fetch → nag | select → detail → plan → mark_done
 //
-//   - gh signed in   → fetch via `gh`, then `plan` (the plan appears in the
-//     session; nothing is posted back to GitHub).
+//   - gh signed in   → fetch via `gh`, then `select`/`detail`/`plan` (the plan
+//     appears in the session; nothing is posted back to GitHub).
 //   - gh missing/unauth but the public API reachable → fetch via `curl`, a `nag`
-//     reminding the user to install + `gh auth login`, then `plan`.
-//   - no access at all → `deny` prints a clear error and exits non-zero, so the
-//     run is recorded as failed with that message and no plan is attempted.
+//     reminding the user to install + `gh auth login`, then select/detail/plan.
+//   - no access at all (or a missing coreutil: grep/sort/cut/mv) → `deny` prints
+//     a clear error and exits non-zero, so the run is recorded as failed with
+//     that message and no plan is attempted.
 //
-// The `plan` step also maintains a memory file at $(workflow.dir)/memory.md — the
-// run's own job directory (~/.vix/jobs/<id>) surfaced to the workflow as the
-// daemon-resolved $(workflow.dir) variable. The model reads it, claims EXACTLY
-// ONE not-yet-addressed open item per run (marking it before it starts), drafts
-// a plan for that single item, marks it addressed when done, and trims numbers
-// that have dropped off the open list (closed/merged). The planning
-// instructions are baked into the plan step itself (the job's prompt is only a
-// label), so the run does not depend on a user-supplied prompt.
+// Item selection is deterministic and lives in bash, NOT in the agent. A
+// line-based tracker file at $(workflow.dir)/tracker.tsv — the run's own job
+// directory (~/.vix/jobs/<id>) surfaced to the workflow as the daemon-resolved
+// $(workflow.dir) variable — holds one "<state>\t<url>" line per item, with no
+// jq or any other JSON dependency. The `select` step reconciles it against the
+// freshly fetched items (append new opens as "todo", drop closed/merged), then
+// claims EXACTLY ONE "todo" (flipping it to "doing") and prints its URL — or
+// "NO_TODO", in which case the graph ends before `plan`, so the run is skipped
+// with no session. `detail` fetches just that one item; `plan` investigates it
+// (write tools denied — it never touches the tracker); `mark_done` flips the
+// item to "done" whether the agent succeeded (next_steps) or failed (on_error),
+// so a failed run still marks the item addressed and it is never retried in a
+// loop. The planning instructions are baked into the plan step itself (the job's
+// prompt is only a label), so the run does not depend on a user-supplied prompt.
 //
 // Skipped: scheduled-job runs execute in the daemon's scheduler, not through the
 // TUI, and the harness has no job-run primitive (no /api/jobs driver, no way to
 // fire a trigger and read back the Vix-initiated session). The branch logic is
 // covered today by the builder's vitest unit tests
 // (internal/daemon/web/source/src/data/jobWorkflows.test.ts), and $(workflow.dir)
-// resolution + the memory-file-aware watcher by the workflow engine's Go tests.
+// resolution + the tracker-file-aware watcher by the workflow engine's Go tests.
 // Enable this once the harness can create + run a job and surface its session
 // transcript.
 //
 // When enabled it proves, per branch, that the right path runs and the plan (or
-// error/nag) lands in the run's session, and that the memory file under
+// error/nag) lands in the run's session, and that the tracker file under
 // $(workflow.dir) is created/updated/trimmed across consecutive runs. The body
 // below seeds the gh/curl shims the three branches switch on; the trigger +
 // transcript read-back is the missing piece.
@@ -47,7 +54,7 @@ func TestGithubPlanJobAccessBranches(t *testing.T) {
 	meta := harness.Meta{
 		Category:    "jobs",
 		Subcategory: "jobs.github_plan",
-		Description: "the GitHub plan job picks gh/API/none, shows its framed findings in a per-item-titled session, and tracks planned items in $(workflow.dir)/memory.md",
+		Description: "the GitHub plan job picks gh/API/none, deterministically claims one todo (skipping with no session when there's none), shows its framed findings in a per-item-titled session, and tracks items in $(workflow.dir)/tracker.tsv",
 		Wire:        harness.WireMessages,
 	}
 	harness.SkipScenario(t, meta, "branch matrix needs the frontend-generated githubIssuePlanWorkflow JSON + gh/curl shims; the daemon-side title/transcript/chat-mode are covered live by jobs.plan_session (jobs_plan_session_test.go)")
@@ -81,9 +88,9 @@ func TestGithubPlanJobAccessBranches(t *testing.T) {
 	//   - keeps the FULL working transcript — the plan-step prompt, the agent's
 	//     tool_use/tool_result turns, and the final findings — not a text-only
 	//     summary, so a follow-up turn is grounded in the real tool calls.
-	// Also assert that after a run the memory file at ~/.vix/jobs/<id>/memory.md
-	// records exactly the one item the run claimed, that a second run claims a
-	// different open item, and that a closed item's number is trimmed from the
-	// file.
+	// Also assert that after a run the tracker file at ~/.vix/jobs/<id>/tracker.tsv
+	// records the claimed item as "done" (even if the agent failed), that a second
+	// run claims a different open item, and that a closed item's line is trimmed
+	// from the file.
 	_ = h.UI.Snapshot()
 }

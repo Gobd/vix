@@ -4,11 +4,12 @@ import (
 	"strings"
 	"testing"
 
+	"charm.land/lipgloss/v2"
 	"github.com/get-vix/vix/internal/protocol"
 )
 
 // TestVixRowTitle covers the bare-title Sessions-tab rendering: a clean title
-// for ok/skipped runs and a ⚠️ marker for failures. The job-id/status prefix is
+// for ok/skipped runs and a ⚠ marker for failures. The job-id/status prefix is
 // gone for titled rows.
 func TestVixRowTitle(t *testing.T) {
 	title := "[Plan GitHub issues (get-vix/vix)] Addressing issue #29 — env bug"
@@ -20,8 +21,8 @@ func TestVixRowTitle(t *testing.T) {
 		{"ok run is bare title", "ok", title},
 		{"skipped run is bare title", "skipped", title},
 		{"empty status is bare title", "", title},
-		{"error run is flagged", "error", "⚠️  " + title},
-		{"timeout run is flagged", "timeout", "⚠️  " + title},
+		{"error run is flagged", "error", "⚠ " + title},
+		{"timeout run is flagged", "timeout", "⚠ " + title},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -37,6 +38,58 @@ func TestVixRowTitle(t *testing.T) {
 		})
 	}
 }
+
+// TestVixRowTitleMarkerWidth guards the alignment fix: the warning marker must
+// measure exactly two display cells ("⚠" + " ") in lipgloss so the padded Title
+// column keeps the Running column aligned across flagged and clean rows. The
+// emoji-presentation "⚠️" (with U+FE0F) measures three here, which regressed the
+// layout, so assert the variation selector is absent.
+func TestVixRowTitleMarkerWidth(t *testing.T) {
+	flagged := vixRowTitle(protocol.SessionSummary{Title: "x", JobStatus: "error"})
+	clean := vixRowTitle(protocol.SessionSummary{Title: "x", JobStatus: "ok"})
+
+	if strings.ContainsRune(flagged, '\uFE0F') {
+		t.Fatalf("marker must not contain the U+FE0F variation selector: %q", flagged)
+	}
+	if got := lipgloss.Width(flagged) - lipgloss.Width(clean); got != 2 {
+		t.Errorf("marker width = %d cells, want 2", got)
+	}
+}
+
+// TestRenderJobsView covers the Jobs & Triggers tab: the header blurb (with the
+// docs link and prompt example), the two grouped sections, the enabled
+// checkboxes, and the running spinner shown for jobs only.
+func TestRenderJobsView(t *testing.T) {
+	s := NewStyles(true)
+	jobs := []protocol.JobSummary{
+		{ID: "alpha", Name: "Alpha", Enabled: true, Schedule: "@every 1m", NextRunAt: "2999-01-01T00:00:00Z"},
+		{ID: "beta", Name: "Beta", Enabled: false, Schedule: "@daily"},
+		{ID: "gamma", Name: "Gamma", Enabled: true, Running: true},
+	}
+	hooks := []protocol.HookSummary{
+		{ID: "guard", Name: "Guard", Enabled: true, Event: "PreToolUse"},
+	}
+	out := renderJobsView(jobs, hooks, 120, 40, s, 0, "⠙")
+
+	for _, want := range []string{
+		jobsTabDocURL,          // docs link
+		"Every weekday at 9am", // prompt example
+		"Jobs", "Triggers",     // group headers
+		"Alpha", "Beta", "Gamma", "Guard",
+		"[✓]", "[ ]", // enabled + disabled checkboxes
+		"PreToolUse",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("renderJobsView output missing %q\n---\n%s", want, out)
+		}
+	}
+
+	// The running job (gamma) drives the spinner glyph; hooks never do.
+	if !strings.Contains(out, "⠙") {
+		t.Errorf("running job should render the spinner glyph\n%s", out)
+	}
+}
+
 func TestTruncateLabel(t *testing.T) {
 	cases := []struct {
 		in   string
