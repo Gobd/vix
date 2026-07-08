@@ -1,6 +1,5 @@
 ---
 name: solver
-model: anthropic/claude-sonnet-4-6
 effort: high
 tools: read_file, write_file, edit_file, delete_file, bash, grep, glob_files
 max_turns: 80

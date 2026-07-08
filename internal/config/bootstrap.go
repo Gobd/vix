@@ -59,6 +59,18 @@ func BootstrapHomeVixDir(homeVixDir, version string) error {
 		return nil
 	}
 
+	if version == "dev" {
+		// A dev build always reports version "dev", so the marker above never
+		// changes between builds — the normal version-change refresh (which
+		// would also touch user-owned files like settings.json) never fires.
+		// Refresh just the vix-managed agent/prompt trees, which carry no user
+		// state, so a locally-built binary picks up source changes to shipped
+		// agents/prompts without clobbering customized settings.json.
+		if err := refreshManagedTrees(homeVixDir); err != nil {
+			log.Printf("[config] bootstrap: failed to refresh managed trees: %v", err)
+		}
+	}
+
 	// Same version: keep the absent-only safety net for the split config
 	// files (e.g. a user deleted workflow.json to reset it).
 	if err := ensureConfigDefaults(homeVixDir); err != nil {
@@ -118,7 +130,28 @@ func refreshManagedDefaults(homeVixDir string) error {
 		return err
 	}
 	files = append(files, trees...)
+	return refreshFiles(homeVixDir, files)
+}
 
+// refreshManagedTrees refreshes only the vix-managed prompts/agents trees,
+// leaving managedDefaultFiles (settings.json and friends, which carry user
+// customization) untouched. Used on dev builds, which always report version
+// "dev" and so never trip the version-change refresh in BootstrapHomeVixDir —
+// this lets a locally-built binary still pick up source changes to shipped
+// agents/prompts across restarts without clobbering user config every time.
+func refreshManagedTrees(homeVixDir string) error {
+	trees, err := managedTreeFiles()
+	if err != nil {
+		return err
+	}
+	return refreshFiles(homeVixDir, trees)
+}
+
+// refreshFiles overwrites each file (.vix-relative slash path) with its
+// embedded default when the on-disk content differs, backing up the previous
+// content to <name>.bak first. Files already matching the embedded default
+// are left untouched.
+func refreshFiles(homeVixDir string, files []string) error {
 	for _, rel := range files {
 		data, err := defaultFiles.ReadFile("defaults/" + rel)
 		if err != nil {

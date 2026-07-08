@@ -1151,7 +1151,7 @@ func renderModelsView(width, height int, s Styles,
 
 	// Server status line for local providers: reachability dot + endpoint.
 	// The API key above is optional (proxied servers only) — say so.
-	if providerIsLocal {
+	if providerIsLocal && IsLocalProvider(provider) {
 		ui := localUI[provider]
 		var serverLine string
 		switch {
@@ -1161,6 +1161,21 @@ func renderModelsView(width, height int, s Styles,
 			serverLine = "Server: " + secondaryStyle.Render("●") + " " + ui.BaseURL + textStyle.Render(" — running · no API key required")
 		default:
 			serverLine = "Server: " + textStyle.Render("○ "+ui.BaseURL+" — not reachable")
+		}
+		rightLines = append(rightLines, serverLine)
+	} else if providerIsLocal && provider == "anthropic" {
+		// Anthropic base URL overridden (e.g. a custom proxy): show what we
+		// found instead of the local-server "no API key required" messaging,
+		// since a remote proxy still needs a credential.
+		ui := localUI[provider]
+		var serverLine string
+		switch {
+		case !ui.Fetched:
+			serverLine = textStyle.Render("Endpoint: probing…")
+		case ui.Reachable:
+			serverLine = "Endpoint: " + secondaryStyle.Render("●") + " " + ui.BaseURL + textStyle.Render(fmt.Sprintf(" — %d models", len(ui.Models)))
+		default:
+			serverLine = "Endpoint: " + textStyle.Render("○ "+ui.BaseURL+" — not reachable")
 		}
 		rightLines = append(rightLines, serverLine)
 	}

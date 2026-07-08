@@ -25,7 +25,8 @@
         { "spec": "anthropic/claude-opus-4-7", "display_name": "Claude Opus 4 7", "context_window": 1000000 },
         { "spec": "anthropic/claude-opus-4-8", "display_name": "Claude Opus 4 8", "context_window": 1000000 },
         { "spec": "anthropic/claude-sonnet-4-5-20250929", "display_name": "Claude Sonnet 4 5 20250929", "context_window": 1000000 },
-        { "spec": "anthropic/claude-sonnet-4-6", "display_name": "Claude Sonnet 4 6", "context_window": 1000000 }
+        { "spec": "anthropic/claude-sonnet-4-6", "display_name": "Claude Sonnet 4 6", "context_window": 1000000 },
+        { "spec": "anthropic/claude-sonnet-5", "display_name": "Claude Sonnet 5", "context_window": 1000000 }
       ]
     },
     {
