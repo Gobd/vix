@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -15,12 +16,15 @@ import (
 )
 
 // anthropicClient is the Anthropic Messages API adapter. One instance is
-// bound to (cred, model, effort, maxTokens, pluginCfg).
+// bound to (cred, model, effort, maxTokens, pluginCfg). cred is re-resolved
+// on each call (see refreshedCredentialOpts) and guarded by credMu since
+// StreamMessage/StreamMessageWith may be called concurrently.
 type anthropicClient struct {
 	sdk                  anthropic.Client
 	model                string
 	effort               string // "adaptive" | "low" | "medium" | "high" | "max" | ""
 	maxTokens            int64  // 0 means use DefaultMaxTokens
+	credMu               sync.Mutex
 	cred                 config.Credential
 	systemPrefix         string
 	streamIdleTimeout    time.Duration
@@ -72,7 +76,11 @@ func NewAnthropic(cfg Config) (Client, error) {
 
 func (a *anthropicClient) Provider() ProviderID          { return ProviderAnthropic }
 func (a *anthropicClient) Model() string                 { return a.model }
-func (a *anthropicClient) Credential() config.Credential { return a.cred }
+func (a *anthropicClient) Credential() config.Credential {
+	a.credMu.Lock()
+	defer a.credMu.Unlock()
+	return a.cred
+}
 func (a *anthropicClient) MaxTokens() int64              { return a.maxTokens }
 func (a *anthropicClient) Effort() string                { return a.effort }
 
@@ -156,6 +164,8 @@ func (a *anthropicClient) StreamMessageWith(
 	if effort != "" {
 		perCallOpts = append(perCallOpts, option.WithJSONSet("thinking.display", "summarized"))
 	}
+
+	perCallOpts = append(perCallOpts, a.refreshedCredentialOpts()...)
 
 	stream := a.sdk.Messages.NewStreaming(ctx, params, perCallOpts...)
 
@@ -299,6 +309,38 @@ loop:
 	}
 
 	return fromAnthropicMessage(&acc), nil
+}
+
+// refreshedCredentialOpts re-resolves a.cred and, if the value changed,
+// returns per-call request options carrying the fresh auth header(s) —
+// applied after the client-level options, so they override the (possibly
+// stale) header baked in at construction time.
+//
+// a.cred is only re-resolved when it originally came from KeySourceEnv,
+// which is also what an apiKeyHelper-sourced token is tagged as (see
+// config.resolveKey). Re-resolving is cheap in the common case: a real env
+// var is a single os.Getenv, and an apiKeyHelper token hits its own
+// in-memory cache and only actually re-runs the helper command when the
+// cached token is due for refresh. This is what lets a long-lived session
+// self-heal from an expired apiKeyHelper token instead of being stuck with
+// whatever was baked in when the client was constructed.
+func (a *anthropicClient) refreshedCredentialOpts() []option.RequestOption {
+	a.credMu.Lock()
+	cred := a.cred
+	a.credMu.Unlock()
+
+	if cred.Source != config.KeySourceEnv {
+		return nil
+	}
+	fresh := config.ResolveProviderCredential(string(a.Provider()))
+	if fresh.Value == "" || fresh.Value == cred.Value {
+		return nil
+	}
+
+	a.credMu.Lock()
+	a.cred = fresh
+	a.credMu.Unlock()
+	return fresh.RequestOptions()
 }
 
 // applyEffort configures adaptive thinking and effort on an Anthropic request.

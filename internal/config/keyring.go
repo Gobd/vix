@@ -143,6 +143,10 @@ func resolveKey(envVar, keyringUser string) (string, KeySource) {
 	return "", KeySourceNone
 }
 
+// apiKeyHelperNonJWTTTL is how long a non-JWT (or exp-less) apiKeyHelper
+// token is reused before the helper is re-run.
+const apiKeyHelperNonJWTTTL = 60 * time.Minute
+
 // apiKeyHelperCache caches the last token returned by apiKeyHelper, along with
 // its expiry so it can be reused until close to expiration.
 var apiKeyHelperCache struct {
@@ -156,8 +160,14 @@ var apiKeyHelperCache struct {
 // files (home then project), runs it via the shell, and returns trimmed stdout.
 // When the returned token is a JWT with an "exp" claim, it is reused until 5
 // minutes before that expiry. When the token is not a JWT or has no "exp"
-// claim, it is re-fetched every 5 minutes.
+// claim, it is re-fetched every apiKeyHelperNonJWTTTL.
 // Returns "" on any error or when no helper is configured.
+//
+// Callers are expected to invoke this on every request (not just once at
+// client-construction time): the cache above makes repeat calls a no-op
+// unless the token is actually due for refresh, so calling it often is
+// cheap and is what lets long-lived sessions self-heal instead of running
+// on a token baked in once at startup.
 func runAPIKeyHelper() string {
 	cmd := loadAPIKeyHelper()
 	if cmd == "" {
@@ -171,8 +181,8 @@ func runAPIKeyHelper() string {
 	if apiKeyHelperCache.token != "" {
 		exp := apiKeyHelperCache.expiresAt
 		if exp.IsZero() {
-			// Not a JWT or no exp claim — refresh every 5 minutes.
-			if time.Since(apiKeyHelperCache.fetchedAt) < 5*time.Minute {
+			// Not a JWT or no exp claim — refresh every apiKeyHelperNonJWTTTL.
+			if time.Since(apiKeyHelperCache.fetchedAt) < apiKeyHelperNonJWTTTL {
 				return apiKeyHelperCache.token
 			}
 		} else if time.Until(exp) > 5*time.Minute {
