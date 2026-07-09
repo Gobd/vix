@@ -865,3 +865,27 @@ func itoa(i int) string {
 	}
 	return string(b[pos:])
 }
+
+// TestBashReferencesDeniedPath_TildeExpansion verifies that tokens like
+// ~/.aws/credentials are correctly caught when ~/.aws is in the deny list.
+func TestBashReferencesDeniedPath_TildeExpansion(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir available")
+	}
+	denyList := []string{filepath.Join(home, ".aws")}
+	cases := []struct {
+		cmd  string
+		want bool
+	}{
+		{"cat ~/.aws/credentials", true},
+		{"ls ~/safe/dir", false},
+		{"cat /etc/hosts", false},
+	}
+	for _, c := range cases {
+		denied, _, _ := bashReferencesDeniedPath(c.cmd, "/tmp", denyList)
+		if denied != c.want {
+			t.Errorf("bashReferencesDeniedPath(%q) denied=%v, want %v", c.cmd, denied, c.want)
+		}
+	}
+}

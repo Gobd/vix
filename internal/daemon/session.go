@@ -347,12 +347,49 @@ func (s *Session) isWriteApproved(absPath string) bool {
 }
 
 func (s *Session) isCommandApproved(cmd string) bool {
+	if containsShellChaining(cmd) {
+		// Even if the prefix is on the allowlist, a command that chains or
+		// substitutes additional shell logic (&&, ||, ;, backticks, $(...))
+		// requires explicit user confirmation. The approved prefix only vouches
+		// for the base command, not for arbitrary code appended to it.
+		return false
+	}
 	for _, prefix := range s.approvedBashPrefixes {
 		if strings.HasPrefix(cmd, prefix) {
 			return true
 		}
 	}
 	return false
+}
+
+// containsShellChaining reports whether cmd contains shell metacharacters that
+// could chain or inject additional commands: &&, ||, ;, backtick, or $(.
+// Used to ensure prefix-approved commands cannot be silently extended with
+// arbitrary shell logic.
+func containsShellChaining(cmd string) bool {
+	return strings.Contains(cmd, "&&") ||
+		strings.Contains(cmd, "||") ||
+		strings.Contains(cmd, ";") ||
+		strings.Contains(cmd, "`") ||
+		strings.Contains(cmd, "$(")
+}
+
+// logToolDecision appends a single JSON line to the tools audit log for this
+// session. Best-effort: failures are swallowed so a broken log dir never
+// interrupts tool execution. decision is one of "approved", "denied",
+// "auto_approved". persisted is the pattern saved to settings.json, if any.
+func (s *Session) logToolDecision(tool, summary, decision, persisted string) {
+	dir := s.paths.ToolsLog()
+	entry := map[string]any{
+		"session_id": s.id,
+		"tool":       tool,
+		"summary":    summary,
+		"decision":   decision,
+	}
+	if persisted != "" {
+		entry["persisted"] = persisted
+	}
+	appendRunLog(dir, entry)
 }
 
 func (s *Session) isURLApproved(url string) bool {
@@ -1497,6 +1534,9 @@ func (s *Session) executeToolDirect(ctx context.Context, name string, params map
 			}
 			return &ToolResult{NeedsConfirmation: true, ToolName: name, Params: params, SuggestedPattern: suggestedDir}
 		}
+		if autoApproved {
+			s.logToolDecision(name, resolvedPath, "auto_approved", "")
+		}
 	}
 
 	// Gate bash execution when automatic bash execution is disabled.
@@ -1519,6 +1559,9 @@ func (s *Session) executeToolDirect(ctx context.Context, name string, params map
 				SuggestedPattern:  suggestBashPattern(command),
 			}
 		}
+		if !confirmed {
+			s.logToolDecision(name, command, "auto_approved", "")
+		}
 	}
 
 	// Gate web_fetch when automatic bash execution is disabled.
@@ -1540,6 +1583,9 @@ func (s *Session) executeToolDirect(ctx context.Context, name string, params map
 				Params:            params,
 				SuggestedPattern:  suggestURLPattern(url),
 			}
+		}
+		if !confirmed {
+			s.logToolDecision(name, url, "auto_approved", "")
 		}
 	}
 
@@ -2495,6 +2541,11 @@ func dispatchToolCalls(ctx context.Context, msg *llm.Message, opts dispatchOptio
 		if input == nil {
 			input = map[string]any{}
 		}
+		// Strip any LLM-supplied "confirmed" field before the security gates run.
+		// The gates only trust confirmed=true when the daemon injects it after
+		// genuine user approval (in resolveConfirmation / subagentDispatchToolCalls).
+		// An adversarial or prompt-injected model must not be able to self-approve.
+		delete(input, "confirmed")
 
 		reason, _ := input["reason"].(string)
 		var bashReasonNotReadFile, bashReasonNotEditFile, bashReasonNotGlobFiles, bashReasonToIncreaseTimeout string
@@ -2853,6 +2904,13 @@ func (s *Session) buildConfirmFn() func(ctx context.Context, name string, input 
 				s.approvedURLPrefixes = append(s.approvedURLPrefixes, confirmData.PersistURLPattern)
 			}
 		}
+		decision := "denied"
+		if confirmData.Approved {
+			decision = "approved"
+		}
+		persisted := confirmData.PersistBashPattern + confirmData.PersistURLPattern + confirmData.PersistWriteDir
+		summary := SummarizeToolInput(name, input)
+		s.logToolDecision(name, summary, decision, persisted)
 		return confirmData.Approved, false
 	}
 }
