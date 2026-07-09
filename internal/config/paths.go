@@ -198,6 +198,16 @@ func (p VixPaths) HooksLog() string {
 	return filepath.Join(base, "hooks")
 }
 
+// ToolsLog returns the directory holding append-only tool-decision logs
+// (<date>.jsonl files), a subdirectory of Logs(). Empty when Logs() is empty.
+func (p VixPaths) ToolsLog() string {
+	base := p.Logs()
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, "tools")
+}
+
 // Sessions returns the directory where persisted session records live.
 // Sessions are stored globally (not project-scoped): override mode uses
 // override/sessions; normal mode uses home/sessions (empty if home is

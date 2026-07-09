@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"charm.land/bubbles/v2/textarea"
+	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
@@ -52,6 +53,12 @@ type QuestionPanel struct {
 	preview              string   // tool preview content shown in confirm mode
 	questionLines        []string // pre-split rendered question text lines
 	questionOffset       int      // scroll offset within the question text block
+
+	// Pattern-edit sub-mode (bash / web_fetch "Always allow" prefix capture).
+	suggestedPattern string
+	confirmToolName  string
+	patternEditMode  bool
+	patternInput     textinput.Model
 }
 
 // NewQuestionPanel returns a QuestionPanel with its inline textarea fully
@@ -219,7 +226,34 @@ func (qp *QuestionPanel) OpenConfirm(toolName string, params map[string]any, req
 	qp.questionOffset = 0
 }
 
-// buildConfirmQuestion builds the permission question shown in the panel and chat.
+// OpenConfirmWithPattern initializes the panel for a tool permission prompt that
+// can carry a persistable approval pattern (bash command prefix or web_fetch URL
+// prefix). It builds on OpenConfirm and, when a suggestedPattern is present and no
+// directory request is involved, switches to the 1/2/3 Deny / Allow once / Always
+// allow option set.
+func (qp *QuestionPanel) OpenConfirmWithPattern(toolName string, params map[string]any, requestedDirs []string, suggestedPattern string, width int, md *MarkdownRenderer) {
+	qp.OpenConfirm(toolName, params, requestedDirs, width, md)
+	qp.confirmToolName = toolName
+	qp.suggestedPattern = suggestedPattern
+	qp.patternEditMode = false
+	ti := textinput.New()
+	ti.Placeholder = "command prefix..."
+	if width > 8 {
+		ti.SetWidth(width - 8)
+	}
+	qp.patternInput = ti
+	// Replace options with 1/2/3 style for bash/web_fetch (when suggestedPattern is set and no dir request).
+	if suggestedPattern != "" && len(requestedDirs) == 0 {
+		qp.tabs[0].options = []string{"Deny", "Allow once", "Always allow"}
+		qp.tabs[0].selected = 0
+	}
+}
+
+// CurrentConfirmToolName returns the tool name associated with the active
+// confirm prompt (used to route a persisted pattern to bash vs web_fetch).
+func (qp *QuestionPanel) CurrentConfirmToolName() string {
+	return qp.confirmToolName
+}
 // For file-touching tools it includes the target path so the user knows exactly
 // which file is being requested.
 func buildConfirmQuestion(toolName string, params map[string]any) string {
@@ -338,6 +372,9 @@ func (qp *QuestionPanel) Close() {
 	qp.currentTab = 0
 	qp.confirmMode = false
 	qp.preview = ""
+	qp.patternEditMode = false
+	qp.suggestedPattern = ""
+	qp.confirmToolName = ""
 }
 
 // IsVisible returns whether the panel is showing.
@@ -417,9 +454,45 @@ func (qp *QuestionPanel) allAnswered() bool {
 
 // HandleKey processes a key event and returns (result, singleAnswer, batchAnswers).
 func (qp *QuestionPanel) HandleKey(msg tea.KeyPressMsg) (QuestionPanelResult, string, map[string]string) {
+	// Pattern-edit sub-mode: activated when user presses 3 / "Always allow".
+	if qp.confirmMode && qp.patternEditMode {
+		switch msg.String() {
+		case "enter":
+			pattern := strings.TrimSpace(qp.patternInput.Value())
+			if pattern == "" {
+				pattern = qp.suggestedPattern
+			}
+			qp.patternEditMode = false
+			return QPSubmitted, "Always allow:" + pattern, nil
+		case "esc":
+			qp.patternEditMode = false
+			return QPNoop, "", nil
+		default:
+			var cmd tea.Cmd
+			qp.patternInput, cmd = qp.patternInput.Update(msg)
+			_ = cmd
+			return QPNoop, "", nil
+		}
+	}
+
 	tab := qp.currentTabRef()
 	if tab == nil {
 		return QPNoop, "", nil
+	}
+
+	// Number shortcuts for 1/2/3 options (bash / web_fetch confirm with pattern).
+	if qp.confirmMode && qp.suggestedPattern != "" {
+		switch msg.String() {
+		case "1":
+			return QPSubmitted, "Deny", nil
+		case "2":
+			return QPSubmitted, "Allow once", nil
+		case "3":
+			qp.patternEditMode = true
+			qp.patternInput.SetValue(qp.suggestedPattern)
+			qp.patternInput.Focus()
+			return QPNoop, "", nil
+		}
 	}
 
 	switch msg.String() {
@@ -614,6 +687,11 @@ func (qp *QuestionPanel) Height() int {
 		h++ // the text input itself
 	}
 
+	// Pattern-edit sub-mode adds the input line plus a help line.
+	if qp.patternEditMode {
+		h += 2
+	}
+
 	h++ // divider
 	h++ // help text
 
@@ -741,6 +819,12 @@ func (qp *QuestionPanel) Render(s Styles, focused bool, md *MarkdownRenderer) st
 				writeLine("  " + s.QuestionPanelUnselectedStyle.Render(num+opt))
 			}
 		}
+	}
+
+	// Pattern-edit input (shown when "Always allow" is being customized).
+	if qp.patternEditMode {
+		writeLine("  Pattern: " + qp.patternInput.View())
+		writeLine("  enter to save  esc to cancel")
 	}
 
 	// Text input area (shown when cursor is on text option)

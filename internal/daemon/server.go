@@ -647,7 +647,7 @@ func (s *Server) handleSession(conn net.Conn, scanner *bufio.Scanner, startCmd p
 	if attachRec != nil {
 		sessionID = attachRec.ID
 	}
-	session := NewSession(sessionID, s, llmClient, model, cwd, startData.ConfigDir, startData.ForceInit, startData.EnableAutomaticWritePermission, startData.EnableAutomaticDirectoryAccess, startData.Headless, s.serverCtx)
+	session := NewSession(sessionID, s, llmClient, model, cwd, startData.ConfigDir, startData.ForceInit, startData.EnableAutomaticWritePermission, startData.EnableAutomaticDirectoryAccess, startData.EnableAutomaticBashExecution, startData.Headless, s.serverCtx)
 
 	if attachRec != nil {
 		session.seedFromRecord(attachRec)
@@ -831,6 +831,23 @@ func (s *Server) handleSession(conn net.Conn, scanner *bufio.Scanner, startCmd p
 				// down so the new binaries take effect on relaunch.
 				s.QuitAll()
 				return
+			}
+
+			if cmd.Type == "session.confirm" {
+				// Route by request ID instead of forwarding to commandChan:
+				// multiple confirmations (e.g. spawn_agent alongside another
+				// confirm-needing tool) can be in flight at once, each with
+				// its own waiter registered under a distinct request ID.
+				// Forwarding to the shared commandChan would let whichever
+				// waiter happened to read next steal an answer meant for a
+				// different tool call.
+				var confirmData protocol.SessionConfirmData
+				if err := json.Unmarshal(cmd.Data, &confirmData); err != nil {
+					LogError("Session %s: invalid session.confirm data: %v", sessionID, err)
+				} else {
+					session.resolveConfirm(confirmData.RequestID, confirmData)
+				}
+				continue
 			}
 
 			select {
@@ -1220,7 +1237,7 @@ func (s *Server) sessionForWebCall(id string) (*Session, func(), error) {
 	if parentCtx == nil {
 		parentCtx = context.Background()
 	}
-	sess := NewSession(rec.ID, s, nil, model, cwd, "", false, false, false, true, parentCtx)
+	sess := NewSession(rec.ID, s, nil, model, cwd, "", false, false, false, true, true, parentCtx)
 	sess.seedFromRecord(&rec)
 
 	drained := make(chan struct{})

@@ -40,11 +40,23 @@ type Session struct {
 	forceInit                      bool
 	enableAutomaticWritePermission bool
 	enableAutomaticDirectoryAccess bool
+	enableAutomaticBashExecution   bool
+	approvedBashPrefixes           []string
+	approvedURLPrefixes            []string
 	headless                       bool
 	eventChan                      chan protocol.SessionEvent
 	commandChan                    chan protocol.SessionCommand
 	ctx                            context.Context
 	cancel                         context.CancelFunc
+
+	// pendingConfirms holds one buffered channel per in-flight confirmation
+	// request, keyed by request ID (the LLM tool_use ID of the call awaiting
+	// approval). Concurrent tool calls (e.g. spawn_agent alongside another
+	// confirm-needing tool) can each be waiting on their own entry at once;
+	// routing by ID rather than by command type keeps their answers from
+	// crossing. Populated by registerConfirm, drained by resolveConfirm.
+	pendingConfirmsMu sync.Mutex
+	pendingConfirms   map[string]chan protocol.SessionConfirmData
 
 	// Agent state
 	messages []llm.MessageParam
@@ -203,7 +215,7 @@ type Session struct {
 }
 
 // NewSession creates a new agent session.
-func NewSession(id string, server *Server, llmClient LLM, model, cwd, configDir string, forceInit bool, enableAutomaticWritePermission bool, enableAutomaticDirectoryAccess bool, headless bool, parentCtx context.Context) *Session {
+func NewSession(id string, server *Server, llmClient LLM, model, cwd, configDir string, forceInit bool, enableAutomaticWritePermission bool, enableAutomaticDirectoryAccess bool, enableAutomaticBashExecution bool, headless bool, parentCtx context.Context) *Session {
 	ctx, cancel := context.WithCancel(parentCtx)
 	return &Session{
 		id:                             id,
@@ -215,9 +227,11 @@ func NewSession(id string, server *Server, llmClient LLM, model, cwd, configDir 
 		forceInit:                      forceInit,
 		enableAutomaticWritePermission: enableAutomaticWritePermission,
 		enableAutomaticDirectoryAccess: enableAutomaticDirectoryAccess,
+		enableAutomaticBashExecution:   enableAutomaticBashExecution,
 		headless:                       headless,
 		eventChan:                      make(chan protocol.SessionEvent, 256),
 		commandChan:                    make(chan protocol.SessionCommand, 16),
+		pendingConfirms:                make(map[string]chan protocol.SessionConfirmData),
 		workflowMsgChan:                make(chan string, 1),
 		ctx:                            ctx,
 		cancel:                         cancel,
@@ -330,6 +344,128 @@ func (s *Session) isWriteApproved(absPath string) bool {
 	s.approvedWriteFilesMu.RLock()
 	defer s.approvedWriteFilesMu.RUnlock()
 	return s.approvedWriteFiles[absPath]
+}
+
+func (s *Session) isCommandApproved(cmd string) bool {
+	if containsShellChaining(cmd) {
+		// Even if the prefix is on the allowlist, a command that chains or
+		// substitutes additional shell logic (&&, ||, ;, backticks, $(...))
+		// requires explicit user confirmation. The approved prefix only vouches
+		// for the base command, not for arbitrary code appended to it.
+		return false
+	}
+	for _, prefix := range s.approvedBashPrefixes {
+		if strings.HasPrefix(cmd, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsShellChaining reports whether cmd contains shell metacharacters that
+// could chain or inject additional commands: &&, ||, ;, backtick, or $(.
+// Used to ensure prefix-approved commands cannot be silently extended with
+// arbitrary shell logic.
+func containsShellChaining(cmd string) bool {
+	return strings.Contains(cmd, "&&") ||
+		strings.Contains(cmd, "||") ||
+		strings.Contains(cmd, ";") ||
+		strings.Contains(cmd, "`") ||
+		strings.Contains(cmd, "$(")
+}
+
+// logToolDecision appends a single JSON line to the tools audit log for this
+// session. Best-effort: failures are swallowed so a broken log dir never
+// interrupts tool execution. decision is one of "approved", "denied",
+// "auto_approved". persisted is the pattern saved to settings.json, if any.
+func (s *Session) logToolDecision(tool, summary, decision, persisted string) {
+	dir := s.paths.ToolsLog()
+	entry := map[string]any{
+		"session_id": s.id,
+		"tool":       tool,
+		"summary":    summary,
+		"decision":   decision,
+	}
+	if persisted != "" {
+		entry["persisted"] = persisted
+	}
+	appendRunLog(dir, entry)
+}
+
+func (s *Session) isURLApproved(url string) bool {
+	for _, prefix := range s.approvedURLPrefixes {
+		if strings.HasPrefix(url, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func suggestBashPattern(cmd string) string {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return ""
+	}
+	parts := strings.Fields(cmd)
+	if len(parts) == 0 {
+		return ""
+	}
+	binary := parts[0]
+	switch binary {
+	case "curl", "wget":
+		for _, p := range parts[1:] {
+			if !strings.HasPrefix(p, "-") {
+				if idx := strings.Index(p, "?"); idx >= 0 {
+					p = p[:idx]
+				}
+				return binary + " " + p
+			}
+		}
+		return binary
+	case "git":
+		if len(parts) >= 2 {
+			return "git " + parts[1]
+		}
+		return "git"
+	case "go":
+		if len(parts) >= 2 {
+			return "go " + parts[1]
+		}
+		return "go"
+	case "make":
+		if len(parts) >= 2 {
+			return "make " + parts[1]
+		}
+		return "make"
+	default:
+		return binary
+	}
+}
+
+func suggestURLPattern(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	if idx := strings.Index(rawURL, "?"); idx >= 0 {
+		rawURL = rawURL[:idx]
+	}
+	schemeEnd := strings.Index(rawURL, "://")
+	if schemeEnd < 0 {
+		return rawURL
+	}
+	rest := rawURL[schemeEnd+3:]
+	slashIdx := strings.Index(rest, "/")
+	if slashIdx < 0 {
+		return rawURL + "/"
+	}
+	hostAndPath := rest[slashIdx:]
+	segments := strings.SplitN(strings.TrimPrefix(hostAndPath, "/"), "/", 3)
+	scheme := rawURL[:schemeEnd+3]
+	host := rest[:slashIdx]
+	if len(segments) <= 1 {
+		return scheme + host + "/"
+	}
+	return scheme + host + "/" + segments[0] + "/"
 }
 
 // persistAllowedDirs saves directories to the project settings.json.
@@ -577,6 +713,52 @@ func (s *Session) waitForCommand(ctx context.Context, types ...string) (protocol
 	}
 }
 
+// registerConfirm creates and stores a buffered channel for the given
+// confirmation request ID. The caller must eventually either receive from
+// the returned channel or call resolveConfirm-adjacent cleanup via
+// unregisterConfirm (done automatically once resolveConfirm delivers, but
+// must be done explicitly by the caller on cancellation/timeout to avoid
+// leaking the map entry).
+func (s *Session) registerConfirm(id string) chan protocol.SessionConfirmData {
+	ch := make(chan protocol.SessionConfirmData, 1)
+	s.pendingConfirmsMu.Lock()
+	if s.pendingConfirms == nil {
+		s.pendingConfirms = make(map[string]chan protocol.SessionConfirmData)
+	}
+	s.pendingConfirms[id] = ch
+	s.pendingConfirmsMu.Unlock()
+	return ch
+}
+
+// unregisterConfirm removes a pending confirmation entry without resolving
+// it. Used when the waiter gives up (context cancelled) before an answer
+// arrives, so the map doesn't accumulate dead entries.
+func (s *Session) unregisterConfirm(id string) {
+	s.pendingConfirmsMu.Lock()
+	delete(s.pendingConfirms, id)
+	s.pendingConfirmsMu.Unlock()
+}
+
+// resolveConfirm delivers data to the pending confirmation registered under
+// id, if any, and removes it from the registry. Returns false if no waiter
+// was registered under that ID (unknown or already-resolved request) — the
+// caller should treat this as "nothing to do", not an error, since it can
+// legitimately happen if the UI double-sends or the request already timed
+// out.
+func (s *Session) resolveConfirm(id string, data protocol.SessionConfirmData) bool {
+	s.pendingConfirmsMu.Lock()
+	ch, ok := s.pendingConfirms[id]
+	if ok {
+		delete(s.pendingConfirms, id)
+	}
+	s.pendingConfirmsMu.Unlock()
+	if !ok {
+		return false
+	}
+	ch <- data
+	return true
+}
+
 // Run is the main session loop. It initializes the brain, then waits for input.
 func (s *Session) Run() {
 	defer func() {
@@ -778,6 +960,9 @@ func (s *Session) initBrain() {
 		s.denyURLs = append([]string(nil), projectConfig.DenyURLs...)
 		s.denyListMu.Unlock()
 	}
+
+	s.approvedBashPrefixes = append([]string(nil), projectConfig.ApprovedBashPrefixes...)
+	s.approvedURLPrefixes = append([]string(nil), projectConfig.ApprovedURLPrefixes...)
 
 	// Apply tool filtering AND model selection. Resolution order for the
 	// session's model: the chat agent's frontmatter `model:` (explicit pin,
@@ -1274,18 +1459,26 @@ func denyOutsideDirsError(name string, dirs []string) *ToolResult {
 // the user's response. On approval, it adds the dirs to the session's allowed
 // set (and persists them if the user chose "remember").
 func (s *Session) promptDirAccess(ctx context.Context, name string, params map[string]any, dirs []string) (approved, cancelled bool) {
+	// This gate runs outside the toolTask/dispatchOptions.confirmFn path (it's
+	// an inline check inside tool execution, with no tool_use ID in scope), so
+	// it mints its own request ID to correlate this wait with its reply —
+	// still unique enough to keep concurrent dir-access prompts from crossing.
+	requestID := nextTaskID()
+	ch := s.registerConfirm(requestID)
 	s.emit("event.confirm_request", protocol.EventConfirmRequest{
+		RequestID:     requestID,
 		ToolName:      name,
 		Params:        snapshotInput(params),
 		RequestedDirs: dirs,
 		Detail:        buildConfirmDetail(s.cwd, name, params),
 	})
-	cmd, ok := s.waitForCommand(ctx, "session.confirm")
-	if !ok {
+	var confirmData protocol.SessionConfirmData
+	select {
+	case confirmData = <-ch:
+	case <-ctx.Done():
+		s.unregisterConfirm(requestID)
 		return false, true
 	}
-	var confirmData protocol.SessionConfirmData
-	json.Unmarshal(cmd.Data, &confirmData)
 	if confirmData.Approved {
 		for _, dir := range dirs {
 			s.addAllowedDir(dir)
@@ -1325,15 +1518,74 @@ func (s *Session) executeToolDirect(ctx context.Context, name string, params map
 	if !s.enableAutomaticWritePermission && writeClassTools[name] {
 		confirmed, _ := params["confirmed"].(bool)
 		autoApproved := false
+		var resolvedPath string
 		if !confirmed {
 			if pathStr, ok := params["path"].(string); ok {
 				if resolved, err := resolvePathInAllowed(s.cwd, s.toolAllowedDirs(), pathStr); err == nil {
+					resolvedPath = resolved
 					autoApproved = s.isWriteApproved(resolved)
 				}
 			}
 		}
 		if !confirmed && !autoApproved {
-			return &ToolResult{NeedsConfirmation: true, ToolName: name, Params: params}
+			suggestedDir := s.cwd
+			if resolvedPath != "" {
+				suggestedDir = filepath.Dir(resolvedPath)
+			}
+			return &ToolResult{NeedsConfirmation: true, ToolName: name, Params: params, SuggestedPattern: suggestedDir}
+		}
+		if autoApproved {
+			s.logToolDecision(name, resolvedPath, "auto_approved", "")
+		}
+	}
+
+	// Gate bash execution when automatic bash execution is disabled.
+	// Interactive sessions request confirmation; headless sessions hard-fail
+	// on any command not already on the allowlist (no human to ask).
+	if !s.enableAutomaticBashExecution && name == "bash" {
+		command, _ := params["command"].(string)
+		confirmed, _ := params["confirmed"].(bool)
+		if !confirmed && !s.isCommandApproved(command) {
+			if s.headless {
+				return &ToolResult{
+					IsError: true,
+					Output:  "Permission denied: bash execution requires an approved prefix pattern. Add the command to approved_bash_prefixes in .vix/settings.json.",
+				}
+			}
+			return &ToolResult{
+				NeedsConfirmation: true,
+				ToolName:          name,
+				Params:            params,
+				SuggestedPattern:  suggestBashPattern(command),
+			}
+		}
+		if !confirmed {
+			s.logToolDecision(name, command, "auto_approved", "")
+		}
+	}
+
+	// Gate web_fetch when automatic bash execution is disabled.
+	// Interactive sessions request confirmation; headless sessions hard-fail
+	// on any URL not already on the allowlist (no human to ask).
+	if !s.enableAutomaticBashExecution && name == "web_fetch" {
+		url, _ := params["url"].(string)
+		confirmed, _ := params["confirmed"].(bool)
+		if !confirmed && !s.isURLApproved(url) {
+			if s.headless {
+				return &ToolResult{
+					IsError: true,
+					Output:  "Permission denied: web_fetch requires an approved URL prefix pattern. Add the URL to approved_url_prefixes in .vix/settings.json.",
+				}
+			}
+			return &ToolResult{
+				NeedsConfirmation: true,
+				ToolName:          name,
+				Params:            params,
+				SuggestedPattern:  suggestURLPattern(url),
+			}
+		}
+		if !confirmed {
+			s.logToolDecision(name, url, "auto_approved", "")
 		}
 	}
 
@@ -2221,9 +2473,12 @@ type dispatchOptions struct {
 	// (nil, false) when it doesn't recognise it.
 	handleSpecial func(ctx context.Context, name string, input map[string]any) (*ToolResult, bool)
 	// confirmFn is called when executeTool returns NeedsConfirmation=true.
-	// Returns approved=true to proceed, or cancelled=true to abort.
-	// When nil, NeedsConfirmation results are treated as denied.
-	confirmFn func(ctx context.Context, name string, input map[string]any) (approved, cancelled bool)
+	// requestID is the calling tool_use's ID, used to correlate the eventual
+	// session.confirm reply to this specific request when multiple
+	// confirmations are in flight concurrently. Returns approved=true to
+	// proceed, or cancelled=true to abort. When nil, NeedsConfirmation
+	// results are treated as denied.
+	confirmFn func(ctx context.Context, name string, input map[string]any, requestID string) (approved, cancelled bool)
 	// emitToolCall is called once per tool, before execution.
 	emitToolCall func(ev protocol.EventToolCall)
 	// emitToolResult is called after each tool completes.
@@ -2286,6 +2541,11 @@ func dispatchToolCalls(ctx context.Context, msg *llm.Message, opts dispatchOptio
 		if input == nil {
 			input = map[string]any{}
 		}
+		// Strip any LLM-supplied "confirmed" field before the security gates run.
+		// The gates only trust confirmed=true when the daemon injects it after
+		// genuine user approval (in resolveConfirmation / subagentDispatchToolCalls).
+		// An adversarial or prompt-injected model must not be able to self-approve.
+		delete(input, "confirmed")
 
 		reason, _ := input["reason"].(string)
 		var bashReasonNotReadFile, bashReasonNotEditFile, bashReasonNotGlobFiles, bashReasonToIncreaseTimeout string
@@ -2557,7 +2817,12 @@ func resolveConfirmation(ctx context.Context, t *toolTask, opts dispatchOptions)
 			return &ToolResult{Output: "Permission denied by hook: " + reason, IsError: true}
 		}
 	}
-	approved, cancelled := opts.confirmFn(ctx, t.toolUse.Name, t.input)
+	// Inject the suggested pattern from the tool result into the input map so
+	// confirmFn (which only receives the input map) can forward it to the UI.
+	if t.result != nil && t.result.SuggestedPattern != "" {
+		t.input["_suggested_pattern"] = t.result.SuggestedPattern
+	}
+	approved, cancelled := opts.confirmFn(ctx, t.toolUse.Name, t.input, t.toolUse.ID)
 	if cancelled {
 		return &ToolResult{Output: "Cancelled", IsError: true}
 	}
@@ -2571,6 +2836,83 @@ func resolveConfirmation(ctx context.Context, t *toolTask, opts dispatchOptions)
 	}
 	p["confirmed"] = true
 	return opts.executeTool(t.toolUse.Name, p)
+}
+
+// buildConfirmFn returns the confirmation closure used both by
+// sessionDispatchToolCalls and by foreground subagents.
+func (s *Session) buildConfirmFn() func(ctx context.Context, name string, input map[string]any, requestID string) (approved, cancelled bool) {
+	return func(ctx context.Context, name string, input map[string]any, requestID string) (approved, cancelled bool) {
+		// Extract requested directories for directory-access confirmations.
+		var requestedDirs []string
+		if rd, ok := input["_requested_dirs"].([]string); ok {
+			requestedDirs = rd
+		}
+		// Extract suggested pattern for bash/URL confirmations.
+		suggestedPattern, _ := input["_suggested_pattern"].(string)
+		ch := s.registerConfirm(requestID)
+		s.emit("event.confirm_request", protocol.EventConfirmRequest{
+			RequestID:        requestID,
+			ToolName:         name,
+			Params:           snapshotInput(input),
+			RequestedDirs:    requestedDirs,
+			Detail:           buildConfirmDetail(s.cwd, name, input),
+			SuggestedPattern: suggestedPattern,
+		})
+		var confirmData protocol.SessionConfirmData
+		select {
+		case confirmData = <-ch:
+		case <-s.ctx.Done():
+			s.unregisterConfirm(requestID)
+			return false, true
+		}
+		// If approved and directories were requested, add them to the session.
+		if confirmData.Approved && len(requestedDirs) > 0 {
+			for _, dir := range requestedDirs {
+				s.addAllowedDir(dir)
+			}
+			if confirmData.PersistDirs {
+				s.persistAllowedDirs(requestedDirs)
+			}
+			// Clean the internal field before re-execution.
+			delete(input, "_requested_dirs")
+		}
+		// If approved and this is a write-class tool, remember the file for auto-approval.
+		if confirmData.Approved && writeClassTools[name] {
+			if pathStr, ok := input["path"].(string); ok {
+				if resolved, err := resolvePathInAllowed(s.cwd, s.toolAllowedDirs(), pathStr); err == nil {
+					s.addApprovedWriteFile(resolved)
+				}
+			}
+		}
+		// If the user chose "Always allow" on a write tool, persist the directory.
+		if confirmData.PersistWriteDir != "" {
+			dir := confirmData.PersistWriteDir
+			s.addAllowedDir(dir)
+			s.persistAllowedDirs([]string{dir})
+		}
+		if confirmData.PersistBashPattern != "" {
+			if err := PersistApprovedBashPrefix(s.paths.ProjectSettingsWrite(), confirmData.PersistBashPattern); err != nil {
+				log.Printf("[session] failed to persist bash prefix: %v", err)
+			} else {
+				s.approvedBashPrefixes = append(s.approvedBashPrefixes, confirmData.PersistBashPattern)
+			}
+		}
+		if confirmData.PersistURLPattern != "" {
+			if err := PersistApprovedURLPrefix(s.paths.ProjectSettingsWrite(), confirmData.PersistURLPattern); err != nil {
+				log.Printf("[session] failed to persist url prefix: %v", err)
+			} else {
+				s.approvedURLPrefixes = append(s.approvedURLPrefixes, confirmData.PersistURLPattern)
+			}
+		}
+		decision := "denied"
+		if confirmData.Approved {
+			decision = "approved"
+		}
+		persisted := confirmData.PersistBashPattern + confirmData.PersistURLPattern + confirmData.PersistWriteDir
+		summary := SummarizeToolInput(name, input)
+		s.logToolDecision(name, summary, decision, persisted)
+		return confirmData.Approved, false
+	}
 }
 
 // sessionDispatchToolCalls is the Session-specific wrapper around the unified dispatcher.
@@ -2615,45 +2957,7 @@ func (s *Session) sessionDispatchToolCalls(ctx context.Context, msg *llm.Message
 			}
 			return nil, false
 		},
-		confirmFn: func(ctx context.Context, name string, input map[string]any) (approved, cancelled bool) {
-			// Extract requested directories for directory-access confirmations.
-			var requestedDirs []string
-			if rd, ok := input["_requested_dirs"].([]string); ok {
-				requestedDirs = rd
-			}
-			s.emit("event.confirm_request", protocol.EventConfirmRequest{
-				ToolName:      name,
-				Params:        snapshotInput(input),
-				RequestedDirs: requestedDirs,
-				Detail:        buildConfirmDetail(s.cwd, name, input),
-			})
-			cmd, ok := s.waitForCommand(s.ctx, "session.confirm")
-			if !ok {
-				return false, true
-			}
-			var confirmData protocol.SessionConfirmData
-			json.Unmarshal(cmd.Data, &confirmData)
-			// If approved and directories were requested, add them to the session.
-			if confirmData.Approved && len(requestedDirs) > 0 {
-				for _, dir := range requestedDirs {
-					s.addAllowedDir(dir)
-				}
-				if confirmData.PersistDirs {
-					s.persistAllowedDirs(requestedDirs)
-				}
-				// Clean the internal field before re-execution.
-				delete(input, "_requested_dirs")
-			}
-			// If approved and this is a write-class tool, remember the file for auto-approval.
-			if confirmData.Approved && writeClassTools[name] {
-				if pathStr, ok := input["path"].(string); ok {
-					if resolved, err := resolvePathInAllowed(s.cwd, s.toolAllowedDirs(), pathStr); err == nil {
-						s.addApprovedWriteFile(resolved)
-					}
-				}
-			}
-			return confirmData.Approved, false
-		},
+		confirmFn: s.buildConfirmFn(),
 		emitToolCall: func(ev protocol.EventToolCall) {
 			s.emit("event.tool_call", ev)
 		},
@@ -2857,7 +3161,9 @@ func (s *Session) handleSpawnAgent(ctx context.Context, input map[string]any) (s
 	def, maxv := s.toolTimeoutBounds()
 	agentID := nextTaskID()
 	s.fireSubagentStart(agentType, agentID, prompt)
-	result, err := RunSubagent(ctx, config, prompt, cred, parentModel, s.server.plugins, executeTool, s.cwd, s.emitHooks(), def, maxv, s.searchDirsSlice()...)
+	subHooks := s.emitHooks()
+	subHooks.ConfirmFn = s.buildConfirmFn()
+	result, err := RunSubagent(ctx, config, prompt, cred, parentModel, s.server.plugins, executeTool, s.cwd, subHooks, def, maxv, s.searchDirsSlice()...)
 	s.fireSubagentStop(agentType, agentID, result)
 
 	if err != nil {
@@ -2887,7 +3193,9 @@ func (s *Session) RunExploration(ctx context.Context, agentName, prompt string) 
 		return s.executeToolConfirmed(ctx, name, params), nil
 	}
 	def, maxv := s.toolTimeoutBounds()
-	return RunSubagent(ctx, agentConfig, prompt, cred, s.model, s.server.plugins, executeTool, s.cwd, nil, def, maxv, s.searchDirsSlice()...)
+	subHooks := s.emitHooks()
+	subHooks.ConfirmFn = s.buildConfirmFn()
+	return RunSubagent(ctx, agentConfig, prompt, cred, s.model, s.server.plugins, executeTool, s.cwd, subHooks, def, maxv, s.searchDirsSlice()...)
 }
 
 func (s *Session) handleTaskOutput(ctx context.Context, input map[string]any) (string, bool) {

@@ -50,6 +50,7 @@ type SessionStartData struct {
 	ForceInit                      bool   `json:"force_init"`
 	EnableAutomaticWritePermission bool   `json:"enable_automatic_write_permission"`
 	EnableAutomaticDirectoryAccess bool   `json:"enable_automatic_directory_access"`
+	EnableAutomaticBashExecution   bool   `json:"enable_automatic_bash_execution"`
 	Headless                       bool   `json:"headless"`
 	// ClientVersion is the vix binary version opening this session. The daemon
 	// refuses the session (event.error, code "version_mismatch") when it does
@@ -140,8 +141,14 @@ func ValidateAttachment(att Attachment) error {
 
 // SessionConfirmData carries tool approval/denial.
 type SessionConfirmData struct {
-	Approved    bool `json:"approved"`
-	PersistDirs bool `json:"persist_dirs,omitempty"` // save approved directories to settings.json
+	// RequestID correlates this reply to the EventConfirmRequest it answers.
+	// Required — a missing/unknown RequestID resolves no pending confirm.
+	RequestID          string `json:"request_id"`
+	Approved           bool   `json:"approved"`
+	PersistDirs        bool   `json:"persist_dirs,omitempty"`
+	PersistWriteDir    string `json:"persist_write_dir,omitempty"`  // dir to add to approved write dirs
+	PersistBashPattern string `json:"persist_bash_pattern,omitempty"`
+	PersistURLPattern  string `json:"persist_url_pattern,omitempty"`
 }
 
 // SessionPlanActionData carries plan review decisions.
@@ -267,10 +274,16 @@ type EventToolResult struct {
 
 // EventConfirmRequest asks the user to approve a tool execution.
 type EventConfirmRequest struct {
-	ToolName      string         `json:"tool_name"`
-	Params        map[string]any `json:"params"`
-	RequestedDirs []string       `json:"requested_dirs,omitempty"` // directories outside cwd that require approval
-	Detail        string         `json:"detail,omitempty"`         // same format as EventToolResult.Detail — fenced code block or structured diff
+	// RequestID uniquely identifies this confirmation request (the LLM
+	// tool_use ID of the call requiring approval) so the reply can be routed
+	// back to the specific waiter when multiple confirmations are in flight
+	// concurrently (e.g. spawn_agent alongside another confirm-needing tool).
+	RequestID        string         `json:"request_id"`
+	ToolName         string         `json:"tool_name"`
+	Params           map[string]any `json:"params"`
+	RequestedDirs    []string       `json:"requested_dirs,omitempty"` // directories outside cwd that require approval
+	Detail           string         `json:"detail,omitempty"`         // same format as EventToolResult.Detail — fenced code block or structured diff
+	SuggestedPattern string         `json:"suggested_pattern,omitempty"`
 }
 
 // EventPlanProposed carries a plan for user review.

@@ -16,6 +16,13 @@ func normalizeForDeny(cwd, path string) string {
 	if path == "" {
 		return ""
 	}
+	// Expand a leading ~ so that tokens like ~/.aws/credentials (common in
+	// bash commands) resolve correctly rather than being joined with cwd.
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			path = filepath.Join(home, path[1:])
+		}
+	}
 	var abs string
 	if filepath.IsAbs(path) {
 		abs = filepath.Clean(path)

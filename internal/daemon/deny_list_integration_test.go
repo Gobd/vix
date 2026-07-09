@@ -31,6 +31,7 @@ func newIntegrationSessionFull(t *testing.T, cwd string, denyPaths, denyURLs []s
 		headless:                       true,
 		enableAutomaticWritePermission: true,
 		enableAutomaticDirectoryAccess: true,
+		enableAutomaticBashExecution:   true,
 		denyList:                       append([]string(nil), denyPaths...),
 		denyURLs:                       append([]string(nil), denyURLs...),
 		readFiles:                      make(map[string]bool),
