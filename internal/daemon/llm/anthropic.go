@@ -351,7 +351,7 @@ func applyEffort(params *anthropic.MessageNewParams, effort string) {
 	if effort == "" {
 		return
 	}
-	adaptive := anthropic.NewThinkingConfigAdaptiveParam()
+	adaptive := anthropic.ThinkingConfigAdaptiveParam{}
 	params.Thinking = anthropic.ThinkingConfigParamUnion{OfAdaptive: &adaptive}
 	switch effort {
 	case "low":
