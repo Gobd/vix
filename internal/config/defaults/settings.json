@@ -14,5 +14,22 @@
   "logs": {
     "retention_days": 10
   },
-  "version": 1
+  "version": 1,
+  "languages": [
+    {
+      "name": "go",
+      "extensions": [".go"],
+      "lsp": { "command": "gopls", "args": [] }
+    },
+    {
+      "name": "python",
+      "extensions": [".py"],
+      "lsp": { "command": "pyright-langserver", "args": ["--stdio"] }
+    },
+    {
+      "name": "typescript",
+      "extensions": [".ts", ".tsx", ".js", ".jsx"],
+      "lsp": { "command": "typescript-language-server", "args": ["--stdio"] }
+    }
+  ]
 }
